@@ -1,0 +1,9 @@
+{
+  "name": "sample-repo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Tiny fixture repository for Relay workflow integration tests.",
+  "scripts": {
+    "test": "node test/run.js"
+  }
+}
