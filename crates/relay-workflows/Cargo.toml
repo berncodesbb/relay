@@ -1,0 +1,17 @@
+[package]
+name = "relay-workflows"
+description = "Relay's built-in software-delivery workflow: work definitions, structured artifact schemas, and grouped views over the work graph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+relay-domain = { workspace = true }
+relay-engine = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

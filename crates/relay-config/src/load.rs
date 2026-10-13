@@ -8,7 +8,7 @@
 //! is cross-referenced (every role reference and fallback role must resolve,
 //! no self-references or cycles, expanded chains within one primary plus
 //! [`MAX_FALLBACKS`]) before it is returned, and can be normalized into the
-//! runtime-facing routing contract with [`normalize_routing`].
+//! runtime-facing routing contract with [`crate::normalize_routing`].
 
 use crate::defaults::default_config;
 use crate::normalized::{MAX_FALLBACKS, expand_role_names};

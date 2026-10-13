@@ -107,14 +107,14 @@ fn match_word_ws_word(text: &[u8], first: &str, second: &str) -> Option<(usize, 
     let second_bytes = second.as_bytes();
     let mut search = 0;
     while let Some(found) = find_sub(text, first_bytes, search) {
-        if boundary_before(text, found) && boundary_after(text, found + first_bytes.len() - 1) {
-            if let Some(after_ws) = skip_ws(text, found + first_bytes.len()) {
-                if text[after_ws..].starts_with(second_bytes) {
-                    let second_end = after_ws + second_bytes.len() - 1;
-                    if boundary_after(text, second_end) {
-                        return Some((found, second_end + 1));
-                    }
-                }
+        if boundary_before(text, found)
+            && boundary_after(text, found + first_bytes.len() - 1)
+            && let Some(after_ws) = skip_ws(text, found + first_bytes.len())
+            && text[after_ws..].starts_with(second_bytes)
+        {
+            let second_end = after_ws + second_bytes.len() - 1;
+            if boundary_after(text, second_end) {
+                return Some((found, second_end + 1));
             }
         }
         search = found + 1;
@@ -133,7 +133,7 @@ fn find_sub(text: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 }
 
 /// `\bgit\s+checkout\s+(--|\.(?:\s|$))`
-fn scan_git_checkout(text: &str) -> Option<String> {
+fn scan_git_checkout(text: &str) -> Option<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut search = 0;
     while let Some(found) = find_sub(bytes, b"git", search) {
@@ -155,13 +155,13 @@ fn scan_git_checkout(text: &str) -> Option<String> {
             continue;
         };
         if bytes[arg_start..].starts_with(b"--") {
-            return Some(text[found..arg_start + 2].to_string());
+            return Some((found, arg_start + 2));
         }
         if bytes[arg_start] == b'.' {
             let next = arg_start + 1;
             if next >= bytes.len() || is_js_whitespace(bytes[next]) {
                 let end = if next < bytes.len() { next + 1 } else { next };
-                return Some(text[found..end].to_string());
+                return Some((found, end));
             }
         }
     }
@@ -169,7 +169,7 @@ fn scan_git_checkout(text: &str) -> Option<String> {
 }
 
 /// `\brm\b(?=[^\n;|&]*\s-[A-Za-z]*r)(?=[^\n;|&]*\s-[A-Za-z]*f)`
-fn scan_rm(text: &str) -> Option<String> {
+fn scan_rm(text: &str) -> Option<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut search = 0;
     while let Some(found) = find_sub(bytes, b"rm", search) {
@@ -180,7 +180,7 @@ fn scan_rm(text: &str) -> Option<String> {
         let rest = &bytes[found + 2..];
         let has_flag = |wanted: u8| flag_lookahead(rest, wanted);
         if has_flag(b'r') && has_flag(b'f') {
-            return Some(text[found..found + 2].to_string());
+            return Some((found, found + 2));
         }
     }
     None
@@ -214,7 +214,7 @@ fn flag_lookahead(rest: &[u8], wanted: u8) -> bool {
 }
 
 /// `\bdd\b[^\n;|]*\bof=`
-fn scan_dd(text: &str) -> Option<String> {
+fn scan_dd(text: &str) -> Option<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut search = 0;
     while let Some(found) = find_sub(bytes, b"dd", search) {
@@ -235,14 +235,14 @@ fn scan_dd(text: &str) -> Option<String> {
             }
         }
         if let Some(index) = best {
-            return Some(text[found..found + 2 + index + 3].to_string());
+            return Some((found, found + 2 + index + 3));
         }
     }
     None
 }
 
 /// `\b(curl|wget)\b[^\n;|]*\|\s*(sudo\s+)?(ba|z|da)?sh\b`
-fn scan_download_pipe_shell(text: &str) -> Option<String> {
+fn scan_download_pipe_shell(text: &str) -> Option<(usize, usize)> {
     let bytes = text.as_bytes();
     for word in [b"curl".as_slice(), b"wget".as_slice()] {
         let mut search = 0;
@@ -265,7 +265,7 @@ fn scan_download_pipe_shell(text: &str) -> Option<String> {
                 continue;
             };
             if let Some(end) = match_shell_target(rest, after_ws) {
-                return Some(text[found..found + word.len() + end].to_string());
+                return Some((found, found + word.len() + end));
             }
         }
     }
@@ -283,25 +283,25 @@ fn match_shell_target(rest: &[u8], start: usize) -> Option<usize> {
         }
     };
     // sudo? prefix? sh
-    if rest[start..].starts_with(b"sudo") {
-        if let Some(after_sudo_ws) = skip_ws(rest, start + 4) {
-            for prefix in [b"ba".as_slice(), b"z", b"da"] {
-                if rest[after_sudo_ws..].starts_with(prefix) {
-                    if let Some(end) = try_sh(after_sudo_ws + prefix.len()) {
-                        return Some(end);
-                    }
-                }
-            }
-            if let Some(end) = try_sh(after_sudo_ws) {
+    if rest[start..].starts_with(b"sudo")
+        && let Some(after_sudo_ws) = skip_ws(rest, start + 4)
+    {
+        for prefix in [b"ba".as_slice(), b"z", b"da"] {
+            if rest[after_sudo_ws..].starts_with(prefix)
+                && let Some(end) = try_sh(after_sudo_ws + prefix.len())
+            {
                 return Some(end);
             }
         }
+        if let Some(end) = try_sh(after_sudo_ws) {
+            return Some(end);
+        }
     }
     for prefix in [b"ba".as_slice(), b"z", b"da"] {
-        if rest[start..].starts_with(prefix) {
-            if let Some(end) = try_sh(start + prefix.len()) {
-                return Some(end);
-            }
+        if rest[start..].starts_with(prefix)
+            && let Some(end) = try_sh(start + prefix.len())
+        {
+            return Some(end);
         }
     }
     try_sh(start)
@@ -320,16 +320,12 @@ pub fn scan_denied_command(fragment: &str) -> Option<(String, &'static str)> {
             r"\bgit\s+stash\b" => match_word_ws_word(fragment.as_bytes(), "git", "stash"),
             r"\bgit\s+commit\b" => match_word_ws_word(fragment.as_bytes(), "git", "commit"),
             r"\bnpm\s+publish\b" => match_word_ws_word(fragment.as_bytes(), "npm", "publish"),
-            r"\bgit\s+checkout\s+(--|\.(?:\s|$))" => {
-                scan_git_checkout(fragment).map(|text| (0, text.len()))
-            }
-            r"\brm\b(?=[^\n;|&]*\s-[A-Za-z]*r)(?=[^\n;|&]*\s-[A-Za-z]*f)" => {
-                scan_rm(fragment).map(|text| (0, text.len()))
-            }
+            r"\bgit\s+checkout\s+(--|\.(?:\s|$))" => scan_git_checkout(fragment),
+            r"\brm\b(?=[^\n;|&]*\s-[A-Za-z]*r)(?=[^\n;|&]*\s-[A-Za-z]*f)" => scan_rm(fragment),
             r"\bmkfs\b" => match_bare_word(fragment, "mkfs"),
-            r"\bdd\b[^\n;|]*\bof=" => scan_dd(fragment).map(|text| (0, text.len())),
+            r"\bdd\b[^\n;|]*\bof=" => scan_dd(fragment),
             r"\b(curl|wget)\b[^\n;|]*\|\s*(sudo\s+)?(ba|z|da)?sh\b" => {
-                scan_download_pipe_shell(fragment).map(|text| (0, text.len()))
+                scan_download_pipe_shell(fragment)
             }
             r"\bchmod\s+-R\s+777\b" => match_word_ws_literal(fragment, &["chmod", "-R"], "777"),
             _ => None,

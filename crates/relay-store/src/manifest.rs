@@ -88,10 +88,8 @@ impl Manifest {
                 reason: "manifest field \"projectId\" must be a string".to_string(),
             })?
             .to_string();
-        crate::envelope::validate_prefixed_uuid(&project_id, "prj").map_err(|reason| {
-            StoreError::Canonical {
-                reason: format!("manifest \"projectId\": {reason}"),
-            }
+        relay_core::ids::ProjectId::parse(&project_id).map_err(|error| StoreError::Canonical {
+            reason: format!("manifest \"projectId\": {error}"),
         })?;
         let created_at = value
             .get("createdAt")

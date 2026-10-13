@@ -476,7 +476,41 @@ mod tests {
 
     #[test]
     fn rejects_forward_jumps_beyond_the_next_mode() {
-        let state = replay_events(&full_pipeline_approved()[..8].to_vec());
+        // Like the TypeScript oracle: specification never left for
+        // technical-design, so all planning inputs exist and are fresh while
+        // planning is two modes ahead.
+        let events = vec![
+            initialized_default(),
+            crate::fakes::artifact_created(
+                crate::artifacts::ArtifactKind::OpportunityBrief,
+                "art-brief",
+                "Test brief",
+            ),
+            crate::fakes::artifact_approved(
+                "art-brief",
+                crate::artifacts::ArtifactKind::OpportunityBrief,
+                1,
+            ),
+            crate::fakes::mode_entered(
+                WorkflowMode::Specification,
+                Some(WorkflowMode::Discovery),
+                crate::payloads::AutoUserSource::Auto,
+                "brief approved",
+            ),
+            crate::fakes::artifact_created(
+                crate::artifacts::ArtifactKind::Prd,
+                "art-prd",
+                "Test prd",
+            ),
+            crate::fakes::artifact_approved("art-prd", crate::artifacts::ArtifactKind::Prd, 1),
+            crate::fakes::artifact_created(
+                crate::artifacts::ArtifactKind::Trd,
+                "art-trd",
+                "Test trd",
+            ),
+            crate::fakes::artifact_approved("art-trd", crate::artifacts::ArtifactKind::Trd, 1),
+        ];
+        let state = replay_events(&events);
         let check = can_enter_mode(&state, WorkflowMode::Planning);
         assert!(!check.ok);
         assert!(check.reason.contains("workflow modes run in order"));
@@ -530,7 +564,21 @@ mod tests {
 
     #[test]
     fn surfaces_pause_rejections_as_needs_user() {
-        let mut events = vec![initialized_default()];
+        // Like the TypeScript oracle: the brief exists and is approved, so
+        // mode-complete reaches the entry gate and surfaces the pause.
+        let mut events = vec![
+            initialized_default(),
+            crate::fakes::artifact_created(
+                crate::artifacts::ArtifactKind::OpportunityBrief,
+                "art-brief",
+                "Test brief",
+            ),
+            crate::fakes::artifact_approved(
+                "art-brief",
+                crate::artifacts::ArtifactKind::OpportunityBrief,
+                1,
+            ),
+        ];
         events.push(make_event(
             crate::events::RelayEventType::WorkflowPaused,
             EventPayload::WorkflowPaused(WorkflowPausedPayload {
@@ -553,7 +601,7 @@ mod tests {
 
     #[test]
     fn honors_valid_user_requests_with_a_user_override_advance() {
-        let state = replay_events(&full_pipeline_approved()[..12].to_vec());
+        let state = replay_events(&full_pipeline_approved()[..12]);
         let outcome = evaluate_transition(
             &state,
             &TransitionTrigger::UserRequest {

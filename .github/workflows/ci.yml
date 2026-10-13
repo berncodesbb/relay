@@ -46,3 +46,18 @@ jobs:
       - run: cargo doc --workspace --all-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+      - name: Focused intent-first suites
+        run: |
+          cargo test -p relay-domain
+          cargo test -p relay-engine
+          cargo test -p relay-workflows
+          cargo test -p relay-executor
+          cargo test --test intent_first_scenarios
+          cargo test --test graph_properties
+          cargo test --test fact_replay
+          cargo test --test semantic_migration
+          cargo test --test crash_recovery
+          cargo test --test capability_security
+          cargo test --test scheduling_concurrency
+          cargo test --test cli_work_graph
+          cargo test --test tui_work_graph

@@ -1,5 +1,15 @@
 # Migrating a Relay project to the Rust implementation
 
+> **Status note (2026-10-14):** this guide describes the migration path of
+> the stopped compatibility port (legacy events → canonical event store
+> per `docs/event-format.md`), which remains in the repository as frozen
+> reference. The preview binary instead performs the semantic work-graph
+> import — `relay migrate --workspace <legacy-copy>` (`--dry-run` to plan;
+> read-only source, staged under `.relay-graph-migration-staging`,
+> rollback-safe) — documented in README.md and
+> `docs/plans/2026-10-13-intent-first-rust-work-graph.md`. The guide is
+> rewritten at the Rust cutover, not before.
+
 Status: preview documentation for the Rust rewrite migration
 Date: 2026-10-13
 

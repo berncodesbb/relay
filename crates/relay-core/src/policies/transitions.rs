@@ -86,7 +86,7 @@ mod tests {
     #[test]
     fn delegates_to_the_core_transition_policy_for_ordinary_triggers() {
         let events = full_pipeline_approved();
-        let state = replay_events(&events[..3].to_vec());
+        let state = replay_events(&events[..3]);
         let trigger = TransitionTrigger::ModeComplete {
             evidence: vec!["research done".to_string()],
         };
@@ -115,7 +115,7 @@ mod tests {
     #[test]
     fn passes_silently_when_the_target_mode_may_be_entered() {
         let events = full_pipeline_approved();
-        let state = replay_events(&events[..3].to_vec());
+        let state = replay_events(&events[..3]);
         assert!(assert_transition_allowed(&state, WorkflowMode::Specification).is_ok());
     }
 

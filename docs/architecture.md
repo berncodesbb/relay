@@ -1,5 +1,15 @@
 # Relay architecture
 
+> **Status note (2026-10-13):** this document describes the TypeScript
+> reference implementation in `src/`, which remains the shipping
+> application. The in-development native Rust rewrite is a durable
+> work-graph engine documented in
+> `docs/plans/2026-10-13-intent-first-rust-work-graph.md` (architecture
+> and phases), `docs/plans/fact-format-proposal.md` (persistence
+> format), and `docs/plans/intent-first-execution-log.md` (crate map and
+> decisions). A full architecture-document rewrite happens at the
+> Rust cutover, not before.
+
 Relay is a local-first, model-agnostic development harness. Deterministic TypeScript code owns workflow state, permissions, and transitions; language models are replaceable workers consulted through a provider-neutral protocol. This document describes the module boundaries, the event-sourced state core, the workflow engine, and the safety rails, as implemented in `src/`.
 
 ## Overview

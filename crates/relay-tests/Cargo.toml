@@ -15,9 +15,22 @@ workspace = true
 # legacy .relay/state.db fixtures, tempfile for workspaces). Additive change
 # to this shared manifest — coordinate with the lead integrator.
 [dev-dependencies]
+relay-artifacts = { workspace = true }
+relay-core = { workspace = true }
 relay-store = { workspace = true }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 tempfile = "3"
+# security suite (runtime/security owner): exercises the relay-tools
+# boundary — path guard, no-overwrite writes, patch attacks, redaction,
+# output bounds, and process supervision.
+relay-tools = { workspace = true }
+relay-config = { workspace = true }
+# capability + scheduling suites (runtime/security owner, Phase 5):
+# grant-gated execution and orchestrator concurrency semantics.
+relay-domain = { workspace = true }
+relay-engine = { workspace = true }
+relay-executor = { workspace = true }
+relay-providers = { workspace = true }

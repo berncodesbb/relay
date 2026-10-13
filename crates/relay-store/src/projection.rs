@@ -1006,8 +1006,8 @@ fn fold_event(tx: &rusqlite::Transaction<'_>, envelope: &EventEnvelope) -> Resul
     Ok(())
 }
 
-/// Convenience wrapper used by doctor: rebuild the projection from records
-/// in one shot.
+/// Convenience wrapper: quarantine the projection at `path` and rebuild it
+/// from the given records in one shot.
 pub fn rebuild_from_records(
     path: &Path,
     recovery_dir: &Path,

@@ -91,10 +91,10 @@ fn is_uuid_v4_tail(tail: &str) -> bool {
 fn parse_prefixed(kind: IdKind, prefixes: &[&str], value: &str) -> Result<String, IdParseError> {
     for prefix in prefixes {
         let head = format!("{prefix}_");
-        if let Some(tail) = value.strip_prefix(&head) {
-            if is_uuid_v4_tail(tail) {
-                return Ok((*prefix).to_string());
-            }
+        if let Some(tail) = value.strip_prefix(&head)
+            && is_uuid_v4_tail(tail)
+        {
+            return Ok((*prefix).to_string());
         }
     }
     Err(IdParseError {
@@ -178,12 +178,16 @@ mod tests {
 
     #[test]
     fn parses_valid_uuid_shaped_ids() {
-        let evt = EventId::parse("evt_01234567-89ab-cdef-0123-456789abcdef");
-        assert!(evt.is_ok());
-        // Version nibble must be 4 and variant nibble in 89ab.
-        assert!(EventId::parse("evt_01234567-89ab-1def-0123-456789abcdef").is_err());
-        assert!(EventId::parse("evt_01234567-89ab-4def-0123-456789abcdef").is_err());
-        assert!(EventId::parse("evt_01234567-89ab-4def-c123-456789abcdef").is_ok());
+        // Valid v4 shape: version nibble 4, variant nibble in 89ab.
+        assert!(EventId::parse("evt_01234567-89ab-4def-8123-456789abcdef").is_ok());
+        assert!(EventId::parse("evt_01234567-89ab-4def-9123-456789abcdef").is_ok());
+        assert!(EventId::parse("evt_01234567-89ab-4def-a123-456789abcdef").is_ok());
+        assert!(EventId::parse("evt_01234567-89ab-4def-b123-456789abcdef").is_ok());
+        // Wrong version nibble, wrong variant nibble, non-v4 shape, bad
+        // prefix, bad shape, and uppercase hex all fail.
+        assert!(EventId::parse("evt_01234567-89ab-1def-8123-456789abcdef").is_err());
+        assert!(EventId::parse("evt_01234567-89ab-4def-c123-456789abcdef").is_err());
+        assert!(EventId::parse("evt_01234567-89ab-cdef-0123-456789abcdef").is_err());
         assert!(EventId::parse("evt_not-a-uuid").is_err());
         assert!(EventId::parse("cor_01234567-89ab-4def-8123-456789abcdef").is_err());
         assert!(EventId::parse("evt_01234567-89AB-4DEF-8123-456789ABCDEF").is_err());

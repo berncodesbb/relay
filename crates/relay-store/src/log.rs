@@ -191,10 +191,8 @@ impl EventLog {
                 ),
             });
         }
-        crate::envelope::validate_prefixed_uuid(project_id, "prj").map_err(|reason| {
-            StoreError::Invalid {
-                reason: format!("project id: {reason}"),
-            }
+        relay_core::ids::ProjectId::parse(project_id).map_err(|error| StoreError::Invalid {
+            reason: format!("project id: {error}"),
         })?;
         paths.ensure_layout().map_err(|error| StoreError::Io {
             context: "creating .relay layout".to_string(),
@@ -629,12 +627,12 @@ impl EventLog {
 }
 
 /// Iterate complete `\n`-terminated lines of `bytes`.
-struct Lines<'a> {
+pub(crate) struct Lines<'a> {
     bytes: &'a [u8],
 }
 
 impl<'a> Lines<'a> {
-    fn new(bytes: &'a [u8]) -> Lines<'a> {
+    pub(crate) fn new(bytes: &'a [u8]) -> Lines<'a> {
         Lines { bytes }
     }
 }
@@ -650,7 +648,7 @@ impl<'a> Iterator for Lines<'a> {
 }
 
 /// Decode one physical line as UTF-8 with a located error otherwise.
-fn utf8_line(line: &[u8], segment: &str, line_number: u64) -> Result<String> {
+pub(crate) fn utf8_line(line: &[u8], segment: &str, line_number: u64) -> Result<String> {
     std::str::from_utf8(line)
         .map(str::to_string)
         .map_err(|_| StoreError::Record {
@@ -663,7 +661,7 @@ fn utf8_line(line: &[u8], segment: &str, line_number: u64) -> Result<String> {
 
 /// Split file bytes into the complete-line prefix and the incomplete tail
 /// after the final `\n` (if any).
-fn split_complete(bytes: &[u8]) -> (&[u8], Option<&[u8]>) {
+pub(crate) fn split_complete(bytes: &[u8]) -> (&[u8], Option<&[u8]>) {
     match bytes.iter().rposition(|&b| b == b'\n') {
         Some(index) => (&bytes[..index + 1], Some(&bytes[index + 1..])),
         None => (&[], Some(bytes)),
@@ -671,12 +669,16 @@ fn split_complete(bytes: &[u8]) -> (&[u8], Option<&[u8]>) {
 }
 
 /// Number of complete lines.
-fn line_count(complete: &[u8]) -> u64 {
+pub(crate) fn line_count(complete: &[u8]) -> u64 {
     complete.iter().filter(|&&b| b == b'\n').count() as u64
 }
 
 /// Write-append with (durable) fsync.
-fn write_append(path: &std::path::Path, bytes: &[u8], durability: Durability) -> Result<()> {
+pub(crate) fn write_append(
+    path: &std::path::Path,
+    bytes: &[u8],
+    durability: Durability,
+) -> Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.append(true).create(true);
     let mut file = options.open(path).map_err(|error| StoreError::Io {
@@ -700,7 +702,7 @@ fn write_append(path: &std::path::Path, bytes: &[u8], durability: Durability) ->
 }
 
 /// Write-append without flush or fsync (fault injection).
-fn write_append_raw(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_append_raw(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.append(true).create(true);
     let mut file = options.open(path).map_err(|error| StoreError::Io {
@@ -717,7 +719,7 @@ fn write_append_raw(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// Truncate `path` to `len` bytes and fsync (tail recovery).
-fn truncate_file(path: &std::path::Path, len: u64) -> Result<()> {
+pub(crate) fn truncate_file(path: &std::path::Path, len: u64) -> Result<()> {
     let file = std::fs::OpenOptions::new()
         .write(true)
         .open(path)

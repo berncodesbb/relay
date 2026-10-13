@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
 members = [
+  "crates/relay-domain",
+  "crates/relay-engine",
+  "crates/relay-workflows",
+  "crates/relay-executor",
+  "crates/relay-app",
   "crates/relay-core",
   "crates/relay-store",
   "crates/relay-artifacts",
@@ -22,6 +27,11 @@ license = "MIT"
 # Shared dependency versions. Crate owners add crate-specific dependencies to
 # their own manifests; only versions shared by multiple crates belong here.
 [workspace.dependencies]
+relay-domain = { path = "crates/relay-domain", version = "0.2.0" }
+relay-engine = { path = "crates/relay-engine", version = "0.2.0" }
+relay-workflows = { path = "crates/relay-workflows", version = "0.2.0" }
+relay-executor = { path = "crates/relay-executor", version = "0.2.0" }
+relay-app = { path = "crates/relay-app", version = "0.2.0" }
 relay-core = { path = "crates/relay-core", version = "0.2.0" }
 relay-store = { path = "crates/relay-store", version = "0.2.0" }
 relay-artifacts = { path = "crates/relay-artifacts", version = "0.2.0" }

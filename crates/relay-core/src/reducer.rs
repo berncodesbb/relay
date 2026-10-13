@@ -401,8 +401,8 @@ pub fn replay_project(events: &[RelayEvent]) -> Result<ProjectState, CoreError> 
 
     let mut state = create_empty_project_state();
     let project_id = first.project_id.clone();
-    let mut expected_sequence: u64 = 1;
-    for event in events {
+    for (index, event) in events.iter().enumerate() {
+        let expected_sequence = (index + 1) as u64;
         if event.project_id != project_id {
             return Err(fold_error(format!(
                 "event \"{}\" (sequence {}) belongs to project \"{}\", \
@@ -423,7 +423,6 @@ pub fn replay_project(events: &[RelayEvent]) -> Result<ProjectState, CoreError> 
                 expected_sequence
             )));
         }
-        expected_sequence += 1;
         state = apply_event(&state, event)?;
     }
     Ok(state)
@@ -434,15 +433,15 @@ pub fn replay_project(events: &[RelayEvent]) -> Result<ProjectState, CoreError> 
 mod tests {
     use super::*;
     use crate::artifacts::ArtifactKind;
-    use crate::intents::{IntentKind, IntentSource};
-    use crate::outcomes::OutcomeKind;
     use crate::events::RelayEventType;
-    use crate::payloads::EventPayload;
     use crate::fakes::{
         artifact_approved, artifact_created, artifact_revised, full_pipeline_approved, initialized,
         initialized_default, make_event, mode_entered, replay_events, verification_completed,
     };
+    use crate::intents::{IntentKind, IntentSource};
     use crate::modes::{AutonomyBound, WorkflowMode};
+    use crate::outcomes::OutcomeKind;
+    use crate::payloads::EventPayload;
     use crate::payloads::*;
     use crate::project_state::create_empty_project_state;
 
@@ -977,7 +976,7 @@ mod tests {
 
     #[test]
     fn mode_entered_clears_a_policy_pause_but_keeps_a_user_pause() {
-        let cleared = replay_events(&vec![
+        let cleared = replay_events(&[
             initialized_default(),
             paused(PauseActor::Policy, "checkpoint", None, vec![]),
             mode_entered(
@@ -989,7 +988,7 @@ mod tests {
         ]);
         assert!(cleared.paused().is_none());
 
-        let kept = replay_events(&vec![
+        let kept = replay_events(&[
             initialized_default(),
             paused(PauseActor::User, "lunch", None, vec![]),
             mode_entered(
@@ -1027,7 +1026,7 @@ mod tests {
         assert_eq!(state.paused().unwrap().reason, "reviewing first");
         assert_eq!(state.paused().unwrap().by, PauseActor::User);
 
-        let budget_only = replay_events(&vec![
+        let budget_only = replay_events(&[
             initialized_default(),
             make_event(
                 RelayEventType::BudgetExhausted,
@@ -1043,7 +1042,7 @@ mod tests {
             "budget exhausted: modelCalls (limit 25)"
         );
 
-        let interrupted = replay_events(&vec![
+        let interrupted = replay_events(&[
             initialized_default(),
             make_event(
                 RelayEventType::RunInterrupted,
@@ -1229,7 +1228,9 @@ mod tests {
 
     #[test]
     fn rejects_a_log_whose_first_event_is_not_project_initialized() {
-        let error = replay_project(&[session_started()]).expect_err("bad first event");
+        let mut first = session_started();
+        first.sequence = 1;
+        let error = replay_project(&[first]).expect_err("bad first event");
         assert_eq!(error.error_name(), "EventFoldError");
         assert!(error.to_string().contains("session.started"));
         assert!(error.to_string().contains("sequence 1"));
@@ -1238,6 +1239,7 @@ mod tests {
     #[test]
     fn rejects_sequence_gaps_and_duplicates_naming_expected_and_found() {
         let mut gap = vec![initialized_default(), session_started()];
+        gap[0].sequence = 1;
         gap[1].sequence = 3;
         let error = replay_project(&gap).expect_err("gap must fail");
         assert!(
@@ -1249,6 +1251,7 @@ mod tests {
         );
 
         let mut duplicate = vec![initialized_default(), session_started()];
+        duplicate[0].sequence = 1;
         duplicate[1].sequence = 1;
         let error = replay_project(&duplicate).expect_err("duplicate must fail");
         assert!(
@@ -1261,6 +1264,7 @@ mod tests {
     #[test]
     fn rejects_events_from_a_different_project() {
         let mut events = vec![initialized_default(), session_started()];
+        events[0].sequence = 1;
         events[1].project_id = "prj_00000000-0000-4000-8000-00000000dead".to_string();
         events[1].sequence = 2;
         let error = replay_project(&events).expect_err("foreign project must fail");
@@ -1273,7 +1277,8 @@ mod tests {
 
     #[test]
     fn throws_incompatible_event_version_for_a_mismatched_schema_version() {
-        let mut events = vec![initialized_default(), session_started()];
+        let mut events = [initialized_default(), session_started()];
+        events[0].sequence = 1;
         events[1].sequence = 2;
         events[1].schema_version = 99;
         let error = apply_event(&replay_events(&events[..1]), &events[1])

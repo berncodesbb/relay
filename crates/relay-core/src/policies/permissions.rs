@@ -208,18 +208,17 @@ pub fn evaluate_tool_permission(
         );
     }
 
-    if tool.capability == ToolCapability::Execute {
-        if let Some(fragment) = extract_command_fragment(args) {
-            if let Some((matched, reason)) = scan_denied_command(&fragment) {
-                return PermissionDecision::deny(
-                    format!(
-                        "denied command fragment \"{}\" in \"{}\": {}",
-                        matched, fragment, reason
-                    ),
-                    true,
-                );
-            }
-        }
+    if tool.capability == ToolCapability::Execute
+        && let Some(fragment) = extract_command_fragment(args)
+        && let Some((matched, reason)) = scan_denied_command(&fragment)
+    {
+        return PermissionDecision::deny(
+            format!(
+                "denied command fragment \"{}\" in \"{}\": {}",
+                matched, fragment, reason
+            ),
+            true,
+        );
     }
 
     PermissionDecision::allow()
@@ -230,9 +229,9 @@ pub fn evaluate_tool_permission(
 mod tests {
     use super::*;
     use crate::events::RelayEventType;
-    use crate::payloads::EventPayload;
     use crate::fakes::{initialized, make_event, replay_events};
     use crate::modes::WorkflowMode;
+    use crate::payloads::EventPayload;
     use crate::payloads::PauseActor;
     use crate::payloads::WorkflowPausedPayload;
     use serde_json::json;

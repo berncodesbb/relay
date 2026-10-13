@@ -10,6 +10,10 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+relay-artifacts = { workspace = true }
+relay-core = { workspace = true }
+relay-domain = { workspace = true }
+relay-workflows = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }

@@ -1,3 +1,5 @@
+#![allow(clippy::panic)] // test-support module; `replay_events` mirrors the TS helper that throws
+
 //! Deterministic event factories for tests, mirroring the TypeScript
 //! `test/unit/core/event-factories.ts`. Sequences and timestamps derive from a
 //! module-local counter over a fixed base instant, so replayed logs are

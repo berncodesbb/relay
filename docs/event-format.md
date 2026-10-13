@@ -1,6 +1,12 @@
 # Relay canonical event format
 
-Status: normative for the Rust store (store format version 1)
+Status: LEGACY — normative only for the stopped compatibility-port event
+path (`relay-core` events + the legacy `RelayStore` surface), which
+remains in the repository as frozen reference until its documented
+retirement gate. The intent-first work-graph store is specified by
+`docs/plans/fact-format-proposal.md` (accepted 2026-10-13); new
+persistence work targets that format. This document changes nothing and
+is retained as the reference for the legacy importer and old fixtures.
 Date: 2026-10-13
 Owners: lead integrator (spec), storage/migration owner (implementation), core/compatibility owner (payload schemas)
 
@@ -49,7 +55,7 @@ Field rules:
 | Field | Type | Rules |
 | --- | --- | --- |
 | `envelopeVersion` | integer | Always `1` for this format. Readers reject newer envelope versions fail-closed with upgrade guidance. |
-| `id` | string | `<prefix>_<uuid-v4-lowercase>`. Prefixes in use: `evt`, `cor`, `ses`, `prj`, `art`, `run`. Unique within the log. |
+| `id` | string | `<prefix>_<uuid-v4-lowercase>`. Prefixes in use: `evt`, `cor`, `ses`, `prj`, `art`, `run`. Unique within the log. (Historical note: the TypeScript runtime emits `session_`-prefixed session ids in some paths; readers accept both `ses_` and `session_`.) |
 | `projectId` | string | `prj_<uuid>`. Every event in one log belongs to exactly one project. |
 | `sequence` | integer | 1-based, contiguous, increasing by exactly 1 across the whole project log (not per segment). |
 | `sessionId` | string \| null | Session that produced the event, or `null`. |
@@ -64,9 +70,12 @@ Field rules:
 
 Additive envelope or payload fields are permitted for forward compatibility:
 readers must accept objects containing unknown additional fields at the
-envelope level only if `envelopeVersion` is understood. Payload schemas
-remain strict (unknown payload fields are rejected, matching TypeScript Zod
-`.strict()`-equivalent behavior through explicit decoding).
+envelope level only if `envelopeVersion` is understood. Unknown payload
+fields are ignored (stripped on decode), matching the TypeScript oracle's
+Zod default behavior — the schema constrains the fields it knows, and
+unknown extras never invalidate a legacy record. Verified decision from
+cross-language fixture work; earlier drafts of this section said payload
+decoding was strict, which the TypeScript implementation does not do.
 
 ## 2. Canonical JSON
 

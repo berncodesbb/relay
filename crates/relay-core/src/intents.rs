@@ -378,6 +378,9 @@ mod tests {
     #[test]
     fn exposes_option_lists_for_validation_messages() {
         assert!(IntentKind::zod_options().starts_with("\"provide-goal\""));
-        assert_eq!(IntentSource::zod_options(), "\"natural-language\"|\"command\"");
+        assert_eq!(
+            IntentSource::zod_options(),
+            "\"natural-language\"|\"command\""
+        );
     }
 }

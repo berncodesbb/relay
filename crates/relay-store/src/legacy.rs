@@ -34,7 +34,6 @@ use crate::canonical::Json;
 use crate::clock::Clock;
 use crate::envelope::EnvelopeDraft;
 use crate::envelope::EventEnvelope;
-use crate::envelope::PayloadValidator;
 use crate::envelope::RecordLocation;
 use crate::error::Result;
 use crate::error::StoreError;
@@ -53,8 +52,6 @@ pub struct MigrationOptions {
     pub lock_timeout: Duration,
     /// Time source for stamps and manifest fields.
     pub clock: Arc<dyn Clock>,
-    /// Optional strict payload validation (relay-core integration).
-    pub payload_validator: Option<PayloadValidator>,
     /// Durability used while writing the staged store.
     pub durability: Durability,
     /// Optional probe invoked with the staging directory after projections
@@ -73,7 +70,6 @@ impl Default for MigrationOptions {
         MigrationOptions {
             lock_timeout: crate::lock::DEFAULT_LOCK_TIMEOUT,
             clock: Arc::new(crate::clock::SystemClock),
-            payload_validator: None,
             durability: Durability::Durable,
             staging_probe: None,
         }
@@ -470,7 +466,7 @@ struct LegacyRow {
     sequence: u64,
     session_id: Option<String>,
     event_type: String,
-    schema_version: u64,
+    schema_version: u32,
     timestamp: String,
     correlation_id: String,
     causation_id: Option<String>,
@@ -530,7 +526,7 @@ fn read_legacy_rows(source: &Connection) -> Result<Vec<LegacyRow>> {
             sequence: sequence.max(0) as u64,
             session_id,
             event_type,
-            schema_version: schema_version.max(0) as u64,
+            schema_version: schema_version.max(0) as u32,
             timestamp,
             correlation_id,
             causation_id,
@@ -546,7 +542,7 @@ fn read_legacy_rows(source: &Connection) -> Result<Vec<LegacyRow>> {
 fn build_envelopes(
     rows: &[LegacyRow],
     project_id: &str,
-    options: &MigrationOptions,
+    _options: &MigrationOptions,
 ) -> Result<Vec<EventEnvelope>> {
     let distinct: Vec<&str> = {
         let mut seen: Vec<&str> = Vec::new();
@@ -582,23 +578,9 @@ fn build_envelopes(
                 ),
             });
         }
-        crate::envelope::validate_prefixed_uuid(&row.id, "").map_err(|reason| {
-            StoreError::Legacy {
-                reason: format!("legacy event id {}: {reason}", row.id),
-            }
-        })?;
-        crate::envelope::validate_prefixed_uuid(&row.correlation_id, "cor").map_err(|reason| {
-            StoreError::Legacy {
-                reason: format!("legacy event {} correlation id: {reason}", row.id),
-            }
-        })?;
-        if let Some(session) = &row.session_id {
-            crate::envelope::validate_prefixed_uuid(session, "ses").map_err(|reason| {
-                StoreError::Legacy {
-                    reason: format!("legacy event {} session id: {reason}", row.id),
-                }
-            })?;
-        }
+        // Id shapes, envelope rules, and the typed payload are validated by
+        // relay-core inside build and validate (the same errors replay
+        // would give).
         let envelope = EventEnvelope::build(EnvelopeDraft {
             project_id: project_id.to_string(),
             sequence: row.sequence,
@@ -610,17 +592,29 @@ fn build_envelopes(
             payload: row.payload.clone(),
             previous_hash,
             id: row.id.clone(),
-        })?;
-        envelope.validate().map_err(|error| match error {
-            StoreError::Record { reason, .. } => StoreError::Legacy {
-                reason: format!(
-                    "legacy event {} (sequence {}) failed validation: {reason}",
-                    row.id, row.sequence
-                ),
-            },
+        })
+        .map_err(|error| match error {
+            StoreError::Record { reason, .. } | StoreError::Append { reason } => {
+                StoreError::Legacy {
+                    reason: format!(
+                        "legacy event {} (sequence {}) failed validation: {reason}",
+                        row.id, row.sequence
+                    ),
+                }
+            }
             other => other,
         })?;
-        envelope.validate_payload(&options.payload_validator)?;
+        envelope.validate().map_err(|error| match error {
+            StoreError::Record { reason, .. } | StoreError::Append { reason } => {
+                StoreError::Legacy {
+                    reason: format!(
+                        "legacy event {} (sequence {}) failed validation: {reason}",
+                        row.id, row.sequence
+                    ),
+                }
+            }
+            other => other,
+        })?;
         previous_hash = Some(envelope.hash.clone());
         envelopes.push(envelope);
     }

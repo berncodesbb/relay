@@ -40,27 +40,39 @@
 //! - [`fault`]: crash-injection hooks for tests.
 //! - [`doctor`]: read-only `check` and `rebuild_index` services.
 //! - [`legacy`]: legacy `state.db` and JSONL-directory import.
+//! - [`fact`]: the generic fact-persistence layer for the intent-first
+//!   work graph (`docs/plans/fact-format-proposal.md`) — a segmented JSONL
+//!   fact log, disposable SQLite projection with a fold callback, and the
+//!   [`fact::FactStore`] orchestrator, all parameterized over an opaque
+//!   record and independent of relay-core.
 //!
-//! # relay-core integration (pending)
+//! # relay-core integration (complete)
 //!
-//! The envelope type, event-type list, payload schemas, and canonical
-//! serialization will be owned by `relay-core`. Until that crate publishes
-//! them, [`canonical`] and [`envelope`] carry store-local implementations
-//! exactly per the normative spec, and payload validation is an injectable
-//! [`envelope::PayloadValidator`] hook. When relay-core lands: bind the
-//! hook to its schemas, re-export its serializer from [`canonical`], and
-//! replace the mirrored type list — no other module needs to change.
+//! Canonical byte serialization comes from
+//! [`relay_core::canonical::canonical_json`] (via [`canonical::Json`]), and
+//! envelope rules, the event-type list, payload schema versions, typed
+//! payload validation, and hash computation come from
+//! [`relay_core::events`] (via [`envelope`]). The store adds only the
+//! log-layer chain rules (`previousHash` null exactly at sequence 1, stored
+//! `hash` must match) and storage diagnostics.
+//!
+//! The [`fact`] layer shares the storage-owned [`canonical::Json`] **value
+//! type** but serializes through its own module ([`fact::canonical`]),
+//! which delegates to the one shared canonicalizer in
+//! `relay_artifacts::canonical`; it never calls into relay-core.
 
 pub mod canonical;
 pub mod clock;
 pub mod doctor;
 pub mod envelope;
 pub mod error;
+pub mod fact;
 pub mod fault;
 pub mod legacy;
 pub mod lock;
 pub mod log;
 pub mod manifest;
+pub mod migrate;
 pub mod paths;
 pub mod projection;
 pub mod segments;
@@ -74,7 +86,7 @@ pub use clock::SequentialIds;
 pub use clock::SystemClock;
 pub use clock::UuidIdGen;
 pub use envelope::EventEnvelope;
-pub use envelope::PayloadValidator;
+pub use error::Result;
 pub use error::StoreError;
 pub use fault::CrashAt;
 pub use fault::FaultInjector;
@@ -107,3 +119,38 @@ pub use store::OpenReport;
 pub use store::RebuildReport;
 pub use store::RelayStore;
 pub use store::StoreOptions;
+
+// Generic fact-persistence layer (intent-first work graph). Re-exports the
+// primary surface so downstream crates can `use relay_store::...` uniformly;
+// everything also remains reachable through `relay_store::fact::...`.
+pub use fact::AcceptAllFacts;
+pub use fact::FACT_STORE_DIR;
+pub use fact::FactAppendOutcome;
+pub use fact::FactEntry;
+pub use fact::FactFold;
+pub use fact::FactInput;
+pub use fact::FactLog;
+pub use fact::FactManifest;
+pub use fact::FactOpenReport;
+pub use fact::FactPaths;
+pub use fact::FactProjection;
+pub use fact::FactRebuildReport;
+pub use fact::FactReconcileOutcome;
+pub use fact::FactRecord;
+pub use fact::FactStore;
+pub use fact::FactStoreOptions;
+pub use fact::FactTail;
+pub use fact::FactValidator;
+pub use fact::Integrity;
+pub use fact::KnownFactVersions;
+pub use fact::NoFold;
+pub use fact::parse_json;
+pub use fact::serialize_json;
+// Domain seam + graph projection + doctor (wave 2).
+pub use fact::doctor::{FactFinding, FactSeverity, check as fact_doctor_check};
+pub use fact::{
+    ArtifactVersionRow, AttemptRow, DecisionFilter, DecisionRow, DependencyRow,
+    DomainFactValidator, EvidenceRow, GraphAppendOutcome, GraphFactStore, GraphFold, GraphMeta,
+    InvalidationRow, TimelineFact, WorkFilter, WorkRow, artifact_versions, attempts, decisions,
+    dependencies, evidence, from_record, graph_meta, invalidations, to_input, work, works,
+};

@@ -113,10 +113,10 @@ impl Normalizer {
         if looks_like_timestamp(text) {
             return "<ts>".to_string();
         }
-        if let Some(root) = &self.workspace_root {
-            if text.contains(root.as_str()) {
-                return text.replace(root.as_str(), "<workspace>");
-            }
+        if let Some(root) = &self.workspace_root
+            && text.contains(root.as_str())
+        {
+            return text.replace(root.as_str(), "<workspace>");
         }
         text.to_string()
     }

@@ -82,6 +82,19 @@ pub enum StoreError {
         /// Human-readable reason.
         reason: String,
     },
+    /// A fact record failed validation in the generic fact layer. `segment`
+    /// and `line` locate the record; `sequence` is included when the record
+    /// parsed far enough to carry one.
+    FactRecord {
+        /// Segment file name, e.g. `0000000000000501-open.jsonl`.
+        segment: String,
+        /// 1-based physical line number within the segment.
+        line: u64,
+        /// Fact sequence number when known.
+        sequence: Option<u64>,
+        /// Human-readable reason.
+        reason: String,
+    },
     /// The writer lock could not be acquired, or its state is unusable.
     Lock {
         /// Lock file path.
@@ -177,6 +190,18 @@ impl std::fmt::Display for StoreError {
                 )
             }
             StoreError::Segments { reason } => write!(f, "invalid event segments: {reason}"),
+            StoreError::FactRecord {
+                segment,
+                line,
+                sequence,
+                reason,
+            } => match sequence {
+                Some(sequence) => write!(
+                    f,
+                    "invalid fact record at {segment} line {line} (sequence {sequence}): {reason}"
+                ),
+                None => write!(f, "invalid fact record at {segment} line {line}: {reason}"),
+            },
             StoreError::Lock { path, detail } => write!(
                 f,
                 "could not acquire the Relay writer lock at {}: {detail}",

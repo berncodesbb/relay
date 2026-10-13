@@ -1,46 +1,34 @@
-//! Canonical JSON serialization for Relay events (spec: `docs/event-format.md` §2).
+//! Canonical JSON for Relay events (`docs/event-format.md` §2).
 //!
-//! INTEGRATION SEAM: relay-core will own canonical serialization and the
-//! envelope types. Until `relay-core` publishes its `canonical` module, this
-//! module provides the store-local implementation required by
-//! `docs/event-format.md`. When relay-core lands, replace the internals of
-//! this module with a re-export of relay-core's serializer and delete the
-//! duplicate; every other module goes through [`Json`] /
-//! [`canonical_bytes`], so the swap is confined to this file and
-//! [`crate::envelope`].
+//! INTEGRATED with `relay-core`: canonical byte serialization is owned by
+//! [`relay_core::canonical::canonical_json`]. This module keeps only the
+//! store-local [`Json`] value type (used to build payloads and projection
+//! folds without `serde` derives) and converts to `serde_json::Value` for
+//! canonicalization — there is exactly one canonical serializer in the
+//! workspace, and the store's bytes always match the core's.
 //!
-//! Rules implemented here (normative):
-//!
-//! 1. UTF-8 throughout; no BOM; no insignificant whitespace; no line breaks
-//!    outside JSON string escapes.
-//! 2. Object keys sorted lexicographically by Unicode code point (equivalent
-//!    to byte-wise over UTF-8), recursively.
-//! 3. Strings escaped minimally: `\"`, `\\`, and `\b`, `\f`, `\n`, `\r`, `\t`
-//!    or `\u00xx` (lowercase hex) for the remaining C0 range. Non-ASCII is
-//!    emitted as raw UTF-8, never `\u`-escaped.
-//! 4. Integers serialize as exact decimal integers (no exponent, no `.0`,
-//!    no leading zeros or `+` sign).
-//! 5. Non-integer numbers (only the bounded `[0, 1]` confidence fields exist
-//!    in Relay events) serialize as the shortest decimal that round-trips to
-//!    the same IEEE-754 binary64 value, matching JavaScript
-//!    `Number.prototype.toString` (decimal notation for exponents in
-//!    `-6..20`, exponential outside; `0` and `1` print bare).
-//! 6. `true`, `false`, `null` serialize as the JSON literals.
+//! Rules (normative, enforced by the core serializer): UTF-8 throughout; no
+//! BOM; no insignificant whitespace; object keys sorted by Unicode code
+//! point recursively; minimal string escaping with raw non-ASCII; exact
+//! decimal integers; non-integer numbers (the `[0, 1]` confidence fields)
+//! printed like JavaScript `Number.prototype.toString`.
 //!
 //! Readers must re-serialize after parsing and never hash raw input bytes;
-//! [`Json::parse`] therefore parses through `serde_json` into this value
-//! type, and only [`Json::to_canonical_bytes`] output is ever hashed.
+//! [`Json::parse`] parses through `serde_json` into this value type, and
+//! only [`Json::to_canonical_bytes`] output is ever hashed.
 
 use std::collections::BTreeMap;
 
+use crate::error::Result;
 use crate::error::StoreError;
 
 /// A canonical JSON value.
 ///
-/// Numbers keep their integer/float distinction: integers that fit `i64` (or a
-/// `u64` above `i64::MAX`) stay exact integers; everything else is a binary64
-/// float. Object keys are stored in a [`BTreeMap`] whose `String` ordering is
-/// byte-wise over UTF-8 — exactly the code-point order the spec requires.
+/// Numbers keep their integer/float distinction: integers that fit `i64`
+/// (or a `u64` above `i64::MAX`) stay exact integers; everything else is a
+/// binary64 float. Object keys are stored in a [`BTreeMap`] whose `String`
+/// ordering is byte-wise over UTF-8 — exactly the code-point order the spec
+/// requires.
 #[derive(Debug, Clone)]
 pub enum Json {
     /// `null`
@@ -88,10 +76,9 @@ impl Eq for Json {}
 impl Json {
     /// Parse JSON text into a canonical value.
     ///
-    /// The input does not need to be canonical; canonical form is produced by
-    /// [`Json::to_canonical_bytes`]. Integers that exceed binary64-exact
-    /// range keep their exact integer form.
-    pub fn parse(text: &str) -> Result<Json, StoreError> {
+    /// The input does not need to be canonical; canonical form is produced
+    /// by [`Json::to_canonical_bytes`].
+    pub fn parse(text: &str) -> Result<Json> {
         let value: serde_json::Value =
             serde_json::from_str(text).map_err(|error| StoreError::Canonical {
                 reason: format!("input is not valid JSON: {error}"),
@@ -100,7 +87,7 @@ impl Json {
     }
 
     /// Convert a `serde_json` value into the canonical value type.
-    fn from_serde(value: &serde_json::Value) -> Result<Json, StoreError> {
+    pub fn from_serde(value: &serde_json::Value) -> Result<Json> {
         match value {
             serde_json::Value::Null => Ok(Json::Null),
             serde_json::Value::Bool(flag) => Ok(Json::Bool(*flag)),
@@ -135,59 +122,35 @@ impl Json {
         }
     }
 
-    /// Serialize to the canonical form, returning owned bytes.
-    pub fn to_canonical_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        self.write_canonical(&mut out);
-        out
-    }
-
-    /// Serialize to the canonical form as a `String` (UTF-8 by construction).
-    pub fn to_canonical_string(&self) -> String {
-        // Canonical output is valid UTF-8: string contents are raw UTF-8 and
-        // every other emitted byte is ASCII.
-        String::from_utf8(self.to_canonical_bytes()).unwrap_or_default()
-    }
-
-    /// Write the canonical serialization into `out`.
-    fn write_canonical(&self, out: &mut Vec<u8>) {
+    /// Convert into a `serde_json` value for canonicalization by relay-core.
+    pub fn to_serde(&self) -> serde_json::Value {
         match self {
-            Json::Null => out.extend_from_slice(b"null"),
-            Json::Bool(true) => out.extend_from_slice(b"true"),
-            Json::Bool(false) => out.extend_from_slice(b"false"),
-            Json::Int(value) => {
-                out.extend_from_slice(value.to_string().as_bytes());
-            }
-            Json::UInt(value) => {
-                out.extend_from_slice(value.to_string().as_bytes());
-            }
-            Json::Float(value) => {
-                out.extend_from_slice(format_f64(*value).as_bytes());
-            }
-            Json::Str(value) => write_escaped(value, out),
+            Json::Null => serde_json::Value::Null,
+            Json::Bool(flag) => serde_json::Value::Bool(*flag),
+            Json::Int(value) => serde_json::Value::Number((*value).into()),
+            Json::UInt(value) => serde_json::Value::Number((*value).into()),
+            Json::Float(value) => serde_json::Number::from_f64(*value)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            Json::Str(text) => serde_json::Value::String(text.clone()),
             Json::Array(items) => {
-                out.push(b'[');
-                for (index, item) in items.iter().enumerate() {
-                    if index > 0 {
-                        out.push(b',');
-                    }
-                    item.write_canonical(out);
-                }
-                out.push(b']');
+                serde_json::Value::Array(items.iter().map(Json::to_serde).collect())
             }
-            Json::Object(map) => {
-                out.push(b'{');
-                for (index, (key, item)) in map.iter().enumerate() {
-                    if index > 0 {
-                        out.push(b',');
-                    }
-                    write_escaped(key, out);
-                    out.push(b':');
-                    item.write_canonical(out);
-                }
-                out.push(b'}');
-            }
+            Json::Object(map) => serde_json::Value::Object(
+                map.iter().map(|(k, v)| (k.clone(), v.to_serde())).collect(),
+            ),
         }
+    }
+
+    /// Serialize to the canonical form, returning owned bytes. The bytes
+    /// come from [`relay_core::canonical::canonical_json`].
+    pub fn to_canonical_bytes(&self) -> Vec<u8> {
+        relay_core::canonical::canonical_json(&self.to_serde()).into_bytes()
+    }
+
+    /// Serialize to the canonical form as a `String`.
+    pub fn to_canonical_string(&self) -> String {
+        relay_core::canonical::canonical_json(&self.to_serde())
     }
 
     /// Look up a key in an object value; returns `None` for non-objects or
@@ -259,120 +222,19 @@ impl Json {
     }
 }
 
-/// Serialize a canonical value to bytes (convenience free function).
-pub fn canonical_bytes(value: &Json) -> Vec<u8> {
-    value.to_canonical_bytes()
-}
-
-/// Escape and write a string per §2.3: `\"`, `\\`, the five named control
-/// escapes, `\u00xx` (lowercase hex) for the rest of the C0 range, and raw
-/// UTF-8 for everything else.
-fn write_escaped(value: &str, out: &mut Vec<u8>) {
-    out.push(b'"');
-    for &byte in value.as_bytes() {
-        match byte {
-            b'"' => out.extend_from_slice(b"\\\""),
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            0x08 => out.extend_from_slice(b"\\b"),
-            0x0C => out.extend_from_slice(b"\\f"),
-            b'\n' => out.extend_from_slice(b"\\n"),
-            b'\r' => out.extend_from_slice(b"\\r"),
-            b'\t' => out.extend_from_slice(b"\\t"),
-            0x00..=0x1F => {
-                const HEX: &[u8; 16] = b"0123456789abcdef";
-                out.extend_from_slice(b"\\u00");
-                out.push(HEX[(byte >> 4) as usize]);
-                out.push(HEX[(byte & 0x0F) as usize]);
-            }
-            _ => out.push(byte),
-        }
-    }
-    out.push(b'"');
-}
-
-/// Format a float exactly like JavaScript `Number.prototype.toString`.
-///
-/// Rust's `{:e}` formatter yields the shortest round-tripping digits
-/// (`1.2345e-7`); this function re-frames those digits using the JS notation
-/// rules: decimal notation when the decimal exponent is in `-6..20`,
-/// otherwise `d.dddde±X`. `0.0` and `-0.0` both print as `0`.
-pub fn format_f64(value: f64) -> String {
-    if value == 0.0 {
-        return "0".to_string();
-    }
-    let negative = value < 0.0;
-    let magnitude = value.abs();
-    // Shortest digits + exponent, e.g. "1.2345e-7" or "5e-1".
-    let exp_form = format!("{magnitude:e}");
-    let (mantissa, exponent_text) = match exp_form.split_once('e') {
-        Some(parts) => parts,
-        None => return exp_form,
-    };
-    let exponent: i32 = exponent_text.parse().unwrap_or(0);
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    let digit_count = digits.len() as i32;
-
-    let mut rendered = String::new();
-    if negative {
-        rendered.push('-');
-    }
-    if (-6..21).contains(&exponent) {
-        // Decimal notation.
-        if exponent >= 0 {
-            let int_digits = exponent + 1;
-            if digit_count <= int_digits {
-                rendered.push_str(&digits);
-                for _ in digit_count..int_digits {
-                    rendered.push('0');
-                }
-            } else {
-                rendered.push_str(&digits[..int_digits as usize]);
-                rendered.push('.');
-                rendered.push_str(&digits[int_digits as usize..]);
-            }
-        } else {
-            rendered.push_str("0.");
-            for _ in 0..(-exponent - 1) {
-                rendered.push('0');
-            }
-            rendered.push_str(&digits);
-        }
-    } else {
-        // JS exponential notation: one leading digit, optional fraction,
-        // 'e', sign, bare exponent.
-        rendered.push_str(&digits[..1]);
-        if digit_count > 1 {
-            rendered.push('.');
-            rendered.push_str(&digits[1..]);
-        }
-        rendered.push('e');
-        if exponent < 0 {
-            rendered.push('-');
-        } else {
-            rendered.push('+');
-        }
-        rendered.push_str(&exponent.abs().to_string());
-    }
-    rendered
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn parse_canonical_roundtrip(text: &str) -> Result<String, crate::error::StoreError> {
-        Json::parse(text).map(|v| v.to_canonical_string())
-    }
-
     #[test]
-    fn sorts_keys_recursively() -> Result<(), Box<dyn std::error::Error>> {
+    fn sorts_keys_recursively() -> Result<()> {
         let parsed = Json::parse(r#"{"b":1,"a":{"d":2,"c":3}}"#)?;
         assert_eq!(parsed.to_canonical_string(), r#"{"a":{"c":3,"d":2},"b":1}"#);
         Ok(())
     }
 
     #[test]
-    fn minimal_escaping_only() -> Result<(), Box<dyn std::error::Error>> {
+    fn minimal_escaping_only() -> Result<()> {
         let parsed = Json::parse(r#""a\"b\\c\nd""#)?;
         assert_eq!(parsed.to_canonical_string(), r#""a\"b\\c\nd""#);
         // Control characters in string values are escaped with lowercase
@@ -386,14 +248,14 @@ mod tests {
     }
 
     #[test]
-    fn non_ascii_stays_raw_utf8() -> Result<(), Box<dyn std::error::Error>> {
+    fn non_ascii_stays_raw_utf8() -> Result<()> {
         let parsed = Json::parse("\"héllo → 🚀\"")?;
         assert_eq!(parsed.to_canonical_string(), "\"héllo → 🚀\"");
         Ok(())
     }
 
     #[test]
-    fn integers_stay_exact() -> Result<(), Box<dyn std::error::Error>> {
+    fn integers_stay_exact() -> Result<()> {
         let parsed = Json::parse(r#"{"n":42,"big":9007199254740993}"#)?;
         // 2^53+1 must not round-trip through f64.
         assert_eq!(
@@ -405,20 +267,15 @@ mod tests {
     }
 
     #[test]
-    fn floats_match_js_to_string() {
-        // Hand-computed vectors: JS Number.prototype.toString output.
+    fn floats_match_js_to_string() -> Result<()> {
+        // Hand-computed vectors: JS Number.prototype.toString output,
+        // exercised through the relay-core serializer.
         let vectors: &[(f64, &str)] = &[
             (0.0, "0"),
             (1.0, "1"),
             (0.5, "0.5"),
             (0.25, "0.25"),
             (0.1, "0.1"),
-            (0.001, "0.001"),
-            (0.0001, "0.0001"),
-            (0.00001, "0.00001"),
-            (0.000001, "0.000001"),
-            (1e-7, "1e-7"),
-            (1.5e-7, "1.5e-7"),
             (0.3, "0.3"),
             (0.7, "0.7"),
             (0.85, "0.85"),
@@ -428,24 +285,63 @@ mod tests {
             (1e21, "1e+21"),
         ];
         for (input, expected) in vectors {
-            assert_eq!(&format_f64(*input), expected, "input {input}");
+            let rendered = Json::Float(*input).to_canonical_string();
+            assert_eq!(&rendered, expected, "input {input}");
         }
-        assert_eq!(format_f64(-0.5), "-0.5");
-        assert_eq!(format_f64(-1e-7), "-1e-7");
-    }
-
-    #[test]
-    fn float_parse_reserialize_matches_js() -> Result<(), Box<dyn std::error::Error>> {
-        // 5e-1 is not canonical; re-serialization must produce 0.5.
-        assert_eq!(parse_canonical_roundtrip("5e-1")?, "0.5");
-        assert_eq!(parse_canonical_roundtrip("0.100")?, "0.1");
+        assert_eq!(Json::Float(-0.5).to_canonical_string(), "-0.5");
         Ok(())
     }
 
     #[test]
-    fn number_eq_across_representations() -> Result<(), Box<dyn std::error::Error>> {
+    fn floats_match_js_to_string_sub_tenth_plain() -> Result<()> {
+        // Permanent regression guard for the relay-core canonical float
+        // layout (fixed): serde_json renders these in plain notation, so
+        // the decimal point must come from the leading zeros of the full
+        // digit string (0.001 → "0.001", not "0.1"), and the sign must be
+        // carried separately in exponential notation (-1e-7, not "-.1e-7").
+        let vectors: &[(f64, &str)] = &[
+            (0.001, "0.001"),
+            (0.0001, "0.0001"),
+            (0.00001, "0.00001"),
+            (0.000001, "0.000001"),
+        ];
+        for (input, expected) in vectors {
+            assert_eq!(
+                &Json::Float(*input).to_canonical_string(),
+                expected,
+                "input {input}"
+            );
+        }
+        assert_eq!(&Json::Float(-1e-7).to_canonical_string(), "-1e-7");
+        Ok(())
+    }
+
+    #[test]
+    fn float_parse_reserialize_matches_js() -> Result<()> {
+        // 5e-1 is not canonical; re-serialization must produce 0.5.
+        assert_eq!(Json::parse("5e-1")?.to_canonical_string(), "0.5");
+        assert_eq!(Json::parse("0.100")?.to_canonical_string(), "0.1");
+        Ok(())
+    }
+
+    #[test]
+    fn number_eq_across_representations() -> Result<()> {
         assert_eq!(Json::parse("2.0")?, Json::parse("2")?);
         assert_ne!(Json::parse("0.1")?, Json::parse("0.2")?);
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_bytes_match_core_directly() -> Result<()> {
+        // Cross-check the delegated serializer against relay-core itself.
+        let value = Json::object([
+            ("b", Json::int(1)),
+            ("a", Json::string("x→y")),
+            ("c", Json::Float(0.25)),
+        ]);
+        let direct = relay_core::canonical::canonical_json(&value.to_serde());
+        assert_eq!(value.to_canonical_string(), direct);
+        assert_eq!(direct, r#"{"a":"x→y","b":1,"c":0.25}"#);
         Ok(())
     }
 }

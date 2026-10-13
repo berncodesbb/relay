@@ -1,6 +1,6 @@
 [package]
 name = "relay-providers"
-description = "Relay relay-providers crate"
+description = "Provider-neutral model contracts and private OpenAI, Anthropic, and fake adapters for Relay"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +8,17 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+regex = "1"
+
+# HTTP adapter transport. Default features are off so no native-TLS stack is
+# pulled in: TLS is rustls only, and no SDK crate is used anywhere.
+reqwest = { version = "0.12", default-features = false, features = [
+  "blocking",
+  "rustls-tls",
+  "json",
+] }

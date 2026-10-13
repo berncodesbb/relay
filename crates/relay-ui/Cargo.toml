@@ -1,6 +1,6 @@
 [package]
 name = "relay-ui"
-description = "Relay relay-ui crate"
+description = "Stable Relay view models, human/JSON renderers, and the terminal interface widgets"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +8,18 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+relay-core = { workspace = true }
+relay-app = { workspace = true }
+relay-workflows = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+ratatui = "0.29"
+
+[dev-dependencies]
+tempfile = "3"
+relay-executor = { workspace = true }
+relay-providers = { workspace = true }
+relay-domain = { workspace = true }
+relay-engine = { workspace = true }

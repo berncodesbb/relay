@@ -126,51 +126,67 @@ pub fn js_number_to_string(value: f64) -> String {
         let as_int = value as i64;
         return as_int.to_string();
     }
-    let (digits, point) = shortest_digits(value);
-    lay_out_digits(&digits, point)
+    let (digits, point, negative) = shortest_digits(value);
+    lay_out_digits(&digits, point, negative)
 }
 
-/// Shortest round-trip decimal digits and decimal-point position for `value`
-/// (point = number of digits before the decimal point; <= 0 for |value| < 1),
-/// derived from serde_json's (Ryu) float rendering.
-fn shortest_digits(value: f64) -> (String, i32) {
+/// Shortest round-trip decimal digits, decimal-point position, and sign for
+/// `value` (point = number of digits before the decimal point; <= 0 for
+/// |value| < 1), derived from serde_json's (Ryu) float rendering. The digit
+/// string is unsigned; the sign travels separately so it can never eat a
+/// mantissa digit during layout.
+fn shortest_digits(value: f64) -> (String, i32, bool) {
     let rendered = serde_json::to_string(&value).unwrap_or_else(|_| "0".to_string());
+    let (negative, body) = match rendered.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, rendered.as_str()),
+    };
     // Ryu output is either plain ("123.456", "0.001") or exponential ("1e-7").
-    if let Some(epos) = rendered.find(['e', 'E']) {
-        let mantissa = &rendered[..epos];
-        let exponent: i32 = rendered[epos + 1..].parse().unwrap_or(0);
+    if let Some(epos) = body.find(['e', 'E']) {
+        let mantissa = &body[..epos];
+        let exponent: i32 = body[epos + 1..].parse().unwrap_or(0);
         let clean: String = mantissa.chars().filter(|c| *c != '.').collect();
-        let digits = clean.trim_start_matches('0').to_string();
-        let digits = if digits.is_empty() {
-            "0".to_string()
-        } else {
-            digits
-        };
+        let digits = strip_leading_zeros(&clean);
         // Mantissa d.ddd → point = exponent + 1.
-        (digits, exponent + 1)
-    } else if let Some(dot) = rendered.find('.') {
-        let int_part = &rendered[..dot];
-        let frac = &rendered[dot + 1..];
-        let digits: String = format!("{int_part}{frac}");
-        let digits = digits.trim_start_matches('0').to_string();
-        let leading_zeros = int_part.len() as i32 - int_part.trim_start_matches('0').len() as i32;
-        let digits = if digits.is_empty() {
-            "0".to_string()
-        } else {
-            digits
-        };
-        (digits, int_part.len() as i32 - leading_zeros)
+        (digits, exponent + 1, negative)
+    } else if let Some(dot) = body.find('.') {
+        let int_part = &body[..dot];
+        let frac = &body[dot + 1..];
+        let full: String = format!("{int_part}{frac}");
+        let leading_zeros = full.len() - full.trim_start_matches('0').len();
+        let digits = strip_leading_zeros(&full);
+        // The decimal point sits after the integer digits; leading zeros of
+        // the FULL digit string (fraction zeros included) shift it left.
+        (
+            digits,
+            int_part.len() as i32 - leading_zeros as i32,
+            negative,
+        )
     } else {
-        let point = rendered.len() as i32;
-        (rendered, point)
+        let digits = strip_leading_zeros(body);
+        let point = digits.len() as i32;
+        (digits, point, negative)
+    }
+}
+
+fn strip_leading_zeros(digits: &str) -> String {
+    let stripped = digits.trim_start_matches('0');
+    if stripped.is_empty() {
+        "0".to_string()
+    } else {
+        stripped.to_string()
     }
 }
 
 /// Lay out `digits` with decimal point at `point` per ECMAScript
-/// `Number::toString` rules (decimal notation for point in (-6, 21]).
-fn lay_out_digits(digits: &str, point: i32) -> String {
+/// `Number::toString` rules (decimal notation for point in (-6, 21]; `-` is
+/// prepended for negative values).
+fn lay_out_digits(digits: &str, point: i32, negative: bool) -> String {
     let k = digits.len() as i32;
     let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
     if point > 21 || point <= -6 {
         // Exponential notation: d.ddde±(point-1)
         out.push_str(&digits[..1]);
@@ -252,17 +268,39 @@ mod tests {
             ("0.98", "0.98"),
             ("0.95", "0.95"),
             ("0.9", "0.9"),
+            ("0.85", "0.85"),
             ("0.6", "0.6"),
             ("0.5", "0.5"),
             ("0.3", "0.3"),
             ("0.2", "0.2"),
             ("0.1", "0.1"),
-            ("0.000001", "0.000001"), // 1e-6: still plain decimal in JS
-            ("0.0000001", "1e-7"),    // below 1e-6: JS switches to exponent
             ("1.0", "1"),
+            ("0.0", "0"),
+            ("1", "1"),
+            ("0", "0"),
         ] {
             assert_eq!(round_trip(source), expected, "source {source}");
         }
+    }
+
+    #[test]
+    fn renders_sub_tenth_and_exponent_floats_like_javascript() {
+        // Plain-rendered sub-0.1 values: the decimal point must account for
+        // leading fraction zeros (0.001 is NOT 0.1).
+        for (source, expected) in [
+            ("0.001", "0.001"),
+            ("0.0001", "0.0001"),
+            ("0.00001", "0.00001"),
+            ("0.000001", "0.000001"), // 1e-6: still plain decimal in JS
+            ("0.0000001", "1e-7"),    // below 1e-6: JS switches to exponent
+        ] {
+            assert_eq!(round_trip(source), expected, "source {source}");
+        }
+        // Negative values: the sign never eats a mantissa digit.
+        assert_eq!(js_number_to_string(-1e-7), "-1e-7");
+        assert_eq!(js_number_to_string(-0.001), "-0.001");
+        assert_eq!(js_number_to_string(-0.5), "-0.5");
+        assert_eq!(js_number_to_string(-0.1), "-0.1");
     }
 
     #[test]

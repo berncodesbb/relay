@@ -321,7 +321,7 @@ pub fn is_iso_timestamp_millis_z(value: &str) -> bool {
         return false;
     }
     let digit = |i: usize| bytes[i].is_ascii_digit();
-    let all_digits = |range: std::ops::Range<usize>| range.clone().all(|i| digit(i));
+    let all_digits = |range: std::ops::Range<usize>| range.clone().all(&digit);
     if !(all_digits(0..4)
         && bytes[4] == b'-'
         && all_digits(5..7)
@@ -377,24 +377,24 @@ fn validate_envelope_shape(envelope: &EventEnvelope) -> Result<(), CoreError> {
             detail: format!("projectId {error}"),
         });
     }
-    if let Some(session_id) = &envelope.session_id {
-        if let Err(error) = crate::ids::SessionId::parse(session_id) {
-            return Err(CoreError::InvalidEventEnvelope {
-                detail: format!("sessionId {error}"),
-            });
-        }
+    if let Some(session_id) = &envelope.session_id
+        && let Err(error) = crate::ids::SessionId::parse(session_id)
+    {
+        return Err(CoreError::InvalidEventEnvelope {
+            detail: format!("sessionId {error}"),
+        });
     }
     if let Err(error) = crate::ids::CorrelationId::parse(&envelope.correlation_id) {
         return Err(CoreError::InvalidEventEnvelope {
             detail: format!("correlationId {error}"),
         });
     }
-    if let Some(causation_id) = &envelope.causation_id {
-        if let Err(error) = crate::ids::EventId::parse(causation_id) {
-            return Err(CoreError::InvalidEventEnvelope {
-                detail: format!("causationId {error}"),
-            });
-        }
+    if let Some(causation_id) = &envelope.causation_id
+        && let Err(error) = crate::ids::EventId::parse(causation_id)
+    {
+        return Err(CoreError::InvalidEventEnvelope {
+            detail: format!("causationId {error}"),
+        });
     }
     if !is_iso_timestamp_millis_z(&envelope.timestamp) {
         return Err(CoreError::InvalidEventEnvelope {

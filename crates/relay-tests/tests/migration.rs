@@ -646,7 +646,7 @@ fn envelope_level_invalid_fixture_cases_are_rejected() -> Result<()> {
     // Cases the store itself must reject fail-closed (payload/fold-level
     // cases belong to the relay-core replay suite and are skipped here).
     let expectations: &[(&str, &str)] = &[
-        ("unknown-event-type", "unknown event type"),
+        ("unknown-event-type", "Unknown event type"),
         ("newer-envelope-version", "envelopeVersion"),
         ("newer-schema-version", "schema version"),
         ("sequence-gap", "not contiguous"),

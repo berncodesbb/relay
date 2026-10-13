@@ -2,6 +2,15 @@
 
 Relay is a local-first, model-agnostic CLI that carries product intent from discovery through specification, technical design, planning, implementation, verification, and delivery. Models are replaceable workers: Relay owns the workflow state, the artifacts, the permissions, and the transition policy. Every durable workflow change is an append-only event in a local SQLite log; every product artifact is versioned, readable Markdown you can review in any editor. Nothing leaves your machine except the model calls you configure.
 
+## Rust work-graph preview (in development)
+
+This repository also contains an in-development native Rust implementation of Relay, rebuilt around its product intent rather than ported one-for-one: the authoritative domain is a durable **work graph** of addressable goals, work items, dependencies, decisions, artifacts, evidence, attempts, capability grants, and receipts — evaluated by a deterministic, pure kernel. There is no global workflow-mode state machine; the familiar discovery→delivery phases are grouped views, and human decisions are first-class blocking work. Models and executors propose; deterministic policy validates and applies.
+
+- Preview binary: `cargo run -p relay-cli -- --help` (version `0.3.0-preview`); state lives in `.relay-graph/` (canonical JSONL facts, disposable SQLite projection, canonical artifact blobs) and never touches the legacy `.relay/` directory.
+- Work-centric surface: `project summary`, `work ready|blocked|inspect`, `decisions list|resolve`, `artifact inspect`, `evidence`, `run --provider fake`, `explain`, `expand`, `import-prd`, `doctor check`, `migrate --dry-run`, plus a Ratatui `tui`. Legacy commands (`status`, `why`, `inspect`) map to their work-graph equivalents; `mode`/`auto`/`pause` exit with migration guidance.
+- `relay migrate --workspace <legacy-copy>` semantically imports an existing TypeScript Relay project (read-only source, staged, rollback-safe, with an extraction report of mapped/inferred/unmapped data).
+- The Node.js implementation below remains the shipping reference until the Rust preview passes its evaluation and retirement gates. See `docs/plans/2026-10-13-intent-first-rust-work-graph.md` and `docs/plans/fact-format-proposal.md`.
+
 ## Requirements
 
 - Node.js 22 or later (the built-in `node:sqlite` module needs 22.5.0+; Node 24 recommended). Relay fails with an actionable message on older runtimes.

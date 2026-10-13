@@ -1,7 +1,7 @@
-//! Store verification services (`doctor check` / `doctor rebuild-index`).
-//!
-//! Library-only: the CLI wires commands to these functions later (phase 2
-//! item 8). `check` is strictly read-only: it validates the manifest, the
+//! Store verification services (`doctor check` / `doctor rebuild-index`)
+//! for the legacy `.relay` event store. Library-only: the intent-first CLI
+//! surfaces the fact-layer doctor (`crate::fact::doctor`) instead of these.
+//! `check` is strictly read-only: it validates the manifest, the
 //! hash chain, segment tiling, artifact presence, and index consistency,
 //! and returns findings without repairing anything. `rebuild_index`
 //! quarantines the existing index and rebuilds it purely from JSONL.

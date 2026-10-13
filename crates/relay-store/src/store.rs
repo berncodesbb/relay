@@ -20,7 +20,6 @@ use crate::clock::IdGen;
 use crate::clock::SystemClock;
 use crate::clock::UuidIdGen;
 use crate::envelope::EventEnvelope;
-use crate::envelope::PayloadValidator;
 use crate::error::Result;
 use crate::error::StoreError;
 use crate::fault::FaultInjector;
@@ -53,9 +52,6 @@ pub struct StoreOptions {
     pub clock: Arc<dyn Clock>,
     /// Identifier source.
     pub id_gen: Arc<dyn IdGen>,
-    /// Optional strict payload validation (the relay-core schema
-    /// integration binds here).
-    pub payload_validator: Option<PayloadValidator>,
     /// Crash-injection hooks for tests.
     pub fault: Arc<dyn FaultInjector>,
 }
@@ -67,7 +63,6 @@ impl Default for StoreOptions {
             lock_timeout: crate::lock::DEFAULT_LOCK_TIMEOUT,
             clock: Arc::new(SystemClock),
             id_gen: Arc::new(UuidIdGen),
-            payload_validator: None,
             fault: Arc::new(NoFaults),
         }
     }
@@ -301,7 +296,6 @@ impl RelayStore {
                 id,
             })?;
             envelope.validate()?;
-            envelope.validate_payload(&self.options.payload_validator)?;
             previous_hash = Some(envelope.hash.clone());
             envelopes.push(envelope);
         }

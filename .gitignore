@@ -15,3 +15,9 @@ crates/*/target/
 # Migration staging and retained backups (scratch, never committed)
 .relay-rust-migration-*/
 .relay-backup-*/
+
+# Rust work-graph preview: fact store, staging, and retained backups
+.relay-graph/
+.relay-graph-migration-staging/
+.relay-graph-pre-migration-*/
+.relay-graph-rolled-back-*/

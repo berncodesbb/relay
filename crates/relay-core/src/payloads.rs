@@ -362,8 +362,8 @@ fn req_bounded_float(
 // -- composite fields --------------------------------------------------------
 
 /// Required nested object field; recurses with `prefix.` paths.
-fn req_object<'a>(
-    map: &'a Map<String, Value>,
+fn req_object(
+    map: &Map<String, Value>,
     key: &str,
     path_prefix: &str,
     issues: &mut Issues,
@@ -383,6 +383,7 @@ fn req_object<'a>(
 }
 
 /// Required array of strings with per-item length bounds and array size bounds.
+#[allow(clippy::too_many_arguments)] // mirrors the Zod schema's four bounds
 fn req_string_array(
     map: &Map<String, Value>,
     key: &str,
