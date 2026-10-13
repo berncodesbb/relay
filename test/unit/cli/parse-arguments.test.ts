@@ -55,6 +55,28 @@ describe('parseArguments', () => {
     });
   });
 
+  it('parses run --role in spaced and --role=value forms', () => {
+    expect(parseArguments(['run', 'ship a timer', '--role', 'reasoning'])).toMatchObject({
+      ok: true,
+      value: { command: 'run', message: 'ship a timer', role: 'reasoning' },
+    });
+    expect(parseArguments(['run', '--role=fast', '--no-interactive'])).toMatchObject({
+      ok: true,
+      value: { command: 'run', role: 'fast', interactive: false },
+    });
+    expect(parseArguments(['run', 'plain goal'])).toMatchObject({
+      ok: true,
+      value: { command: 'run', role: undefined },
+    });
+  });
+
+  it('treats --role as a run option other commands ignore', () => {
+    expect(parseArguments(['status', '--role', 'fast'])).toMatchObject({
+      ok: true,
+      value: { command: 'status' },
+    });
+  });
+
   it('resolves relative workspaces against cwd', () => {
     const result = parseArguments(['--workspace', 'sub/dir', 'status']);
     expect(result.ok).toBe(true);
@@ -89,5 +111,9 @@ describe('parseArguments', () => {
     for (const command of ['init', 'run', 'status', 'inspect', 'mode', 'auto', 'pause', 'why', 'config']) {
       expect(USAGE).toContain(`relay ${command}`);
     }
+  });
+
+  it('usage text documents the role option', () => {
+    expect(USAGE).toContain('--role <name>');
   });
 });

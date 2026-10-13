@@ -1,7 +1,12 @@
 /**
  * Default configuration.
  *
- * Every mode routes to a concrete provider and model. The fake provider is a
+ * The seven workflow modes and the `intent` purpose route through named model
+ * roles defined in the `models` catalog. The defaults resolve to exactly the
+ * providers and models the mode-based defaults always used: Anthropic Sonnet
+ * for the reasoning-heavy stages, Anthropic Opus for technical design, OpenAI
+ * with a reasoning fallback for verification, and the lightweight Anthropic
+ * Haiku role for delivery and intent classification. The fake provider is a
  * valid target for demos and deterministic tests; it never contacts the
  * network.
  */
@@ -14,14 +19,22 @@ export const DEFAULT_CONFIG: RelayConfig = {
     openai: { apiKeyEnv: 'OPENAI_API_KEY' },
     anthropic: { apiKeyEnv: 'ANTHROPIC_API_KEY' },
   },
+  models: {
+    reasoning: { provider: 'anthropic', model: 'claude-sonnet-5-5' },
+    architect: { provider: 'anthropic', model: 'claude-opus-5-5' },
+    coding: { provider: 'anthropic', model: 'claude-sonnet-5-5' },
+    review: { provider: 'openai', model: 'gpt-5.2', fallbacks: ['reasoning'] },
+    fast: { provider: 'anthropic', model: 'claude-haiku-4-5' },
+  },
   routing: {
-    discovery: { provider: 'anthropic', model: 'claude-sonnet-5-5' },
-    specification: { provider: 'anthropic', model: 'claude-sonnet-5-5' },
-    'technical-design': { provider: 'anthropic', model: 'claude-opus-5-5' },
-    planning: { provider: 'anthropic', model: 'claude-sonnet-5-5' },
-    implementation: { provider: 'anthropic', model: 'claude-sonnet-5-5' },
-    verification: { provider: 'openai', model: 'gpt-5.2' },
-    delivery: { provider: 'anthropic', model: 'claude-haiku-4-5' },
+    intent: 'fast',
+    discovery: 'reasoning',
+    specification: 'reasoning',
+    'technical-design': 'architect',
+    planning: 'reasoning',
+    implementation: 'coding',
+    verification: 'review',
+    delivery: 'fast',
   },
   budgets: {
     maxTurns: 24,

@@ -15,6 +15,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ARTIFACT_KINDS, type ArtifactKind } from '../../src/core/artifacts.js';
+import type { AnyRelayEvent } from '../../src/core/events.js';
 import type { AutonomyBound } from '../../src/core/modes.js';
 import { replayProject } from '../../src/core/reducer.js';
 import { DEFAULT_CONFIG } from '../../src/config/defaults.js';
@@ -70,6 +71,50 @@ function fakeRouting(): RelayConfig['routing'] {
   };
 }
 
+/** Legacy inline-only effective config (no models catalog, no intent key). */
+function legacyFakeConfig(): RelayConfig {
+  return { ...DEFAULT_CONFIG, models: {}, routing: fakeRouting() };
+}
+
+/** Roles-catalog config: every mode on `worker`, intent explicitly on `quick`. */
+function rolesFakeConfig(): RelayConfig {
+  return {
+    ...DEFAULT_CONFIG,
+    models: {
+      worker: { provider: 'fake', model: 'fake-standard' },
+      quick: { provider: 'fake', model: 'fake-mini' },
+    },
+    routing: {
+      intent: 'quick',
+      discovery: 'worker',
+      specification: 'worker',
+      'technical-design': 'worker',
+      planning: 'worker',
+      implementation: 'worker',
+      verification: 'worker',
+      delivery: 'worker',
+    },
+  };
+}
+
+function requestedEvents(
+  events: readonly AnyRelayEvent[],
+): readonly Extract<AnyRelayEvent, { type: 'model.requested' }>[] {
+  return events.filter(
+    (event): event is Extract<AnyRelayEvent, { type: 'model.requested' }> =>
+      event.type === 'model.requested',
+  );
+}
+
+function respondedEvents(
+  events: readonly AnyRelayEvent[],
+): readonly Extract<AnyRelayEvent, { type: 'model.responded' }>[] {
+  return events.filter(
+    (event): event is Extract<AnyRelayEvent, { type: 'model.responded' }> =>
+      event.type === 'model.responded',
+  );
+}
+
 function makeSampleWorkspace(): string {
   const workspace = mkdtempSync(join(tmpdir(), 'relay-workflow-'));
   for (const entry of readdirSync(FIXTURE_DIR)) {
@@ -98,6 +143,8 @@ function createHarness(options: {
   readonly workspace: string;
   readonly budgets?: Partial<BudgetLimits>;
   readonly initialAutonomy?: AutonomyBound;
+  readonly config?: RelayConfig;
+  readonly roleOverride?: string;
 }): Harness {
   const paths = relayPaths(options.workspace);
   const db = openDatabase(paths.database);
@@ -107,7 +154,7 @@ function createHarness(options: {
   const repository = new ProjectRepository(db, store, replayProject);
   const artifacts = new ArtifactMarkdownStore(paths.artifactsDir);
   const tools = createDefaultToolRegistry(DEFAULT_CONFIG.tools);
-  const router = new ModelRouter(new Map([['fake', options.provider]]), fakeRouting());
+  const router = new ModelRouter(new Map([['fake', options.provider]]), options.config ?? legacyFakeConfig());
   const controller = new WorkflowController(
     {
       workspaceRoot: options.workspace,
@@ -118,7 +165,10 @@ function createHarness(options: {
       tools,
       budgets: { ...DEFAULT_CONFIG.budgets, ...options.budgets },
     },
-    { initialAutonomy: options.initialAutonomy ?? 'workflow' },
+    {
+      initialAutonomy: options.initialAutonomy ?? 'workflow',
+      ...(options.roleOverride !== undefined ? { roleOverride: options.roleOverride } : {}),
+    },
   );
   return { workspace: options.workspace, db, controller, artifacts, repository };
 }
@@ -594,5 +644,116 @@ describe('end-to-end workflow (sample repo fixture)', () => {
     await harness.controller.initialize(SAMPLE_GOAL);
     expect(harness.controller.projectId).not.toBeNull();
     await expect(harness.controller.initialize('another goal')).rejects.toThrow(ProjectAlreadyInitializedError);
+  });
+
+  it('leaves model events role-less on legacy inline routing', async () => {
+    const harness = createHarness({
+      provider: createWorkflowFakeProvider(),
+      workspace: makeSampleWorkspace(),
+    });
+    await harness.controller.initialize(SAMPLE_GOAL);
+    await harness.controller.runStep();
+
+    const events = harness.repository.loadProject().events;
+    for (const requested of requestedEvents(events)) {
+      expect(requested.payload.role).toBeUndefined();
+    }
+    for (const responded of respondedEvents(events)) {
+      expect(responded.payload.role).toBeUndefined();
+    }
+    const why = harness.controller.whyView();
+    expect(why.routing.length).toBeGreaterThan(0);
+    for (const row of why.routing) {
+      expect(row.role).toBeNull();
+    }
+  });
+});
+
+describe('end-to-end workflow (roles-based routing)', () => {
+  it('records the selected role in model events and why-view rows (worker modes, quick intent)', async () => {
+    const harness = createHarness({
+      provider: createWorkflowFakeProvider(),
+      workspace: makeSampleWorkspace(),
+      config: rolesFakeConfig(),
+    });
+    await harness.controller.initialize(SAMPLE_GOAL);
+
+    // 'continue' classifies as an advance intent (role quick) and then runs
+    // the discovery step (role worker), pausing at the brief approval gate.
+    const result = await harness.controller.handleInput('continue');
+    expect(result.outcome.kind).toBe('NEEDS_USER');
+    expect(questionOf(result)).toContain('Approve the opportunity-brief');
+
+    const events = harness.repository.loadProject().events;
+    const intentRequested = requestedEvents(events).filter(
+      (event) => event.payload.purpose === 'intent',
+    );
+    expect(intentRequested).toHaveLength(1);
+    expect(intentRequested[0]?.payload.role).toBe('quick');
+    expect(intentRequested[0]?.payload.model).toBe('fake-mini');
+
+    const discoveryRequested = requestedEvents(events).filter(
+      (event) => event.payload.purpose === 'mode:discovery',
+    );
+    expect(discoveryRequested).toHaveLength(1);
+    expect(discoveryRequested[0]?.payload.role).toBe('worker');
+    expect(discoveryRequested[0]?.payload.model).toBe('fake-standard');
+
+    const responded = respondedEvents(events);
+    expect(responded.length).toBeGreaterThanOrEqual(2);
+    for (const event of responded) {
+      expect(event.payload.role).toBe(event.payload.purpose === 'intent' ? 'quick' : 'worker');
+    }
+
+    const why = harness.controller.whyView();
+    expect(why.routing.some((row) => row.purpose === 'intent' && row.role === 'quick')).toBe(true);
+    expect(
+      why.routing.some((row) => row.purpose === 'mode:discovery' && row.role === 'worker'),
+    ).toBe(true);
+  });
+
+  it('completes the full pipeline on roles-based routing with roles on every model event', async () => {
+    const harness = createHarness({
+      provider: createWorkflowFakeProvider(),
+      workspace: makeSampleWorkspace(),
+      config: rolesFakeConfig(),
+    });
+    await harness.controller.initialize(SAMPLE_GOAL);
+    const final = await driveToDeliveryHold(harness.controller);
+
+    expect(final.state.currentMode).toBe('delivery');
+    expect(questionOf(final)).toMatch(DELIVERY_HOLD);
+    expect(final.state.verification.passed).toBe(true);
+
+    const events = harness.repository.loadProject().events;
+    const requested = requestedEvents(events);
+    expect(requested.length).toBeGreaterThan(0);
+    for (const event of requested) {
+      expect(event.payload.role, event.payload.purpose).toBe('worker');
+    }
+    for (const event of respondedEvents(events)) {
+      expect(event.payload.role, event.payload.purpose).toBe('worker');
+    }
+  });
+
+  it('applies the --role override ahead of the configured route', async () => {
+    const harness = createHarness({
+      provider: createWorkflowFakeProvider(),
+      workspace: makeSampleWorkspace(),
+      config: rolesFakeConfig(),
+      roleOverride: 'quick',
+    });
+    await harness.controller.initialize(SAMPLE_GOAL);
+
+    const result = await harness.controller.runStep();
+
+    expect(result.outcome.kind).toBe('NEEDS_USER');
+    const events = harness.repository.loadProject().events;
+    const requested = requestedEvents(events);
+    expect(requested).toHaveLength(1);
+    // The override replaces the configured discovery route: role quick, and
+    // quick's own model id — not discovery's worker/fake-standard route.
+    expect(requested[0]?.payload.role).toBe('quick');
+    expect(requested[0]?.payload.model).toBe('fake-mini');
   });
 });

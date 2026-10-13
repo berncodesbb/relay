@@ -38,6 +38,8 @@ export function describeCliError(error: unknown): CliErrorReport {
       };
     case 'UsageError':
       return { message, code: 2, hint: 'Run relay --help for usage.' };
+    case 'UnknownModelRoleError':
+      return { message, code: 2, hint: 'Run `relay config show` to list configured model roles.' };
     case 'ProjectNotFoundError':
       return { message, code: 1, hint: 'Run relay init first.' };
     case 'NotInitializedError':

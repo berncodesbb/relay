@@ -67,6 +67,7 @@ async function dispatch(
         auto: args.auto,
         provider: args.provider,
         model: args.model,
+        role: args.role,
         interactive: args.interactive,
         output,
       });

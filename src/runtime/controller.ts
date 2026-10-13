@@ -91,6 +91,12 @@ export type StepResult = { readonly outcome: ControllerOutcome; readonly state: 
 export type ControllerOptions = {
   readonly sessionId?: string;
   readonly providerOverrides?: { readonly provider?: ProviderName; readonly model?: string };
+  /**
+   * Invocation-wide semantic role override (`--role`): replaces the configured
+   * route's chain with the named role's expanded chain. Must exist in the
+   * effective model catalog; unknown roles fail with an actionable error.
+   */
+  readonly roleOverride?: string;
   /** Autonomy recorded at initialization; defaults to 'next-checkpoint'. */
   readonly initialAutonomy?: AutonomyBound;
   /** Aborts in-flight model steps cooperatively. */
@@ -139,6 +145,7 @@ export class WorkflowController {
   private readonly providerOverrides:
     | { readonly provider?: ProviderName; readonly model?: string }
     | undefined;
+  private readonly roleOverride: string | undefined;
   private readonly initialAutonomy: AutonomyBound | undefined;
   private readonly signal: AbortSignal | undefined;
   private readonly listeners = new Set<(event: ControllerUiEvent) => void>();
@@ -151,6 +158,7 @@ export class WorkflowController {
     this.services = services;
     this.sessionId = options?.sessionId ?? newId('session');
     this.providerOverrides = options?.providerOverrides;
+    this.roleOverride = options?.roleOverride;
     this.initialAutonomy = options?.initialAutonomy;
     this.signal = options?.signal;
     const projects = services.repository.listProjects();
@@ -455,6 +463,7 @@ export class WorkflowController {
               provider: route.provider,
               model: route.model,
               purpose: `mode:${mode}`,
+              ...(route.role !== null ? { role: route.role } : {}),
               errorKind: 'invalid-response',
               message: bounded(
                 `structured output failed validation twice: ${reparsed.issues.join('; ').slice(0, 800)}`,
@@ -1089,6 +1098,7 @@ export class WorkflowController {
           purpose: bounded(event.purpose, 200),
           mode,
           attempt: event.attempt,
+          ...(event.role !== null ? { role: event.role } : {}),
         });
         break;
       case 'model-response':
@@ -1096,6 +1106,7 @@ export class WorkflowController {
           provider: event.provider,
           model: event.model,
           purpose: bounded(event.purpose, 200),
+          ...(event.role !== null ? { role: event.role } : {}),
           usage: {
             inputTokens: Math.max(0, Math.floor(event.usage.inputTokens)),
             outputTokens: Math.max(0, Math.floor(event.usage.outputTokens)),
@@ -1109,6 +1120,7 @@ export class WorkflowController {
           provider: event.provider,
           model: event.model,
           purpose: bounded(event.purpose, 200),
+          ...(event.role !== null ? { role: event.role } : {}),
           errorKind: event.errorKind,
           message: bounded(event.message, 2000),
           attempts: event.attempts,
@@ -1305,14 +1317,22 @@ export class WorkflowController {
     return null;
   }
 
+  /**
+   * Resolve the route chain for a call, applying invocation overrides in the
+   * documented precedence (later wins): the configured route, `--role`, then
+   * `--provider` (filter), then `--model` (rewrite).
+   */
   private resolveRoutes(purpose: string, mode: WorkflowMode | null): readonly ResolvedRoute[] {
-    const chain = this.services.router.routeChain({ mode, purpose });
+    let routes = this.services.router.routeChain({ mode, purpose });
+    if (this.roleOverride !== undefined) {
+      // Throws an actionable RouteUnavailableError for unknown roles.
+      routes = this.services.router.chainForRole(this.roleOverride);
+    }
     const overrides = this.providerOverrides;
-    if (overrides === undefined) return chain;
-    let routes = chain;
+    if (overrides === undefined) return routes;
     if (overrides.provider !== undefined) {
       const provider = overrides.provider;
-      routes = chain.filter((route) => route.providerName === provider);
+      routes = routes.filter((route) => route.providerName === provider);
       if (routes.length === 0) {
         throw new RouteUnavailableError(
           `provider override "${provider}" matched no route in the chain for purpose "${purpose}"`,
@@ -1326,12 +1346,12 @@ export class WorkflowController {
     return routes;
   }
 
-  private describeRoute(mode: WorkflowMode): { provider: string; model: string } {
+  private describeRoute(mode: WorkflowMode): { provider: string; model: string; role: string | null } {
     const routes = this.resolveRoutes(`mode:${mode}`, mode);
     const first = routes[0];
     return first !== undefined
-      ? { provider: first.providerName, model: first.model }
-      : { provider: 'unknown', model: 'unknown' };
+      ? { provider: first.providerName, model: first.model, role: first.role }
+      : { provider: 'unknown', model: 'unknown', role: null };
   }
 
   private newBudgetTracker(): BudgetTracker {

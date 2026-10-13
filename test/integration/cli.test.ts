@@ -147,12 +147,15 @@ describe('cli init', () => {
 
 describe('cli config', () => {
   it(
-    'show prints YAML with routing, path lists layers, get resolves dotted keys',
+    'show prints YAML with the models catalog and routing, path lists layers, get resolves dotted keys',
     async () => {
       const ws = makeWorkspace('config');
       const show = await relay(['config', 'show'], ws);
       expect(show.code).toBe(0);
       expect(show.stdout).toContain('routing:');
+      expect(show.stdout).toContain('models:');
+      expect(show.stdout).toContain('reasoning:');
+      expect(show.stdout).toContain('fast:');
       expect(show.stdout).toContain('# effective config');
       expect(existsSync(join(ws.dir, '.relay'))).toBe(false);
 
@@ -162,17 +165,27 @@ describe('cli config', () => {
       expect(path.stdout).toContain('project:');
       expect(existsSync(join(ws.dir, '.relay'))).toBe(false);
 
-      const model = await relay(['config', 'get', 'routing.discovery.model'], ws);
-      expect(model.code).toBe(0);
-      expect(model.stdout.trim().length).toBeGreaterThan(0);
-      expect(model.stdout).not.toContain('unknown key');
+      // Routing values are model-role names now; the concrete model lives in
+      // the models catalog (routing.discovery -> reasoning -> claude-sonnet-5-5).
+      const discovery = await relay(['config', 'get', 'routing.discovery'], ws);
+      expect(discovery.code).toBe(0);
+      expect(discovery.stdout.trim()).toBe('reasoning');
+      expect(discovery.stdout).not.toContain('unknown key');
+
+      const intent = await relay(['config', 'get', 'routing.intent'], ws);
+      expect(intent.code).toBe(0);
+      expect(intent.stdout.trim()).toBe('fast');
+
+      const roleModel = await relay(['config', 'get', 'models.reasoning.model'], ws);
+      expect(roleModel.code).toBe(0);
+      expect(roleModel.stdout.trim()).toBe('claude-sonnet-5-5');
 
       const bogus = await relay(['config', 'get', 'bogus.key'], ws);
       expect(bogus.code).toBe(1);
       expect(bogus.stderr).toContain('unknown key');
       expect(existsSync(join(ws.dir, '.relay'))).toBe(false);
     },
-    90_000,
+    120_000,
   );
 });
 
@@ -268,5 +281,71 @@ describe.skipIf(!CONTROLLER_READY)('cli workflow commands', () => {
       expect(inspect.stdout).toContain('#');
     },
     180_000,
+  );
+});
+
+// -- role override -----------------------------------------------------------------
+
+describe('cli role override', () => {
+  it(
+    'unknown --role exits 2, names the role and the available roles, and creates no .relay state',
+    async () => {
+      const ws = makeWorkspace('role-bad');
+      const result = await relay(
+        ['run', 'demo goal', '--provider', 'fake', '--role', 'nonexistent', '--no-interactive'],
+        ws,
+      );
+      expect(result.code).toBe(2);
+      expect(result.stderr).toContain('unknown model role "nonexistent"');
+      expect(result.stderr).toContain('reasoning, architect, coding, review, fast');
+      expect(result.stderr).toContain('relay config show');
+      // A usage failure must never leave project state behind.
+      expect(existsSync(join(ws.dir, '.relay'))).toBe(false);
+    },
+    60_000,
+  );
+
+  it(
+    'valid --role runs the fake flow and relay why shows the role in routing rows',
+    async () => {
+      const ws = makeWorkspace('role-fast');
+      // Also the combined-override smoke: --provider narrows every route (the
+      // role's included) to the fake provider while --role keeps the semantics.
+      const run = await relay(
+        ['run', 'demo goal', '--provider', 'fake', '--role', 'fast', '--no-interactive'],
+        ws,
+      );
+      expect(run.code).toBe(0);
+      expect(existsSync(join(ws.dir, '.relay', 'state.db'))).toBe(true);
+
+      const why = await relay(['why'], ws);
+      expect(why.code).toBe(0);
+      expect(why.stdout).toContain('Routing:');
+      expect(why.stdout).toContain('fast');
+    },
+    120_000,
+  );
+
+  it(
+    '--role and --provider combine in either order: the provider filter narrows to fake',
+    async () => {
+      const ws = makeWorkspace('role-combined');
+      const run = await relay(
+        ['run', 'demo goal', '--role', 'fast', '--provider', 'fake', '--no-interactive'],
+        ws,
+      );
+      expect(run.code).toBe(0);
+    },
+    90_000,
+  );
+
+  it(
+    'RELAY_FAKE=1 without --role still runs the fake flow (existing behavior)',
+    async () => {
+      const ws = makeWorkspace('fake-only');
+      const run = await relay(['run', 'demo goal', '--no-interactive'], ws);
+      expect(run.code).toBe(0);
+    },
+    90_000,
   );
 });

@@ -83,7 +83,7 @@ export ANTHROPIC_API_KEY=sk-ant-...   # https://console.anthropic.com/settings/k
 export OPENAI_API_KEY=sk-...          # https://platform.openai.com/api-keys
 ```
 
-The default routing uses Anthropic for six modes and OpenAI for verification, so a default setup needs an Anthropic key (plus an OpenAI key unless you reroute verification). Routing is configuration, not model output — see [docs/configuration.md](docs/configuration.md) for per-mode provider/model/fallback tables and examples routing everything to one vendor.
+Routing is configuration, not model output. Each routing purpose — the seven workflow modes plus `intent` (input classification) — maps to a named model role, and each role maps to a provider and model. The built-in defaults define five roles (`reasoning`, `architect`, `coding`, `review`, `fast`): Anthropic for everything except verification on OpenAI, so a default setup needs an Anthropic key (plus an OpenAI key unless you reroute verification). Roles are user-defined — add your own (for example `security-review`) in `relay.config.yaml` and point any purpose at it. See [docs/configuration.md](docs/configuration.md) for the full annotated configuration, the legacy inline routing form, and examples routing everything to one vendor.
 
 The offline fake provider (`--provider fake`) never touches the network. It is a valid target for demos and deterministic tests:
 
@@ -140,6 +140,7 @@ relay config [show|path|get <key>]         Inspect effective configuration
 Options:
   --workspace <path>     Operate on this directory (default: current directory)
   --no-interactive       Force plain, non-interactive output (scripts and CI)
+  --role <name>          Route every model call to this configured role
   --provider <name>      Force a provider for this invocation (openai|anthropic|fake)
   --model <name>         Override the routed model for this invocation
   --auto <bound>         Set the autonomy bound for a run
@@ -148,6 +149,8 @@ Options:
   -h, --help             Show this help
   -V, --version          Show version
 ```
+
+When combined, invocation overrides apply in order — configured route, then `--role`, then `--provider`, then `--model` (later wins); `--provider`/`--model` are low-level and may produce combinations absent from your role catalog. An unknown `--role` fails before any project state is created.
 
 Autonomy bounds: `off` pauses at every checkpoint, `next-checkpoint` (the default) runs until the next artifact approval or intervention, `until:<mode>` runs until the workflow enters that mode, `workflow` runs end to end while still pausing for consequential choices, approvals, destructive operations, and delivery.
 

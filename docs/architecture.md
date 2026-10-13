@@ -135,7 +135,15 @@ Delivery assembles the trace from requirement to change to evidence, then stops:
 
 ## Model routing
 
-`ModelRouter` (`src/runtime/model-router.ts`) turns configuration into a route chain. Routing is fixed per mode — never chosen by a model: each of the seven modes maps to a provider, model, optional fallback order (max 3, kept only for providers actually registered), and optional per-route limits (`maxOutputTokens`, `temperature`). Non-mode purposes (intent classification, status summaries) intentionally use the first configured route so utility calls need no routing entry of their own. `routeChain()` returns primary plus fallbacks; the agent loop retries within a route before failing over to the next.
+Routing is deterministic configuration — never model output, and never a model choosing its own role. Every call resolves **purpose → role → provider**:
+
+1. **Purpose.** The call's routing purpose is either the current workflow mode (`discovery` … `delivery`) or a utility purpose such as `intent` (input classification).
+2. **Role.** The routing entry for that purpose names a model role from the user-defined `models` catalog — built-in names like `reasoning` or `coding`, or user names like `security-review`. A role owns a provider, a model, optional limits, and optional role-name fallbacks. Legacy inline routing objects carry no role and keep working unchanged.
+3. **Provider.** The role resolves to a registered provider adapter.
+
+Normalization happens once, at the configuration boundary: `src/config` reduces role references and legacy inline objects into `NormalizedRouting` (`src/config/normalized.ts`) — a chain per defined role, a chain per routing key, plus a legacy fallback — before the router runs, so the raw string/object union never reaches the runtime or controllers. `ModelRouter` (`src/runtime/model-router.ts`) resolves the chain: an explicit purpose entry (`intent`) wins over the workflow mode's route, and only a non-mode purpose with no explicit entry falls back to the first configured route (the historical behavior). Role fallback chains expand deterministically — declared order, deduplicated without reordering, at most one primary plus three fallbacks — keeping only providers actually registered; an unregistered primary provider fails immediately with an actionable error. `routeChain()` returns the chain; the agent loop retries within a route before failing over to the next.
+
+Model events carry the attempted role as an optional payload field (`role` on `model.requested`, `model.responded`, and `model.failed`; the event schema version stays 1), so pre-role event logs replay unchanged and legacy inline routes simply record no role. `relay why` and its JSON/TUI projections surface the role next to provider, model, and purpose when it is present.
 
 ## Providers
 
@@ -146,7 +154,7 @@ Delivery assembles the trace from requirement to change to evidence, then stops:
 - **Error normalization.** `toProviderFailure` maps SDK/fetch errors to `ProviderFailure` with a neutral kind (`rate-limit`, `server`, `network`, `timeout`, `canceled`, `auth`, `invalid-response`, `unknown`), a retryability hint, and a message trimmed to 300 chars with credential-shaped substrings redacted. Headers and bodies never survive the adapter.
 - **Fake provider.** In-process, offline, scriptable per purpose/model/call-count with ordered failures; records a call log for assertions.
 - **Retry/fallback.** `withRetries` retries only retryable failures (rate limits, 5xx, network, timeouts) with exponential backoff plus jitter, at most 3 attempts per route; cancellation and auth fail fast. The agent loop then tries the route chain's fallbacks in order.
-- **What gets recorded.** `model.requested` / `model.responded` (provider, model, purpose, usage, tool-call count, duration) / `model.failed` (kind, redacted message, attempts). Keys, headers, and request bodies are never recorded.
+- **What gets recorded.** `model.requested` / `model.responded` (provider, model, purpose, optional role, usage, tool-call count, duration) / `model.failed` (kind, redacted message, attempts). Keys, headers, and request bodies are never recorded.
 
 ## Tools and safety
 
@@ -189,7 +197,7 @@ The fake provider is the key to determinism: tests script responses (and ordered
 
 ## Extension points
 
-- **New provider adapter.** Implement `ModelProvider` from `src/providers/provider.ts`, normalize errors through `toProviderFailure`, and add the name to `PROVIDER_NAMES` + routing in `src/config`. Nothing outside the adapter changes.
+- **New provider adapter.** Implement `ModelProvider` from `src/providers/provider.ts`, normalize errors through `toProviderFailure`, and add the name to `PROVIDER_NAMES` in `src/config` so model roles can reference it. Nothing outside the adapter changes.
 - **New tool.** Define a `ToolDefinition` (Zod args, capability, timeout, output cap) and register it in `createDefaultToolRegistry`. Mode capability lists and the permission policy gate it automatically.
 - **New mode or artifact kind.** Extend `WORKFLOW_MODES`/`MODE_CONTRACTS` and `ARTIFACT_KINDS`/`ARTIFACT_DEPENDENCIES` together (plus a draft schema, renderer section, and mode-entry gates). The dependency graph and invalidation derive from these tables, never from hardcoded lists.
 - **Configuration layers.** Add or adjust layers in `src/config/load.ts`; see [configuration.md](configuration.md) for the current precedence.

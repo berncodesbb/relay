@@ -25,8 +25,9 @@ function route(
   providerName: ProviderName,
   model = 'fake-standard',
   limits?: ResolvedRoute['limits'],
+  role: string | null = null,
 ): ResolvedRoute {
-  return { provider, providerName, model, ...(limits !== undefined ? { limits } : {}) };
+  return { provider, providerName, model, role, ...(limits !== undefined ? { limits } : {}) };
 }
 
 function makeRegistry(): ToolRegistry {
@@ -405,6 +406,59 @@ describe('runAgentLoop', () => {
     await runAgentLoop(options);
 
     expect(provider.callLog[0]?.model).toBe('fake-standard');
+  });
+
+  it('threads the attempted route role through request, response, and failure events', async () => {
+    const primary = new FakeProvider(
+      [{ match: {}, response: { error: { kind: 'server', retryable: true, message: 'primary down', failTimes: 10 } } }],
+      { text: 'never' },
+    );
+    const fallback = new FakeProvider([], { text: 'rescued' });
+    const { options, events } = baseOptions({
+      routes: [
+        route(primary, 'openai', 'gpt-5.2', undefined, 'review'),
+        route(fallback, 'anthropic', 'claude-sonnet-5-5', undefined, 'reasoning'),
+      ],
+    });
+
+    const result = await runAgentLoop(options);
+
+    expect(result.status).toBe('completed');
+    // Every request names the role of the route actually attempted: the three
+    // failed attempts carry the primary's role, the fallback its own.
+    const requests = events.filter((event) => event.kind === 'model-request');
+    for (const request of requests) {
+      if (request.kind !== 'model-request') continue;
+      expect(request.role).toBe(request.provider === 'openai' ? 'review' : 'reasoning');
+    }
+    const failure = events.find((event) => event.kind === 'model-failure');
+    if (failure?.kind === 'model-failure') {
+      expect(failure.provider).toBe('openai');
+      expect(failure.role).toBe('review');
+    }
+    const response = events.find((event) => event.kind === 'model-response');
+    if (response?.kind === 'model-response') {
+      expect(response.provider).toBe('anthropic');
+      expect(response.role).toBe('reasoning');
+    }
+  });
+
+  it('reports role null on model events for role-less (legacy inline) routes', async () => {
+    const provider = new FakeProvider([], { text: 'done' });
+    const { options, events } = baseOptions({ provider });
+
+    await runAgentLoop(options);
+
+    const modelEvents = events.filter(
+      (event) =>
+        event.kind === 'model-request' || event.kind === 'model-response' || event.kind === 'model-failure',
+    );
+    expect(modelEvents.length).toBeGreaterThan(0);
+    for (const event of modelEvents) {
+      expect(
+        (event as { kind: string; role: string | null }).role,
+      ).toBeNull();
+    }
   });
 
   it('converts tool timeouts into error tool-results and keeps going', async () => {

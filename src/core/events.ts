@@ -178,6 +178,12 @@ export const modelRequestedSchema = z.object({
   purpose: z.string().min(1).max(200),
   mode: mode.nullable(),
   attempt: z.number().int().min(1),
+  /**
+   * Semantic model-role name selected by routing, when the route came from a
+   * role reference. Optional and absent for legacy inline routes and pre-role
+   * event logs, which must keep validating and replaying unchanged.
+   */
+  role: z.string().min(1).max(100).optional(),
 });
 
 export type ModelRequestedPayload = z.infer<typeof modelRequestedSchema>;
@@ -186,6 +192,7 @@ export const modelRespondedSchema = z.object({
   provider: z.string().min(1),
   model: z.string().min(1),
   purpose: z.string().min(1).max(200),
+  role: z.string().min(1).max(100).optional(),
   usage: z.object({ inputTokens: z.number().int().min(0), outputTokens: z.number().int().min(0) }),
   toolCalls: z.number().int().min(0),
   durationMs: z.number().int().min(0),
@@ -197,6 +204,7 @@ export const modelFailedSchema = z.object({
   provider: z.string().min(1),
   model: z.string().min(1),
   purpose: z.string().min(1).max(200),
+  role: z.string().min(1).max(100).optional(),
   errorKind: z.enum([
     'rate-limit',
     'server',

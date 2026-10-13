@@ -42,13 +42,31 @@ export type CliContext = {
   close(): void;
 };
 
-/** `--provider` / `--model` values carried from the parsed command line. */
-type ProviderOverrides = { provider?: ProviderName; model?: string };
+/** `--provider` / `--model` / `--role` values carried from the parsed command line. */
+type InvocationOverrides = { provider?: ProviderName; model?: string; role?: string };
 
-const controllerOverrides = new WeakMap<CliContext, ProviderOverrides>();
+const controllerOverrides = new WeakMap<CliContext, InvocationOverrides>();
 
 /** Provider names the CLI accepts for `--provider`. */
 export const CLI_PROVIDER_OVERRIDES: readonly ProviderName[] = ['openai', 'anthropic', 'fake'];
+
+/**
+ * Raised when a `--role` value is absent from the effective `models` catalog.
+ * `relay run` validates the role before creating project state, so this is a
+ * defensive guard at controller-construction time, not the user-facing path.
+ */
+export class UnknownModelRoleError extends Error {
+  constructor(
+    readonly role: string,
+    readonly available: readonly string[],
+  ) {
+    super(
+      `unknown model role "${role}"; available roles: `
+        + (available.length > 0 ? available.join(', ') : '(none defined)'),
+    );
+    this.name = 'UnknownModelRoleError';
+  }
+}
 
 /**
  * Build the full stateful context: layered configuration, an open (and
@@ -60,6 +78,7 @@ export function createCliContext(options: {
   workspaceRoot: string;
   providerOverride?: 'openai' | 'anthropic' | 'fake';
   modelOverride?: string;
+  roleOverride?: string;
 }): CliContext {
   const forceProvider = options.providerOverride ?? (process.env.RELAY_FAKE === '1' ? 'fake' : undefined);
   const loaded = loadConfig({
@@ -88,9 +107,10 @@ export function createCliContext(options: {
     },
   };
 
-  const overrides: ProviderOverrides = { ...(controllerOverrides.get(context) ?? {}) };
+  const overrides: InvocationOverrides = { ...(controllerOverrides.get(context) ?? {}) };
   if (options.providerOverride !== undefined) overrides.provider = options.providerOverride;
   if (options.modelOverride !== undefined) overrides.model = options.modelOverride;
+  if (options.roleOverride !== undefined) overrides.role = options.roleOverride;
   controllerOverrides.set(context, overrides);
   return context;
 }
@@ -108,15 +128,26 @@ export async function createController(
   const fakeForced =
     controllerOverrides.get(context)?.provider === 'fake' || process.env.RELAY_FAKE === '1';
   const providers = await buildProviders(config, fakeForced);
-  const router = new ModelRouter(providers, config.routing);
+  const router = new ModelRouter(providers, config);
+
+  const role = controllerOverrides.get(context)?.role;
+  if (role !== undefined && (config.models ?? {})[role] === undefined) {
+    // Defensive: `relay run` validates --role against the same effective
+    // configuration before creating the context, so this should be
+    // unreachable — surface an actionable error rather than routing on.
+    const available = Object.keys(config.models ?? {});
+    throw new UnknownModelRoleError(role, available);
+  }
 
   const constructorOptions: {
     sessionId?: string;
     providerOverrides?: { provider?: ProviderName; model?: string };
+    roleOverride?: string;
     signal?: AbortSignal;
   } = {};
   if (options?.sessionId !== undefined) constructorOptions.sessionId = options.sessionId;
   if (options?.signal !== undefined) constructorOptions.signal = options.signal;
+  if (role !== undefined) constructorOptions.roleOverride = role;
   const overrides = controllerOverrides.get(context);
   if (overrides !== undefined && (overrides.provider !== undefined || overrides.model !== undefined)) {
     const providerOverrides: { provider?: ProviderName; model?: string } = {};

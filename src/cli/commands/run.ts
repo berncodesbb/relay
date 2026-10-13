@@ -14,6 +14,7 @@ import {
   parseAutonomyBound,
   type AutonomyBound,
 } from '../../core/modes.js';
+import { loadConfig } from '../../config/load.js';
 import type { ControllerUiEvent, StepResult, WorkflowController } from '../../runtime/controller.js';
 import { CLI_PROVIDER_OVERRIDES, createCliContext, createController, hasRelayState } from '../context.js';
 import type { OutputWriter } from '../output.js';
@@ -31,10 +32,11 @@ export async function runRun(options: {
   auto: string | undefined;
   provider: string | undefined;
   model: string | undefined;
+  role: string | undefined;
   interactive: boolean;
   output: OutputWriter;
 }): Promise<number> {
-  const { workspaceRoot, message, provider, model, interactive, output } = options;
+  const { workspaceRoot, message, provider, model, role, interactive, output } = options;
 
   if (provider !== undefined && !isProviderName(provider)) {
     output.error(`unknown provider "${provider}"`);
@@ -59,10 +61,31 @@ export async function runRun(options: {
     return 2;
   }
 
+  // Validate --role against the effective model catalog BEFORE any project
+  // state is created (createCliContext below opens the database). The probe
+  // loads configuration read-only and mirrors the provider/RELAY_FAKE
+  // override inputs the context will use, so both see the same catalog.
+  if (role !== undefined) {
+    const forced =
+      isProviderName(provider) ? provider : process.env.RELAY_FAKE === '1' ? 'fake' : undefined;
+    const { config } = loadConfig({
+      workspaceRoot,
+      ...(forced !== undefined ? { overrides: { forceProvider: forced } } : {}),
+    });
+    const available = Object.keys(config.models ?? {});
+    if (!available.includes(role)) {
+      output.error(`unknown model role "${role}"`);
+      output.error(`Available roles: ${available.length > 0 ? available.join(', ') : '(none defined)'}`);
+      output.error('See relay config show');
+      return 2;
+    }
+  }
+
   const context = createCliContext({
     workspaceRoot,
     ...(isProviderName(provider) ? { providerOverride: provider } : {}),
     ...(model !== undefined ? { modelOverride: model } : {}),
+    ...(role !== undefined ? { roleOverride: role } : {}),
   });
   try {
     const useTui = interactive && process.stdout.isTTY === true && process.stdin.isTTY === true;

@@ -63,6 +63,8 @@ export type WhyView = {
     readonly provider: string;
     readonly model: string;
     readonly purpose: string;
+    /** Role of the attempted route; null for legacy inline (role-less) events. */
+    readonly role: string | null;
     readonly at: string;
     readonly ok: boolean;
   }[];
@@ -183,31 +185,50 @@ export function buildStatusView(
   };
 }
 
-/** Fold model.requested/model.failed events from the tail into routing rows. */
+/**
+ * Fold model.requested/model.failed events from the tail into routing rows.
+ * A failure with a role prefers the request row for the same role and only
+ * then falls back to the legacy provider+model+purpose match, so role-less
+ * events keep rendering exactly as before.
+ */
 function routingTail(events: readonly AnyRelayEvent[]): WhyView['routing'] {
-  const routing: { provider: string; model: string; purpose: string; at: string; ok: boolean }[] = [];
+  const routing: {
+    provider: string;
+    model: string;
+    purpose: string;
+    role: string | null;
+    at: string;
+    ok: boolean;
+  }[] = [];
   for (const event of events.slice(-ROUTING_TAIL_EVENTS)) {
     if (event.type === 'model.requested') {
       routing.push({
         provider: event.payload.provider,
         model: event.payload.model,
         purpose: event.payload.purpose,
+        role: event.payload.role ?? null,
         at: event.timestamp,
         ok: true,
       });
     } else if (event.type === 'model.failed') {
-      for (let index = routing.length - 1; index >= 0; index -= 1) {
-        const entry = routing[index];
-        if (entry === undefined) continue;
-        if (
-          entry.ok &&
-          entry.provider === event.payload.provider &&
-          entry.model === event.payload.model &&
-          entry.purpose === event.payload.purpose
-        ) {
-          entry.ok = false;
-          break;
+      const failureRole = event.payload.role ?? null;
+      const matchRow = (requireRoleMatch: boolean): number => {
+        for (let index = routing.length - 1; index >= 0; index -= 1) {
+          const entry = routing[index];
+          if (entry === undefined || !entry.ok) continue;
+          if (entry.provider !== event.payload.provider) continue;
+          if (entry.model !== event.payload.model) continue;
+          if (entry.purpose !== event.payload.purpose) continue;
+          if (requireRoleMatch && entry.role !== failureRole) continue;
+          return index;
         }
+        return -1;
+      };
+      let index = matchRow(failureRole !== null);
+      if (index < 0 && failureRole !== null) index = matchRow(false);
+      if (index >= 0) {
+        const entry = routing[index];
+        if (entry !== undefined) entry.ok = false;
       }
     }
   }

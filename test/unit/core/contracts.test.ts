@@ -10,6 +10,7 @@ import {
   InvalidEventPayloadError,
   UnknownEventTypeError,
   validateStoredEvent,
+  EVENT_PAYLOAD_VERSIONS,
   type StoredEventEnvelope,
 } from '../../../src/core/events.js';
 import { intentProposalSchema, isIntentAmbiguous, parseSlashCommand } from '../../../src/core/intents.js';
@@ -33,6 +34,36 @@ describe('contract smoke', () => {
 });
 
 describe('core contracts', () => {
+  it('accepts model events with and without the optional role field', () => {
+    const envelope = (payload: unknown, sequence: number) => ({
+      id: `e${sequence}`, projectId: 'p1', sequence, sessionId: null,
+      type: 'model.requested' as const, schemaVersion: 1, timestamp: '2026-10-13T00:00:00.000Z',
+      correlationId: 'c1', causationId: null, payload,
+    });
+    // Pre-role payload: no role key at all — must keep validating (legacy logs).
+    const legacy = validateStoredEvent(envelope({
+      provider: 'anthropic', model: 'claude-sonnet-5-5', purpose: 'mode:discovery', mode: 'discovery', attempt: 1,
+    }, 1));
+    expect((legacy.payload as Record<string, unknown>)['role']).toBeUndefined();
+    // Role-aware payload: optional field validates and round-trips.
+    const roled = validateStoredEvent(envelope({
+      provider: 'anthropic', model: 'claude-sonnet-5-5', purpose: 'mode:discovery', mode: 'discovery', attempt: 1,
+      role: 'reasoning',
+    }, 2));
+    expect((roled.payload as Record<string, unknown>)['role']).toBe('reasoning');
+    // Role must be a non-empty bounded string when present.
+    expect(() => validateStoredEvent(envelope({
+      provider: 'anthropic', model: 'claude-sonnet-5-5', purpose: 'mode:discovery', mode: 'discovery', attempt: 1,
+      role: '',
+    }, 3))).toThrow(/role/);
+  });
+
+  it('keeps model event payload schema versions at 1 (additive role field)', () => {
+    expect(EVENT_PAYLOAD_VERSIONS['model.requested']).toBe(1);
+    expect(EVENT_PAYLOAD_VERSIONS['model.responded']).toBe(1);
+    expect(EVENT_PAYLOAD_VERSIONS['model.failed']).toBe(1);
+  });
+
   it('orders the seven workflow modes', () => {
     expect(WORKFLOW_MODES).toEqual([
       'discovery',

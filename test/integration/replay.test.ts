@@ -17,6 +17,7 @@ import { SqliteEventStore } from '../../src/storage/event-store.js';
 import { ProjectRepository } from '../../src/storage/project-repository.js';
 import { replayProject } from '../../src/core/reducer.js';
 import type { AnyRelayEvent, EventAppendInput, RelayEventType } from '../../src/core/events.js';
+import { buildWhyView } from '../../src/runtime/controller-views.js';
 import { makeEvent, fullPipelineApproved, artifactRevised } from '../unit/core/event-factories.js';
 
 const GOAL = 'Ship a workflow CLI that preserves product intent';
@@ -156,6 +157,45 @@ describe('event-sourced project state', () => {
     expect(state.staleArtifacts).toEqual(
       expect.arrayContaining(['art-trd', 'art-plan', 'art-vr', 'art-dr']),
     );
+  });
+
+  it('replays and renders pre-role model events (role-less payloads stay valid)', async () => {
+    await appendAll([
+      makeEvent({
+        type: 'model.requested',
+        projectId,
+        payload: { provider: 'anthropic', model: 'claude-sonnet-5-5', purpose: 'mode:discovery', mode: 'discovery', attempt: 1 },
+      }),
+      makeEvent({
+        type: 'model.responded',
+        projectId,
+        payload: {
+          provider: 'anthropic',
+          model: 'claude-sonnet-5-5',
+          purpose: 'mode:discovery',
+          usage: { inputTokens: 10, outputTokens: 5 },
+          toolCalls: 0,
+          durationMs: 25,
+        },
+      }),
+      makeEvent({
+        type: 'model.failed',
+        projectId,
+        payload: { provider: 'anthropic', model: 'claude-sonnet-5-5', purpose: 'mode:discovery', errorKind: 'rate-limit', message: 'too many requests', attempts: 3, durationMs: 900 },
+      }),
+    ]);
+
+    // Fresh handles: the log replays with identical state...
+    const loaded = openFreshRepository().loadProject();
+    expect(loaded.state.stats.modelCalls).toBe(1);
+    expect(loaded.state.stats.lastModelError).toContain('rate-limit');
+
+    // ...and the why view renders routing rows from role-less events: one row
+    // per request, with the failure matched back onto its request row.
+    const why = buildWhyView(loaded.state, loaded.events);
+    expect(why.routing).toHaveLength(1);
+    expect(why.routing[0]).toMatchObject({ provider: 'anthropic', model: 'claude-sonnet-5-5', purpose: 'mode:discovery' });
+    expect(why.routing[0]?.ok).toBe(false);
   });
 
   it('rejects a sequence gap with an actionable diagnostic', async () => {

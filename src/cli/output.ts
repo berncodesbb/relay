@@ -320,11 +320,15 @@ function collectBlockers(value: unknown): readonly string[] {
 
 function renderRouting(value: unknown): readonly string[] {
   const lines: string[] = [];
+  // Route description: `role provider/model` when the routing row carries a
+  // semantic model-role name, plain `provider/model` for legacy role-less rows.
   const describeRoute = (record: Loose): string | null => {
+    const role = firstString(record, ['role']);
     const provider = firstString(record, ['provider', 'providerName']);
     const model = firstString(record, ['model']);
-    if (provider !== null && model !== null) return `${provider}/${model}`;
-    return provider ?? model;
+    const route = provider !== null && model !== null ? `${provider}/${model}` : (provider ?? model);
+    if (route === null) return role;
+    return role !== null ? `${role} ${route}` : route;
   };
   if (Array.isArray(value)) {
     for (const entry of value.slice(-12)) {

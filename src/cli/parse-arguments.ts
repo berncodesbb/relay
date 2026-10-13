@@ -27,6 +27,7 @@ Options:
   --no-interactive       Force plain, non-interactive output (scripts and CI)
   --provider <name>      Force a provider for this invocation (openai|anthropic|fake)
   --model <name>         Override the routed model for this invocation
+  --role <name>          Select a model role for this invocation (see relay config show)
   --auto <bound>         Set the autonomy bound for a run
   --json                 Machine-readable output where supported
   --no-color             Disable ANSI colors
@@ -52,6 +53,7 @@ export type ParsedArguments =
     readonly auto: string | undefined;
     readonly provider: string | undefined;
     readonly model: string | undefined;
+    readonly role: string | undefined;
     readonly interactive: boolean;
     readonly json: boolean;
   }
@@ -122,7 +124,7 @@ function tokenize(argv: readonly string[]): {
   const errors: string[] = [];
   let command: string | undefined;
   let i = 0;
-  const valueFlags = new Set(['workspace', 'provider', 'model', 'auto', 'goal']);
+  const valueFlags = new Set(['workspace', 'provider', 'model', 'role', 'auto', 'goal']);
 
   while (i < argv.length) {
     const token = argv[i]!;
@@ -186,6 +188,7 @@ export function parseArguments(argv: readonly string[]): ParseResult {
     }
     case 'run': {
       const autoFlag = flags.get('auto');
+      const roleFlag = flags.get('role');
       const message = positionals.join(' ') || undefined;
       return {
         ok: true,
@@ -195,6 +198,7 @@ export function parseArguments(argv: readonly string[]): ParseResult {
           auto: typeof autoFlag === 'string' ? autoFlag : undefined,
           provider: common.provider,
           model: common.model,
+          role: typeof roleFlag === 'string' ? roleFlag : undefined,
           interactive: common.interactive,
           json: common.json,
         },

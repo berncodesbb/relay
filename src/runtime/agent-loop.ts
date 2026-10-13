@@ -29,12 +29,21 @@ import { withRetries } from './retry.js';
 import type { ResolvedRoute } from './model-router.js';
 
 export type AgentLoopEvent =
-  | { kind: 'model-request'; provider: string; model: string; purpose: string; attempt: number }
+  | {
+      kind: 'model-request';
+      provider: string;
+      model: string;
+      purpose: string;
+      /** Role of the route actually attempted; null for legacy inline routes. */
+      role: string | null;
+      attempt: number;
+    }
   | {
       kind: 'model-response';
       provider: string;
       model: string;
       purpose: string;
+      role: string | null;
       usage: TokenUsage;
       toolCalls: number;
       durationMs: number;
@@ -44,6 +53,7 @@ export type AgentLoopEvent =
       provider: string;
       model: string;
       purpose: string;
+      role: string | null;
       errorKind: ModelErrorKind;
       message: string;
       attempts: number;
@@ -165,6 +175,7 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
             provider: route.providerName,
             model: route.model,
             purpose: options.purpose,
+            role: route.role,
             attempt,
           });
           const callStartedAt = Date.now();
@@ -191,6 +202,7 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
             provider: route.providerName,
             model: route.model,
             purpose: options.purpose,
+            role: route.role,
             usage: result.usage,
             toolCalls: result.toolCalls.length,
             durationMs: Date.now() - callStartedAt,
@@ -210,6 +222,7 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
           provider: route.providerName,
           model: route.model,
           purpose: options.purpose,
+          role: route.role,
           errorKind: error.kind,
           message: redactSecrets(error.message).slice(0, 2000),
           attempts: Math.max(1, attempts),
