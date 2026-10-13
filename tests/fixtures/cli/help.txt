@@ -1,0 +1,33 @@
+relay — carry product intent from discovery through delivery
+
+Usage:
+  relay init [--goal <text>]                 Create local Relay state (.relay/)
+  relay run [message] [options]              Run the workflow (interactive by default)
+  relay status [--json]                      Show goal, mode, progress, artifacts, next action
+  relay inspect <artifact>                   Print an artifact's Markdown
+  relay mode <mode>                          Override the active workflow mode
+  relay auto [off|next-checkpoint|until:<mode>|workflow]
+                                             Change the autonomy bound
+  relay pause [<reason>]                     Pause automatic advancement
+  relay why                                  Explain the last routing/transition decision
+  relay config [show|path|get <key>]         Inspect effective configuration
+
+Options:
+  --workspace <path>     Operate on this directory (default: current directory)
+  --no-interactive       Force plain, non-interactive output (scripts and CI)
+  --provider <name>      Force a provider for this invocation (openai|anthropic|fake)
+  --model <name>         Override the routed model for this invocation
+  --role <name>          Select a model role for this invocation (see relay config show)
+  --auto <bound>         Set the autonomy bound for a run
+  --json                 Machine-readable output where supported
+  --no-color             Disable ANSI colors
+  -h, --help             Show this help
+  -V, --version          Show version
+
+Workflow modes:
+  discovery, specification, technical-design, planning, implementation,
+  verification, delivery
+
+Slash commands (inside relay run):
+  /status /why /inspect <artifact> /mode <mode> /auto <bound> /pause <reason>
+  /resume /approve [artifact] /revise <kind> <reason> /help

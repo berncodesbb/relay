@@ -1,0 +1,1 @@
+{"description":"A freshly initialized project: one project.initialized event and nothing else.","envelopeVersion":1,"eventTypes":["project.initialized"],"formatVersion":1,"generatedBy":"scripts/export-compatibility-fixtures.mjs","name":"initialized-only","sessionKey":"ses_00000000-0000-4000-8000-000000000001","spec":"docs/event-format.md (store format version 1)","valid":true}

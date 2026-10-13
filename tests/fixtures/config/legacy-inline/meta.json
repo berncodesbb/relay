@@ -1,0 +1,1 @@
+{"description":"A complete version-1 legacy configuration: inline routes only, one with an inline fallback chain.","formatVersion":1,"generatedBy":"scripts/export-compatibility-fixtures.mjs","input":"input.yaml","name":"legacy-inline"}

@@ -1,0 +1,1 @@
+{"description":"Role fallback chains with per-role limits expanded breadth-first into the purpose chain.","formatVersion":1,"generatedBy":"scripts/export-compatibility-fixtures.mjs","input":"input.yaml","name":"roles-fallback-chain-limits"}

@@ -1,0 +1,1 @@
+{"description":"A mixed configuration: role references and legacy inline routes (with fallbacks) side by side.","formatVersion":1,"generatedBy":"scripts/export-compatibility-fixtures.mjs","input":"input.yaml","name":"mixed-roles-and-inline"}

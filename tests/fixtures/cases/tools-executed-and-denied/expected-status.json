@@ -1,0 +1,1 @@
+{"artifacts":[],"autonomy":"workflow","blockers":[],"changedFiles":["README.md"],"goal":"Ship a workflow CLI that preserves product intent","mode":"discovery","nextAction":"run /auto or relay run to continue discovery","paused":null,"progress":{"stage":1,"total":7},"staleArtifacts":[],"stats":{"events":5,"modelCalls":0,"toolCalls":2}}

@@ -1,0 +1,23 @@
+[package]
+name = "relay-tests"
+description = "Cross-crate compatibility, migration, fault-injection, and security test suites"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# NOTE (storage/migration engineer): dev-dependencies added for the
+# migration and fault_injection suites (relay-store, rusqlite for building
+# legacy .relay/state.db fixtures, tempfile for workspaces). Additive change
+# to this shared manifest — coordinate with the lead integrator.
+[dev-dependencies]
+relay-store = { workspace = true }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tempfile = "3"

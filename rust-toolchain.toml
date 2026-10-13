@@ -1,0 +1,9 @@
+# Toolchain pin for the Relay Rust workspace.
+#
+# rustup users get exactly this channel (plus the listed components) when
+# working in this repository. Homebrew-installed Rust ignores this file
+# harmlessly; any Rust >= 1.99 also builds the workspace. The MSRV is
+# declared once in the root Cargo.toml (`workspace.package.rust-version`).
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,1 @@
+{"description":"Legacy inline routes carrying per-route limits and an inline fallback.","formatVersion":1,"generatedBy":"scripts/export-compatibility-fixtures.mjs","input":"input.yaml","name":"legacy-inline-limits"}

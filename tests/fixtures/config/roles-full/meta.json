@@ -1,0 +1,1 @@
+{"description":"A full role-based configuration: worker and quick roles referenced from every routing key.","formatVersion":1,"generatedBy":"scripts/export-compatibility-fixtures.mjs","input":"input.yaml","name":"roles-full"}

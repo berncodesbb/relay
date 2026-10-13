@@ -7,3 +7,11 @@ coverage/
 .env.*
 !.env.example
 .DS_Store
+
+# Rust build products
+/target/
+crates/*/target/
+
+# Migration staging and retained backups (scratch, never committed)
+.relay-rust-migration-*/
+.relay-backup-*/

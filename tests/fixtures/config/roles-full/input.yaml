@@ -1,0 +1,18 @@
+version: 1
+budgets: {}
+models:
+  worker:
+    provider: fake
+    model: fake-standard
+  quick:
+    provider: fake
+    model: fake-mini
+routing:
+  intent: quick
+  discovery: worker
+  specification: worker
+  technical-design: worker
+  planning: worker
+  implementation: worker
+  verification: worker
+  delivery: worker

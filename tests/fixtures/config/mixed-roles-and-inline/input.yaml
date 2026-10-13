@@ -1,0 +1,19 @@
+version: 1
+budgets: {}
+models:
+  heavy:
+    provider: anthropic
+    model: claude-opus-5-5
+    fallbacks: [light]
+  light:
+    provider: anthropic
+    model: claude-haiku-4-5
+routing:
+  intent: light
+  discovery: light
+  specification: { provider: anthropic, model: claude-sonnet-5-5 }
+  technical-design: heavy
+  planning: { provider: openai, model: gpt-5.2, fallbacks: [{ provider: anthropic, model: claude-sonnet-5-5 }] }
+  implementation: light
+  verification: { provider: openai, model: gpt-5.2 }
+  delivery: light

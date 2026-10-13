@@ -1,0 +1,24 @@
+version: 1
+budgets: {}
+models:
+  a:
+    provider: anthropic
+    model: claude-sonnet-5-5
+    fallbacks: [b]
+    limits: { maxOutputTokens: 4096, temperature: 0.2 }
+  b:
+    provider: openai
+    model: gpt-5.2
+    limits: { maxOutputTokens: 2048 }
+  reasoning:
+    provider: anthropic
+    model: claude-sonnet-5-5
+routing:
+  intent: reasoning
+  discovery: a
+  specification: reasoning
+  technical-design: reasoning
+  planning: reasoning
+  implementation: reasoning
+  verification: reasoning
+  delivery: reasoning

@@ -1,0 +1,1 @@
+{"lastOutcome":null,"mode":"discovery","pausedReason":null,"recentTransitions":[],"rejectedTransitions":[],"routing":[{"at":"2026-10-13T00:00:02.000Z","model":"claude-sonnet-5-5","ok":false,"provider":"anthropic","purpose":"mode:discovery","role":null}],"staleArtifacts":[]}

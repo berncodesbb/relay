@@ -1,0 +1,10 @@
+version: 1
+budgets: {}
+routing:
+  discovery: { provider: anthropic, model: claude-sonnet-5-5 }
+  specification: { provider: anthropic, model: claude-sonnet-5-5 }
+  technical-design: { provider: anthropic, model: claude-opus-5-5 }
+  planning: { provider: openai, model: gpt-5-mini, fallbacks: [{ provider: anthropic, model: claude-sonnet-5-5 }] }
+  implementation: { provider: anthropic, model: claude-sonnet-5-5 }
+  verification: { provider: openai, model: gpt-5.2 }
+  delivery: { provider: anthropic, model: claude-haiku-4-5 }

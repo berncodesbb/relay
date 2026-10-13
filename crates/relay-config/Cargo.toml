@@ -1,0 +1,17 @@
+[package]
+name = "relay-config"
+description = "Layered Relay configuration: YAML parsing, strict validation, model-role catalogs, routing normalization, and invocation overrides"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+indexmap = { version = "2", features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
