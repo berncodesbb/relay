@@ -57,7 +57,8 @@ pub fn explain(graph: &ProjectGraph, work: &WorkItemId) -> Result<Explanation, E
 }
 
 /// Render the detail sentence for a known node and status. Public for
-/// `evaluate`, which already holds the status it wants explained.
+/// `evaluate` and scheduling, which already hold the status they want
+/// explained.
 pub fn explain_status(graph: &ProjectGraph, node: &WorkNode, status: &WorkStatus) -> String {
     let id = &node.work.id;
     match status {

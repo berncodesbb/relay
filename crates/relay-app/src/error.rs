@@ -50,9 +50,6 @@ pub enum AppError {
     /// A controlled Markdown import did not parse or validate.
     #[error("import failed: {0}")]
     Import(#[source] relay_workflows::ImportError),
-    /// The semantic legacy migration is not available in this build.
-    #[error("migration unavailable: {0}")]
-    Migration(String),
     /// Reading or writing a workspace file failed.
     #[error("io failure: {0}")]
     Io(#[source] std::io::Error),

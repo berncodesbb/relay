@@ -699,3 +699,136 @@ fn declared_invalidation_invalidates_exactly_its_target() {
         relay_engine::VersionStatus::Current
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Conversation interleaving
+// ---------------------------------------------------------------------------
+
+fn conversation_id(id: &str) -> relay_domain::ConversationId {
+    id.parse().ok().expect("valid conversation id")
+}
+
+fn turn_id(id: &str) -> relay_domain::TurnId {
+    id.parse().ok().expect("valid turn id")
+}
+
+fn message_id(id: &str) -> relay_domain::MessageId {
+    id.parse().ok().expect("valid message id")
+}
+
+/// The turn facts of one conversation, in legal order: a completed turn, a
+/// failed turn, a cancelled turn, and an interrupted (never-terminated)
+/// turn. The `ConversationStarted` fact is *not* included — it belongs to
+/// the fixed prefix both conversations share. `tag` names the turn/message
+/// ids (`turn_<tag>-1`, `msg_<tag>-u1`, …).
+fn conversation_turns(conversation: &relay_domain::ConversationId, tag: &str) -> Vec<DomainFact> {
+    vec![
+        DomainFact::UserMessageRecorded {
+            conversation: conversation.clone(),
+            turn: turn_id(&format!("turn_{tag}-1")),
+            message: message_id(&format!("msg_{tag}-u1")),
+            text: format!("{tag}: what is here?").to_string(),
+            at_ms: 1_000,
+        },
+        DomainFact::AssistantMessageRecorded {
+            conversation: conversation.clone(),
+            turn: turn_id(&format!("turn_{tag}-1")),
+            message: message_id(&format!("msg_{tag}-a1")),
+            text: format!("{tag}: a work-graph harness").to_string(),
+            at_ms: 1_100,
+            related_attempts: Vec::new(),
+            related_decisions: Vec::new(),
+            related_work: vec![work("work_side")],
+        },
+        DomainFact::UserMessageRecorded {
+            conversation: conversation.clone(),
+            turn: turn_id(&format!("turn_{tag}-2")),
+            message: message_id(&format!("msg_{tag}-u2")),
+            text: format!("{tag}: try again").to_string(),
+            at_ms: 1_200,
+        },
+        DomainFact::ConversationTurnFailed {
+            conversation: conversation.clone(),
+            turn: turn_id(&format!("turn_{tag}-2")),
+            safe_message: "provider unavailable".to_string(),
+            at_ms: 1_300,
+        },
+        DomainFact::UserMessageRecorded {
+            conversation: conversation.clone(),
+            turn: turn_id(&format!("turn_{tag}-3")),
+            message: message_id(&format!("msg_{tag}-u3")),
+            text: format!("{tag}: cancel this").to_string(),
+            at_ms: 1_400,
+        },
+        DomainFact::ConversationTurnCancelled {
+            conversation: conversation.clone(),
+            turn: turn_id(&format!("turn_{tag}-3")),
+            reason: "user interrupted".to_string(),
+            at_ms: 1_500,
+        },
+        DomainFact::UserMessageRecorded {
+            conversation: conversation.clone(),
+            turn: turn_id(&format!("turn_{tag}-4")),
+            message: message_id(&format!("msg_{tag}-u4")),
+            text: format!("{tag}: left hanging").to_string(),
+            at_ms: 1_600,
+        },
+    ]
+}
+
+#[test]
+fn interleaved_independent_conversations_fold_identically() {
+    // Facts of independent conversations commute: interleaving the turn
+    // facts of two conversations (order inside each preserved) folds to
+    // identical derived state — conversations, interrupted turns, bounded
+    // transcripts, and the untouched work statuses.
+    let alpha_id = conversation_id("cnv_alpha");
+    let beta_id = conversation_id("cnv_beta");
+    let prefix = vec![
+        project("prj_chat"),
+        goal("goal_chat", "unaffected by chat"),
+        work_declared(model_work("work_side", "research", "unrelated")),
+        DomainFact::ConversationStarted {
+            conversation: alpha_id.clone(),
+            started_at_ms: 900,
+        },
+        DomainFact::ConversationStarted {
+            conversation: beta_id.clone(),
+            started_at_ms: 901,
+        },
+    ];
+    let alpha = conversation_turns(&alpha_id, "alpha");
+    let beta = conversation_turns(&beta_id, "beta");
+
+    let canonical = {
+        let mut facts = prefix.clone();
+        facts.extend(alpha.iter().cloned());
+        facts.extend(beta.iter().cloned());
+        fold(&facts)
+    };
+
+    let mut lcg = Lcg::new(11);
+    for _ in 0..128 {
+        let mut facts = prefix.clone();
+        facts.extend(interleave(&alpha, &beta, &mut lcg));
+        let graph = fold(&facts);
+        assert_eq!(
+            graph, canonical,
+            "shuffled independent conversation facts must fold identically"
+        );
+
+        assert_eq!(graph.latest_conversation(), Some(beta_id.clone()));
+        assert_eq!(
+            graph.interrupted_turns(&alpha_id),
+            vec![turn_id("turn_alpha-4")]
+        );
+        assert_eq!(
+            graph.interrupted_turns(&beta_id),
+            vec![turn_id("turn_beta-4")]
+        );
+        assert_eq!(graph.transcript_tail(&alpha_id, 3).len(), 3);
+        assert_eq!(graph.transcript_tail(&beta_id, 10).len(), 5);
+        // The work graph is untouched by conversation facts.
+        assert_eq!(status_map(&graph)[&work("work_side")], WorkStatus::Ready);
+    }
+}

@@ -26,6 +26,7 @@
 
 pub mod artifact;
 pub mod attempt;
+pub mod conversation;
 pub mod decision;
 pub mod dependency;
 pub mod error;
@@ -41,6 +42,10 @@ pub mod work;
 
 pub use artifact::{ArtifactContent, ArtifactDigest, ArtifactVersionRef, DigestError};
 pub use attempt::{AttemptConclusion, AttemptOutcome, AttemptReceipt, OutputProposal, Usage};
+pub use conversation::{
+    ConversationNode, MESSAGE_TEXT_MAX_CHARS, RecordedMessage, Speaker, TURN_RELATED_MAX,
+    TranscriptEntry, TurnNode, TurnOutcome, TurnReferences,
+};
 pub use decision::{Authority, Decision, DecisionOption, DecisionResolution, DecisionSubject};
 pub use dependency::{DependencyEdge, DependencyKind};
 pub use error::FactError;
@@ -58,8 +63,8 @@ pub use graph::{
     VersionRecord, WorkNode,
 };
 pub use ids::{
-    ArtifactId, ArtifactVersion, AttemptId, DecisionId, EvidenceId, GoalId, GrantId, IdParseError,
-    ProjectId, ProjectRevision, VersionError, WorkItemId,
+    ArtifactId, ArtifactVersion, AttemptId, ConversationId, DecisionId, EvidenceId, GoalId,
+    GrantId, IdParseError, MessageId, ProjectId, ProjectRevision, TurnId, VersionError, WorkItemId,
 };
 pub use proposal::GraphChangeProposal;
 pub use work::{

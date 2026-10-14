@@ -1,4 +1,5 @@
-//! Ports of `test/unit/config/roles.test.ts`: the raw `models` catalog and
+//! Ports of the retired `test/unit/config/roles.test.ts` (removed from the
+//! tree 2026-10-14): the raw `models` catalog and
 //! union routing-value schema surface.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

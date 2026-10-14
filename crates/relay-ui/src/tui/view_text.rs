@@ -1,5 +1,6 @@
 //! Defensive view-to-text rendering for the terminal interface panels.
-//! Ported from `src/tui/app.tsx` (`renderViewText`, `renderInspectBody`,
+//! Ported from `src/tui/app.tsx` (retired TypeScript tree, removed from the
+//! repository 2026-10-14): `renderViewText`, `renderInspectBody`,
 //! `renderRecord`, `orderEntries`, `humanizeKey`, and the preferred-key
 //! orders): controller views render as humanized `Key: value` blocks with
 //! arrays joined inline and nested records indented, ordering preferred keys

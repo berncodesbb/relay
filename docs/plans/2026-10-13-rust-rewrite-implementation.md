@@ -1,5 +1,11 @@
 # Relay Rust rewrite implementation plan
 
+> **Historical (2026-10-14):** this implementation plan was stopped and
+> superseded by the intent-first work-graph plan
+> (`2026-10-13-intent-first-rust-work-graph.md`). Its npm/TypeScript checks
+> no longer apply — the TypeScript application was removed from the
+> repository. Retained as design history; not current instructions.
+
 Status: implementation-ready  
 Date: 2026-10-13  
 Architecture reference: `docs/plans/2026-10-13-rust-rewrite-architecture.md`

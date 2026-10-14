@@ -66,9 +66,7 @@ pub use graph::{
 pub use log::{FactLog, FactTail};
 pub use manifest::{FACT_MIN_READER_VERSION, FACT_STORE_VERSION, FactManifest};
 pub use paths::{FACT_STORE_DIR, FactPaths};
-pub use projection::{
-    FactCheckpoint, FactFold, FactProjection, FactReconcileOutcome, FactRow, NoFold,
-};
+pub use projection::{FactCheckpoint, FactFold, FactProjection, FactReconcileOutcome, NoFold};
 pub use record::{FactEntry, FactInput, FactRecord, Integrity};
 pub use store::{
     FactAppendOutcome, FactOpenReport, FactRebuildReport, FactStore, FactStoreOptions,

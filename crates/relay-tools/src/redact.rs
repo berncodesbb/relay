@@ -1,6 +1,7 @@
 //! Secret redaction and output bounding shared by every tool.
 //!
-//! Ported from `src/tools/redact.ts`. Nothing a tool returns may carry
+//! Ported from `src/tools/redact.ts` (retired TypeScript tree, removed from
+//! the repository 2026-10-14). Nothing a tool returns may carry
 //! credential material: known token shapes are replaced with
 //! `[redacted:<kind>]` markers and the literal values of secret-named
 //! environment variables never reach recorded output. The value being

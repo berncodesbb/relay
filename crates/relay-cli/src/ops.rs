@@ -7,8 +7,9 @@
 //! loop, approvals, revisions); until then the not-yet-wired operations
 //! return an actionable error instead of pretending to run.
 //!
-//! Event semantics mirror `src/runtime/controller.ts` exactly for the
-//! operations implemented here: `set_mode` applies
+//! Event semantics mirror `src/runtime/controller.ts` (the retired
+//! TypeScript implementation, removed from the tree 2026-10-14) exactly for
+//! the operations implemented here: `set_mode` applies
 //! `assert_transition_allowed` and records `mode.entered` with source
 //! `user` (or `mode.transition.rejected`), `set_autonomy` records
 //! `autonomy.changed` with source `user`, `pause` records `workflow.paused`

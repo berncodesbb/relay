@@ -9,7 +9,8 @@
 //!
 //! Prefixes: [`ProjectId`] `prj_`, [`GoalId`] `goal_`, [`WorkItemId`] `work_`,
 //! [`ArtifactId`] `art_`, [`DecisionId`] `dec_`, [`EvidenceId`] `ev_`,
-//! [`AttemptId`] `att_`, [`GrantId`] `grant_`.
+//! [`AttemptId`] `att_`, [`GrantId`] `grant_`, [`ConversationId`] `cnv_`,
+//! [`TurnId`] `turn_`, [`MessageId`] `msg_`.
 
 use std::fmt;
 
@@ -63,11 +64,6 @@ macro_rules! domain_id {
             pub fn as_str(&self) -> &str {
                 &self.0
             }
-
-            /// Consume the id and return the underlying string.
-            pub fn into_string(self) -> String {
-                self.0
-            }
         }
 
         impl fmt::Display for $name {
@@ -112,6 +108,9 @@ domain_id!(DecisionId, "dec_");
 domain_id!(EvidenceId, "ev_");
 domain_id!(AttemptId, "att_");
 domain_id!(GrantId, "grant_");
+domain_id!(ConversationId, "cnv_");
+domain_id!(TurnId, "turn_");
+domain_id!(MessageId, "msg_");
 
 /// Error raised for artifact versions below 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -209,6 +208,20 @@ mod tests {
         assert!(AttemptId::parse("att_1").is_ok());
         assert!(GrantId::parse("grant_model").is_ok());
         assert!(ProjectId::parse("prj_alpha").is_ok());
+        assert!(ConversationId::parse("cnv_chat").is_ok());
+        assert!(TurnId::parse("turn_1").is_ok());
+        assert!(MessageId::parse("msg_user-1").is_ok());
+    }
+
+    #[test]
+    fn rejects_malformed_conversation_turn_and_message_ids() {
+        assert!(ConversationId::parse("turn_1").is_err());
+        assert!(TurnId::parse("turn_").is_err());
+        assert!(TurnId::parse("turn_Up").is_err());
+        assert!(MessageId::parse("msg_-lead").is_err());
+        assert!(MessageId::parse("msg_a_b").is_err());
+        assert!(TurnId::parse(&format!("turn_{}", "x".repeat(65))).is_err());
+        assert!(TurnId::parse(&format!("turn_{}", "x".repeat(64))).is_ok());
     }
 
     #[test]

@@ -16,7 +16,8 @@ use crate::evidence::Evidence;
 use crate::goal::Goal;
 use crate::grant::{CapabilityGrant, Operation};
 use crate::ids::{
-    ArtifactId, ArtifactVersion, AttemptId, DecisionId, ProjectId, ProjectRevision, WorkItemId,
+    ArtifactId, ArtifactVersion, AttemptId, ConversationId, DecisionId, MessageId, ProjectId,
+    ProjectRevision, TurnId, WorkItemId,
 };
 use crate::work::{ScopePath, WorkItem};
 
@@ -212,6 +213,78 @@ pub enum DomainFact {
         /// The input version change that motivated the invalidation.
         changed_input: Option<ArtifactVersionRef>,
     },
+    /// A conversation started in the workspace. Conversations exist
+    /// independently of the work graph: they are legal before any goal is
+    /// declared and with no work at all.
+    ConversationStarted {
+        /// The conversation identity.
+        conversation: ConversationId,
+        /// Wall-clock milliseconds when the conversation started
+        /// (caller-supplied).
+        started_at_ms: i64,
+    },
+    /// A user message was accepted, starting a conversation turn. Exactly
+    /// one user message is recorded per turn.
+    UserMessageRecorded {
+        /// The owning conversation.
+        conversation: ConversationId,
+        /// The turn this message starts.
+        turn: TurnId,
+        /// The message identity.
+        message: MessageId,
+        /// The bounded message text.
+        text: String,
+        /// Wall-clock milliseconds when the message was recorded
+        /// (caller-supplied).
+        at_ms: i64,
+    },
+    /// An assistant message completed a conversation turn. Related ids are
+    /// annotations on the transcript — they are not required to exist in
+    /// the graph.
+    AssistantMessageRecorded {
+        /// The owning conversation.
+        conversation: ConversationId,
+        /// The completed turn.
+        turn: TurnId,
+        /// The message identity.
+        message: MessageId,
+        /// The bounded final message text (no stream deltas, no
+        /// chain-of-thought).
+        text: String,
+        /// Wall-clock milliseconds when the message was recorded
+        /// (caller-supplied).
+        at_ms: i64,
+        /// Accepted attempts the answer drew on.
+        related_attempts: Vec<AttemptId>,
+        /// Decisions the answer proposed or resolved.
+        related_decisions: Vec<DecisionId>,
+        /// Work items the answer touched.
+        related_work: Vec<WorkItemId>,
+    },
+    /// A conversation turn failed with a safe (redacted, bounded) message.
+    ConversationTurnFailed {
+        /// The owning conversation.
+        conversation: ConversationId,
+        /// The failed turn.
+        turn: TurnId,
+        /// The safe failure message shown in the transcript.
+        safe_message: String,
+        /// Wall-clock milliseconds when the failure was recorded
+        /// (caller-supplied).
+        at_ms: i64,
+    },
+    /// A conversation turn was cancelled.
+    ConversationTurnCancelled {
+        /// The owning conversation.
+        conversation: ConversationId,
+        /// The cancelled turn.
+        turn: TurnId,
+        /// Why it was cancelled.
+        reason: String,
+        /// Wall-clock milliseconds when the cancellation was recorded
+        /// (caller-supplied).
+        at_ms: i64,
+    },
 }
 
 impl DomainFact {
@@ -234,6 +307,11 @@ impl DomainFact {
             DomainFact::AttemptStarted { .. } => "attempt_started",
             DomainFact::AttemptConcluded { .. } => "attempt_concluded",
             DomainFact::InvalidationDeclared { .. } => "invalidation_declared",
+            DomainFact::ConversationStarted { .. } => "conversation_started",
+            DomainFact::UserMessageRecorded { .. } => "user_message_recorded",
+            DomainFact::AssistantMessageRecorded { .. } => "assistant_message_recorded",
+            DomainFact::ConversationTurnFailed { .. } => "conversation_turn_failed",
+            DomainFact::ConversationTurnCancelled { .. } => "conversation_turn_cancelled",
         }
     }
 }
@@ -257,6 +335,11 @@ pub const KNOWN_FACT_KINDS: &[&str] = &[
     "attempt_started",
     "attempt_concluded",
     "invalidation_declared",
+    "conversation_started",
+    "user_message_recorded",
+    "assistant_message_recorded",
+    "conversation_turn_failed",
+    "conversation_turn_cancelled",
 ];
 
 /// The payload version of a fact kind. All kinds are at version 1; a newer
@@ -355,9 +438,11 @@ mod tests {
 
     #[test]
     fn catalog_covers_every_foldable_kind() {
-        assert_eq!(KNOWN_FACT_KINDS.len(), 16);
+        assert_eq!(KNOWN_FACT_KINDS.len(), 21);
         assert_eq!(current_fact_version("work_declared"), Some(1));
         assert_eq!(current_fact_version("attempt_concluded"), Some(1));
+        assert_eq!(current_fact_version("conversation_started"), Some(1));
+        assert_eq!(current_fact_version("conversation_turn_cancelled"), Some(1));
         assert_eq!(current_fact_version("mode_entered"), None);
         assert_eq!(current_fact_version(""), None);
     }
@@ -383,5 +468,95 @@ mod tests {
             .expect("malformed payload must fail");
         assert!(matches!(error, FactError::InvalidState { .. }));
         assert!(fact_from_parts("work_declared", &serde_json::Value::Null).is_err());
+    }
+
+    fn sample_conversation_facts() -> Vec<DomainFact> {
+        let conversation: ConversationId = "cnv_chat".parse().ok().unwrap();
+        let turn: TurnId = "turn_1".parse().ok().unwrap();
+        vec![
+            DomainFact::ConversationStarted {
+                conversation: conversation.clone(),
+                started_at_ms: 1_000,
+            },
+            DomainFact::UserMessageRecorded {
+                conversation: conversation.clone(),
+                turn: turn.clone(),
+                message: "msg_u1".parse().ok().unwrap(),
+                text: "Explain this repository".to_string(),
+                at_ms: 1_001,
+            },
+            DomainFact::AssistantMessageRecorded {
+                conversation: conversation.clone(),
+                turn: turn.clone(),
+                message: "msg_a1".parse().ok().unwrap(),
+                text: "It is a CLI harness".to_string(),
+                at_ms: 1_002,
+                related_attempts: vec!["att_1".parse().ok().unwrap()],
+                related_decisions: vec!["dec_q".parse().ok().unwrap()],
+                related_work: vec!["work_research".parse().ok().unwrap()],
+            },
+            DomainFact::ConversationTurnFailed {
+                conversation: conversation.clone(),
+                turn: "turn_2".parse().ok().unwrap(),
+                safe_message: "provider unavailable".to_string(),
+                at_ms: 1_003,
+            },
+            DomainFact::ConversationTurnCancelled {
+                conversation,
+                turn: "turn_3".parse().ok().unwrap(),
+                reason: "user interrupted".to_string(),
+                at_ms: 1_004,
+            },
+        ]
+    }
+
+    #[test]
+    fn conversation_facts_round_trip_through_tagged_json_and_parts() {
+        for fact in sample_conversation_facts() {
+            let json = serde_json::to_string(&fact).ok().expect("serializes");
+            let expected_kind = fact.kind();
+            assert!(
+                json.contains(&format!("\"type\":\"{expected_kind}\"")),
+                "{json}"
+            );
+            let back: DomainFact = serde_json::from_str(&json).ok().expect("deserializes");
+            assert_eq!(back, fact);
+
+            let (kind, payload) = fact_to_parts(&fact);
+            assert_eq!(kind, expected_kind);
+            assert!(
+                payload.get("type").is_none(),
+                "payload must not carry the tag"
+            );
+            let reassembled = fact_from_parts(kind, &payload).ok().expect("reassembles");
+            assert_eq!(reassembled, fact);
+        }
+    }
+
+    #[test]
+    fn conversation_payloads_fail_closed_on_garbage() {
+        // A payload that does not decode fails even for a known kind at the
+        // current version.
+        let error = fact_from_parts(
+            "conversation_started",
+            &serde_json::json!({"unrelated": true}),
+        )
+        .err()
+        .expect("malformed payload must fail");
+        assert!(matches!(error, FactError::InvalidState { .. }));
+        // Conversation ids validate on decode: a wrong prefix is rejected.
+        let error = fact_from_parts(
+            "user_message_recorded",
+            &serde_json::json!({
+                "conversation": "cnv_chat",
+                "turn": "wrong_1",
+                "message": "msg_u1",
+                "text": "hi",
+                "at_ms": 1_000
+            }),
+        )
+        .err()
+        .expect("turn ids must carry the turn_ prefix");
+        assert!(matches!(error, FactError::InvalidState { .. }));
     }
 }

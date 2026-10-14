@@ -1,6 +1,7 @@
 //! OpenAI adapter.
 //!
-//! Ported from `src/providers/openai.ts`. Translates Relay-owned requests
+//! Ported from `src/providers/openai.ts` (retired TypeScript tree, removed
+//! from the repository 2026-10-14). Translates Relay-owned requests
 //! into OpenAI chat-completion wire calls and normalizes streamed chunks back
 //! into Relay-owned provider events. No wire type appears in this module's
 //! public API; errors pass through the shared normalizer so headers and

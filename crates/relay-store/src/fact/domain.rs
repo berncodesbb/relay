@@ -627,4 +627,194 @@ mod tests {
         assert!(reader.projection(|_| Ok(())).is_err());
         Ok(())
     }
+
+    /// A domain-valid conversation stream exercising all five fact kinds:
+    /// two conversations; a completed turn with related annotations (which
+    /// deliberately name ids that do not exist in the graph), a failed
+    /// turn, a cancelled turn, and a started-but-never-terminated turn.
+    fn conversation_facts() -> Result<Vec<DomainFact>> {
+        fn id<T>(raw: &str) -> Result<T>
+        where
+            T: std::str::FromStr,
+            T::Err: std::fmt::Display,
+        {
+            raw.parse::<T>()
+                .map_err(|error| invalid(format!("{raw}: {error}")))
+        }
+        let archive: relay_domain::ConversationId = id("cnv_archive")?;
+        let chat: relay_domain::ConversationId = id("cnv_chat")?;
+        Ok(vec![
+            DomainFact::ProjectCreated {
+                project: project()?,
+            },
+            DomainFact::ConversationStarted {
+                conversation: archive.clone(),
+                started_at_ms: CLOCK_MS,
+            },
+            DomainFact::ConversationStarted {
+                conversation: chat.clone(),
+                started_at_ms: CLOCK_MS + 1,
+            },
+            DomainFact::UserMessageRecorded {
+                conversation: chat.clone(),
+                turn: id("turn_1")?,
+                message: id("msg_u1")?,
+                text: "Explain this repository".to_string(),
+                at_ms: CLOCK_MS + 2,
+            },
+            DomainFact::AssistantMessageRecorded {
+                conversation: chat.clone(),
+                turn: id("turn_1")?,
+                message: id("msg_a1")?,
+                text: "It is a work-graph harness".to_string(),
+                at_ms: CLOCK_MS + 3,
+                // Annotations only: none of these ids exist in the graph.
+                related_attempts: vec![id("att_ghost")?],
+                related_decisions: vec![id("dec_ghost")?],
+                related_work: vec![id("work_ghost")?],
+            },
+            DomainFact::UserMessageRecorded {
+                conversation: chat.clone(),
+                turn: id("turn_2")?,
+                message: id("msg_u2")?,
+                text: "Ship it".to_string(),
+                at_ms: CLOCK_MS + 4,
+            },
+            DomainFact::ConversationTurnFailed {
+                conversation: chat.clone(),
+                turn: id("turn_2")?,
+                safe_message: "provider unavailable".to_string(),
+                at_ms: CLOCK_MS + 5,
+            },
+            DomainFact::UserMessageRecorded {
+                conversation: chat.clone(),
+                turn: id("turn_3")?,
+                message: id("msg_u3")?,
+                text: "Never answered".to_string(),
+                at_ms: CLOCK_MS + 6,
+            },
+            DomainFact::UserMessageRecorded {
+                conversation: archive,
+                turn: id("turn_old")?,
+                message: id("msg_old-u")?,
+                text: "Old question".to_string(),
+                at_ms: CLOCK_MS - 10,
+            },
+            DomainFact::ConversationTurnCancelled {
+                conversation: id("cnv_archive")?,
+                turn: id("turn_old")?,
+                reason: "user interrupted".to_string(),
+                at_ms: CLOCK_MS - 9,
+            },
+        ])
+    }
+
+    #[test]
+    fn conversation_facts_encode_decode_and_validate() -> Result<()> {
+        for fact in conversation_facts()?.into_iter().skip(1) {
+            let input = to_input(&fact)?;
+            assert_eq!(input.fact_type, fact.kind());
+            assert_eq!(input.fact_version, 1);
+            assert!(input.payload.get("type").is_none());
+            let reassembled = fact_from_parts(&input.fact_type, &input.payload.to_serde())
+                .map_err(|e| invalid(e.to_string()))?;
+            assert_eq!(reassembled, fact);
+            assert!(DomainFactValidator.validate_input(&input).is_ok());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn conversation_records_fail_closed_on_newer_versions() -> Result<()> {
+        // A hand-written conversation_started record at payload version 2
+        // is rejected with upgrade guidance, and a malformed v1 payload is
+        // rejected even at the current version.
+        let started = DomainFact::ConversationStarted {
+            conversation: relay_domain::ConversationId::parse("cnv_chat")
+                .map_err(|e| invalid(e.to_string()))?,
+            started_at_ms: CLOCK_MS,
+        };
+        let (kind, payload) = fact_to_parts(&started);
+        let newer = FactInput::new(kind, 2, Json::from_serde(&payload)?);
+        let error = DomainFactValidator
+            .validate_input(&newer)
+            .err()
+            .unwrap_or_default();
+        assert!(error.contains("version 2"), "{error}");
+        assert!(error.contains("Upgrade Relay"), "{error}");
+
+        let malformed = FactInput::new(
+            "user_message_recorded",
+            1,
+            Json::object([("unrelated", Json::Bool(true))]),
+        );
+        assert!(DomainFactValidator.validate_input(&malformed).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn graph_store_round_trips_and_projects_conversations() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let dir = tempfile::tempdir()?;
+        let store = GraphFactStore::create(
+            dir.path(),
+            &project()?,
+            Integrity::Checksums,
+            FactStoreOptions::deterministic(CLOCK_MS),
+        )?;
+        let facts = conversation_facts()?;
+        let outcome = store.append(&facts)?;
+        assert_eq!(outcome.len(), facts.len());
+        assert_eq!(store.revision()?.get(), facts.len() as u64);
+
+        // The typed timeline replays in order and the pure fold projects
+        // the conversation state.
+        let timeline = store.read_timeline()?;
+        assert_eq!(timeline.len(), facts.len());
+        assert_eq!(timeline[1].fact.kind(), "conversation_started");
+        let graph = store.project_graph()?;
+        assert_eq!(graph.conversations().count(), 2);
+        assert_eq!(
+            graph.latest_conversation().map(|id| id.to_string()),
+            Some("cnv_chat".to_string()),
+            "the most recently applied start wins"
+        );
+        let chat = relay_domain::ConversationId::parse("cnv_chat")?;
+        assert_eq!(
+            graph
+                .interrupted_turns(&chat)
+                .iter()
+                .map(|turn| turn.to_string())
+                .collect::<Vec<_>>(),
+            vec!["turn_3".to_string()]
+        );
+        assert_eq!(
+            graph.transcript_tail(&chat, 10).len(),
+            4,
+            "u1, a1, u2 (failed turn), u3 (interrupted turn)"
+        );
+
+        // SQLite stays a work-graph lookup index: the fold contributed no
+        // conversation rows, but the revision stamp counts every fact.
+        let meta = store.projection(crate::fact::graph::graph_meta)?;
+        assert_eq!(meta.revision, facts.len() as u64);
+        assert_eq!(meta.project.as_deref(), Some(PROJECT));
+
+        // A fold-invalid conversation append (terminal without a started
+        // turn) is refused and nothing is written.
+        let error = store
+            .append(&[DomainFact::ConversationTurnCancelled {
+                conversation: chat,
+                turn: "turn_ghost".parse()?,
+                reason: "nothing to cancel".to_string(),
+                at_ms: CLOCK_MS,
+            }])
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(error.contains("would not fold"), "{error}");
+        assert!(error.contains("without a started turn"), "{error}");
+        assert_eq!(store.revision()?.get(), facts.len() as u64);
+        Ok(())
+    }
 }

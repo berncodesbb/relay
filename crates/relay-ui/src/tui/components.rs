@@ -1,5 +1,6 @@
 //! Terminal components: ratatui widgets over the view model, faithful to
-//! `src/tui/components/*.tsx` (labels, key hints, truncation, pause overlay,
+//! the retired `src/tui/components/*.tsx` (removed from the tree
+//! 2026-10-14): labels, key hints, truncation, pause overlay,
 //! panel caps). Drawing targets a [`ratatui`] frame — nothing here prints or
 //! owns a terminal; the CLI runner supplies the backend (or a
 //! `ratatui::backend::TestBackend` in tests).

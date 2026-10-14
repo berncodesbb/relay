@@ -1,6 +1,8 @@
 # Intent-first Rust work-graph implementation plan
 
-Status: proposed replacement plan  
+Status: proposed replacement plan — now the authoritative implementation;
+the TypeScript application it was replacing was removed from the repository
+on 2026-10-14 (`2026-10-14-remove-typescript-rust-only-codebase.md`)  
 Date: 2026-10-13  
 Supersedes as implementation direction: `docs/plans/2026-10-13-rust-rewrite-implementation.md`  
 Retains useful background from: `docs/plans/2026-10-13-rust-rewrite-architecture.md`

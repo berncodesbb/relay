@@ -1,6 +1,7 @@
 //! The interactive terminal interface: the view-model fold, the
 //! controller-feed seam, defensive view-to-text rendering, and the ratatui
-//! components. Ported from `src/tui/**`. Nothing here prints or owns a
+//! components. Ported from `src/tui/**` (retired TypeScript tree, removed
+//! from the repository 2026-10-14). Nothing here prints or owns a
 //! terminal; the `relay-cli` binary supplies the crossterm backend and the
 //! terminal-restore lifecycle.
 

@@ -1,5 +1,6 @@
 //! Event-driven view model for the interactive terminal interface. Ported
-//! from `src/tui/view-model.ts`: a pure, terminal-free fold over controller
+//! from `src/tui/view-model.ts` (retired TypeScript tree, removed from the
+//! repository 2026-10-14): a pure, terminal-free fold over controller
 //! UI events and local UI actions. Components never orchestrate workflow
 //! work; they render [`TuiViewModel`] snapshots and dispatch [`TuiAction`]s.
 //! Folding stays deterministic and unit-testable without a terminal.
@@ -11,8 +12,9 @@
 //! outcome payload falls back to `NEEDS_USER` — so a drifted event degrades
 //! gracefully instead of crashing the interface.
 
-/// One controller UI event, mirroring the `ControllerUiEvent` union of
-/// `src/runtime/controller.ts`. Field-level optionality matches the
+/// One controller UI event, mirroring the `ControllerUiEvent` union of the
+/// retired `src/runtime/controller.ts` (removed from the tree 2026-10-14).
+/// Field-level optionality matches the
 /// TypeScript payloads; the fold fills defaults defensively.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ControllerEvent {

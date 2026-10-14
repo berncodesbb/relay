@@ -9,15 +9,14 @@
 //! graph or delivers anything.
 
 use relay_domain::{
-    ArtifactContent, ArtifactDigest, ArtifactId, AttemptId, Decision, DecisionId, DecisionOption,
-    DecisionSubject, Evidence, EvidenceId, EvidenceKind, EvidenceOutcome, EvidenceTarget, GoalId,
-    OutputProposal, ProjectGraph,
+    ArtifactContent, ArtifactDigest, ArtifactId, AttemptId, Evidence, EvidenceId, EvidenceKind,
+    EvidenceOutcome, EvidenceTarget, GoalId, OutputProposal,
 };
 use relay_executor::spec::{AttemptSpec, RunContext};
 use relay_executor::{SystemJob, SystemOutcome};
 use relay_workflows::{
-    CRITERION_SCHEMA, DELIVERY_SCHEMA, DESIGN_SCHEMA, DeliveryDoc, PLAN_SCHEMA, REQUIREMENT_SCHEMA,
-    StructuredDoc, artifacts_with_schema,
+    CRITERION_SCHEMA, DESIGN_SCHEMA, DeliveryDoc, PLAN_SCHEMA, REQUIREMENT_SCHEMA, StructuredDoc,
+    artifacts_with_schema,
 };
 
 /// The artifact id the delivery report publishes under.
@@ -122,43 +121,6 @@ impl SystemJob for DeliveryPrepJob {
     }
 }
 
-/// The authorization decision the workflow opens once a delivery report is
-/// published (rule 10 of `relay_workflows::propose_next`): exposed here so
-/// callers that need the graph shape reuse the same wording. Delivery
-/// authority never leaves the human.
-pub fn delivery_authorization_decision(graph: &ProjectGraph) -> Option<Decision> {
-    let deliveries = artifacts_with_schema(graph, DELIVERY_SCHEMA);
-    let reference = deliveries.first()?.clone();
-    let goal = graph.goal().map(|goal| goal.id.clone())?;
-    let count = graph.decisions().count() + 1;
-    Some(Decision::new(
-        delivery_decision_id(count),
-        DecisionSubject::Goal(goal),
-        format!("Authorize delivery of the package at {reference}?"),
-        vec![
-            DecisionOption {
-                label: "authorize".to_string(),
-                description: "deliver the prepared package".to_string(),
-            },
-            DecisionOption {
-                label: "hold".to_string(),
-                description: "keep the package undelivered".to_string(),
-            },
-        ],
-        0,
-    ))
-}
-
-/// Whether every criterion of the graph is satisfied — the job's gate,
-/// exposed for views.
-pub fn delivery_ready(graph: &ProjectGraph) -> bool {
-    let criteria = artifacts_with_schema(graph, CRITERION_SCHEMA);
-    !criteria.is_empty()
-        && criteria
-            .iter()
-            .all(|reference| relay_engine::status::criterion_satisfied(graph, reference))
-}
-
 // -- total-construction helpers ---------------------------------------------
 //
 // Every literal below is a compile-time-fixed id shape; the fallbacks keep
@@ -167,14 +129,6 @@ pub fn delivery_ready(graph: &ProjectGraph) -> bool {
 #[allow(clippy::expect_used)] // scoped: static literal, compile-time fixed
 fn report_artifact_id() -> ArtifactId {
     ArtifactId::parse(DELIVERY_REPORT_ARTIFACT).expect("literal parses")
-}
-
-#[allow(clippy::expect_used)] // scoped: static literal shape
-fn delivery_decision_id(count: usize) -> DecisionId {
-    match DecisionId::parse(&format!("dec_request-delivery-authorization-{count}")) {
-        Ok(id) => id,
-        Err(_) => DecisionId::parse("dec_delivery").expect("literal parses"),
-    }
 }
 
 #[allow(clippy::expect_used)] // scoped: static literal shape

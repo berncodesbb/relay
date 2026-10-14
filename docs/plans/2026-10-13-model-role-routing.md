@@ -1,5 +1,11 @@
 # Named model roles and purpose-aware routing implementation plan
 
+> **Historical (2026-10-14):** role-name routing shipped in the TypeScript
+> implementation and is retained in Rust (`crates/relay-config`, documented
+> in `docs/configuration.md`). The TypeScript application itself was removed
+> from the repository. Retained as design history; not current
+> instructions.
+
 ## Objective
 
 Introduce a stable, user-defined model-role layer between Relay's workflow purposes and provider-specific model identifiers. Users should be able to define roles such as `reasoning`, `coding`, `review`, and `fast`, map workflow modes and utility purposes to those roles, change a role's underlying provider/model in one place, and see the selected role in routing diagnostics.

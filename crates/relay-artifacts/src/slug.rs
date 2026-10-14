@@ -1,6 +1,7 @@
 //! Kebab-case filename slugs for artifact version files.
 //!
-//! Port of `slugify` in `src/artifacts/markdown-store.ts`:
+//! Port of `slugify` in `src/artifacts/markdown-store.ts` (retired TypeScript
+//! tree, removed from the repository 2026-10-14):
 //!
 //! ```text
 //! title.normalize('NFKD').replace(/\p{M}/gu, '')

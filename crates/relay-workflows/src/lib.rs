@@ -23,8 +23,7 @@ pub mod schemas;
 pub use catalog::{
     ApprovalRule, CeilingTemplate, CompletionTemplate, InputPolicy, InstantiateError, Multiplicity,
     Phase, WorkDefinition, WorkflowCatalog, approval_decision, has_live_instance, human_decision,
-    instantiate_executor, instantiate_human, instantiate_verification, live_instance_count,
-    requires_edge, validates_edge,
+    instantiate_executor, instantiate_human, instantiate_verification, requires_edge,
 };
 pub use expansion::{artifacts_with_schema, criterion_failing, propose_next};
 pub use import::{

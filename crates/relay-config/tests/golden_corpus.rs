@@ -1,11 +1,13 @@
 //! Golden corpus verified against the TypeScript reference implementation
-//! (`src/config/**` as of the model-role routing work). Each case records the
+//! (`src/config/**` as of the model-role routing work; that tree was removed
+//! from the repository 2026-10-14). Each case records the
 //! TypeScript behavior exactly: parsed-layer value equality for valid layers
 //! and byte-identical diagnostic strings for invalid ones, plus
 //! effective-validation scenarios on merged configurations.
 //!
-//! Regenerating this corpus requires the TypeScript oracle; the expectations
-//! are checked in so the tests stay offline and deterministic.
+//! The TypeScript oracle is retired, so this corpus is now frozen historical
+//! evidence; the expectations are checked in so the tests stay offline and
+//! deterministic.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

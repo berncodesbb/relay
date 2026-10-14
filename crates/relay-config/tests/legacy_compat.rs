@@ -1,4 +1,5 @@
-//! Ports of `test/unit/config/legacy-compat.test.ts`: TODAY's behavior for
+//! Ports of the retired `test/unit/config/legacy-compat.test.ts` (removed
+//! from the tree 2026-10-14): TODAY's behavior for
 //! complete version-1 configurations that use only inline mode routes (no
 //! `models` catalog, no role references, no `intent` key). The named-role
 //! routing work must keep every one of these passing unchanged.

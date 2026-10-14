@@ -179,11 +179,6 @@ impl ScopePath {
         &self.raw
     }
 
-    /// The path segments; empty for the root scope.
-    pub fn segments(&self) -> &[String] {
-        &self.segments
-    }
-
     /// Whether `self` is `other` or an ancestor of it.
     pub fn contains(&self, other: &ScopePath) -> bool {
         self.segments.len() <= other.segments.len()

@@ -22,6 +22,17 @@ how legacy projects map onto it. `docs/event-format.md` remains normative
 for the frozen legacy event path and is the reference for the principles
 reused here; nothing in this proposal changes it.
 
+Catalog extension (2026-10-14, `docs/plans/2026-10-14-chat-first-workspace-conversations.md`):
+five conversation fact kinds joined the domain catalog —
+`conversation_started`, `user_message_recorded`,
+`assistant_message_recorded`, `conversation_turn_failed`,
+`conversation_turn_cancelled` — all payload version 1, carried by the same
+envelope, versioning, and fail-closed rules above. Their wire shapes and
+fold invariants are defined by the domain catalog in
+`crates/relay-domain` (`facts.rs`, `conversation.rs`); conversations are
+legal in projects with no goal, and a user message without a terminal
+outcome replays as an interrupted turn.
+
 ## 1. Authority order
 
 ```text

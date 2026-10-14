@@ -2,8 +2,8 @@
 //!
 //! Each error carries the same public fields as its TypeScript counterpart and
 //! renders the same message text, so diagnostics fed back to models or users
-//! stay byte-compatible with the reference implementation in
-//! `src/artifacts/*.ts`.
+//! stay byte-compatible with the retired TypeScript implementation
+//! (`src/artifacts/*.ts`, removed from the tree 2026-10-14).
 
 use std::fmt;
 

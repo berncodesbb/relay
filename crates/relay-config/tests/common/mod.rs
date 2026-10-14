@@ -1,5 +1,5 @@
-//! Shared fixtures for the relay-config integration tests (ports of
-//! `test/unit/config/*.test.ts`).
+//! Shared fixtures for the relay-config integration tests (ports of the
+//! retired `test/unit/config/*.test.ts`, removed from the tree 2026-10-14).
 
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

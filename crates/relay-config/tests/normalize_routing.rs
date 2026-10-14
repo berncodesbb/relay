@@ -1,4 +1,5 @@
-//! Ports of `test/unit/config/normalize.test.ts`: the seam between raw
+//! Ports of the retired `test/unit/config/normalize.test.ts` (removed from
+//! the tree 2026-10-14): the seam between raw
 //! configuration and the runtime routing contract.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

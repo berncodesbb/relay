@@ -1,6 +1,7 @@
 //! Provider-neutral model interface.
 //!
-//! Ported from `src/providers/provider.ts`. This module is the only contract
+//! Ported from `src/providers/provider.ts` (retired TypeScript tree, removed
+//! from the repository 2026-10-14). This module is the only contract
 //! between the runtime and model providers: it contains no SDK types, and
 //! adapters translate provider responses into these Relay-owned types without
 //! letting SDK objects cross their module boundary.
@@ -248,12 +249,6 @@ impl ModelRequest {
     /// Attach a purpose to this request.
     pub fn with_purpose(mut self, purpose: impl Into<String>) -> Self {
         self.purpose = Some(purpose.into());
-        self
-    }
-
-    /// Attach a cancellation signal to this request.
-    pub fn with_signal(mut self, signal: CancelToken) -> Self {
-        self.signal = Some(signal);
         self
     }
 }

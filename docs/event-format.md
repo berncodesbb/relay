@@ -1,19 +1,23 @@
 # Relay canonical event format
 
-Status: LEGACY — normative only for the stopped compatibility-port event
-path (`relay-core` events + the legacy `RelayStore` surface), which
-remains in the repository as frozen reference until its documented
-retirement gate. The intent-first work-graph store is specified by
-`docs/plans/fact-format-proposal.md` (accepted 2026-10-13); new
-persistence work targets that format. This document changes nothing and
-is retained as the reference for the legacy importer and old fixtures.
+Status: LEGACY — normative for the legacy import path only: the stopped
+compatibility-port event surface (`relay-core` events + the legacy
+`RelayStore`, kept in-tree as frozen reference until their documented
+retirement gate) and the legacy `.relay/` JSONL event stores that the
+Rust importers read (`relay_store::import_jsonl_directory`, the semantic
+migration). This document is the self-contained specification for that
+format — the TypeScript implementation that produced it was removed from
+the repository on 2026-10-14, and the frozen fixtures under
+`tests/fixtures/**` are its immutable output. The intent-first work-graph
+store has its own format, specified by `docs/plans/fact-format-proposal.md`
+(accepted 2026-10-13); new persistence work targets that format.
 Date: 2026-10-13
 Owners: lead integrator (spec), storage/migration owner (implementation), core/compatibility owner (payload schemas)
 
-This document specifies the authoritative Relay event record: the JSONL
+This document specifies the legacy Relay event record: the JSONL
 envelope, canonical JSON serialization, the hash chain, segmentation, the
-store manifest, durability, recovery, and the rules for comparing output
-across the TypeScript and Rust implementations.
+store manifest, durability, recovery, and the rules the frozen
+compatibility fixtures were normalized under.
 
 The authority order is fixed:
 
@@ -59,30 +63,31 @@ Field rules:
 | `projectId` | string | `prj_<uuid>`. Every event in one log belongs to exactly one project. |
 | `sequence` | integer | 1-based, contiguous, increasing by exactly 1 across the whole project log (not per segment). |
 | `sessionId` | string \| null | Session that produced the event, or `null`. |
-| `type` | string | One of the 24 event types in `src/core/events.ts` (`RELAY_EVENT_TYPES`). Unknown types fail replay fail-closed. |
+| `type` | string | One of the 24 event types: `project.initialized`, `session.started`, `intent.proposed`, `intent.applied`, `mode.entered`, `mode.transition.rejected`, `autonomy.changed`, `artifact.created`, `artifact.revised`, `artifact.approval.requested`, `artifact.approved`, `artifact.invalidated`, `artifact.inspected`, `transition.evaluated`, `model.requested`, `model.responded`, `model.failed`, `tool.executed`, `tool.denied`, `verification.completed`, `workflow.paused`, `workflow.resumed`, `budget.exhausted`, `run.interrupted`. Unknown types fail replay fail-closed. |
 | `schemaVersion` | integer | Per-type payload version; must equal the version the reader understands (all are `1` today). |
 | `timestamp` | string | RFC 3339 UTC with millisecond precision and a `Z` suffix: `YYYY-MM-DDTHH:MM:SS.sssZ` (matches JS `Date.toISOString()`). |
 | `correlationId` | string | Fresh `cor_<uuid>` when the event starts an operation; the initiator's correlation id when it is part of one. |
 | `causationId` | string \| null | `id` of the event that directly caused this one, or `null`. |
-| `payload` | object | Type-specific payload, byte-compatible with the TypeScript Zod schemas. Keys and values use exactly the TypeScript field names. |
+| `payload` | object | Type-specific payload. Keys and values use exactly the field names of the retired TypeScript implementation; the frozen fixtures under `tests/fixtures/**` pin them as the oracle. |
 | `previousHash` | string \| null | Hex SHA-256 of the previous event's `hash` input; `null` exactly when `sequence === 1`. |
 | `hash` | string | Hex SHA-256 (lowercase) over the canonical serialization of this envelope minus the `hash` field itself. |
 
 Additive envelope or payload fields are permitted for forward compatibility:
 readers must accept objects containing unknown additional fields at the
 envelope level only if `envelopeVersion` is understood. Unknown payload
-fields are ignored (stripped on decode), matching the TypeScript oracle's
-Zod default behavior — the schema constrains the fields it knows, and
-unknown extras never invalidate a legacy record. Verified decision from
-cross-language fixture work; earlier drafts of this section said payload
-decoding was strict, which the TypeScript implementation does not do.
+fields are ignored (stripped on decode), matching the behavior of the
+retired TypeScript implementation — the schema constrains the fields it
+knows, and unknown extras never invalidate a legacy record. Verified
+decision from cross-language fixture work; earlier drafts of this section
+said payload decoding was strict, which the TypeScript implementation did
+not do.
 
 ## 2. Canonical JSON
 
 Canonical serialization is used for (a) the bytes written into JSONL
-segments, (b) the hash input, and (c) the payload strings the TypeScript
-exporter emits. Readers must re-serialize after parsing; they must never
-hash raw input bytes.
+segments, (b) the hash input, and (c) the payload strings the retired
+TypeScript exporter emitted into the frozen fixtures. Readers must
+re-serialize after parsing; they must never hash raw input bytes.
 
 Rules:
 
@@ -294,8 +299,10 @@ plus derived tables. Import is direct and read-only against the source:
 
 ## 11. Normalized cross-language comparison
 
-Compatibility fixtures compare TypeScript and Rust outputs. Normalization
-applies before comparison and must preserve equality relationships:
+The frozen compatibility fixtures under `tests/fixtures/**` were generated
+from the retired TypeScript implementation and are compared against Rust
+import/replay output. Normalization applies before comparison and must
+preserve equality relationships:
 
 - **Timestamps**: any string matching RFC 3339 with `Z` is replaced by
   `<ts>`; distinct source values may collapse.
@@ -319,8 +326,9 @@ ids during generation, so most fixtures need no normalization at all.
 
 - `envelopeVersion` governs the container; `storeVersion` in the manifest
   mirrors it. Both are `1`.
-- Per-type payload `schemaVersion` values continue to follow
-  `EVENT_PAYLOAD_VERSIONS` from the TypeScript contracts.
+- Per-type payload `schemaVersion` is `1` for every event type; readers
+  reject any other value fail-closed. The frozen fixtures pin the payload
+  field names and shapes.
 - The minimum Relay version able to read a store is recorded in
   `manifest.minReaderVersion`.
 - Unknown event types and newer versions always fail closed with upgrade

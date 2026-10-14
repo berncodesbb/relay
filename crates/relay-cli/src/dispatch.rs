@@ -11,12 +11,15 @@
 
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use relay_app::commands as app;
+use relay_app::conversation::{self, ConversationEvent, ConversationLimits, TurnStatus};
 use relay_app::providers;
 use relay_app::session::{ProjectSession, SessionOptions};
 use relay_app::{AppError, RuntimeWiring};
 use relay_engine::{Autonomy, SchedulingPolicy};
+use relay_providers::contract::{CancelToken, ModelProvider};
 
 use crate::args::Command;
 use crate::args::DoctorAction;
@@ -24,6 +27,7 @@ use crate::args::ParseResult;
 use crate::args::USAGE;
 use crate::args::VERSION;
 use crate::args::parse_arguments;
+use crate::invocation::TerminalCapability;
 use crate::output::OutputWriter;
 use crate::render;
 
@@ -76,14 +80,20 @@ pub const EXIT_FAILURE: i32 = 1;
 /// Exit code: usage or configuration error.
 pub const EXIT_USAGE: i32 = 2;
 
-/// The production entry point: parse, dispatch, report. Returns the process
-/// exit code.
-pub fn run_main(argv: &[String], writer: &mut OutputWriter) -> i32 {
-    run_with(argv, writer, CliDeps::production(None))
+/// The testable entry point with injectable dependencies, treated as a
+/// non-interactive invocation (tests capture output).
+pub fn run_with(argv: &[String], writer: &mut OutputWriter, deps: CliDeps) -> i32 {
+    run_with_capability(argv, writer, deps, TerminalCapability::non_interactive())
 }
 
-/// The testable entry point with injectable dependencies.
-pub fn run_with(argv: &[String], writer: &mut OutputWriter, deps: CliDeps) -> i32 {
+/// The testable entry point with an explicit terminal capability: chat
+/// opens the interactive driver only when both stdin and stdout are TTYs.
+pub fn run_with_capability(
+    argv: &[String],
+    writer: &mut OutputWriter,
+    deps: CliDeps,
+    capability: TerminalCapability,
+) -> i32 {
     let parsed = match parse_arguments(argv) {
         ParseResult::Ok(parsed) => parsed,
         ParseResult::Err { error, usage } => {
@@ -105,6 +115,10 @@ pub fn run_with(argv: &[String], writer: &mut OutputWriter, deps: CliDeps) -> i3
             writer.always(&format!("relay {VERSION}"));
             EXIT_OK
         }
+        Command::Chat { prompt } => {
+            chat_command(writer, &workspace, &deps, capability, prompt.as_deref())
+        }
+        Command::Print { prompt } => print_command(writer, &workspace, &deps, &prompt),
         Command::Init { goal } => {
             let Some(goal) = goal else {
                 writer.error("relay: init needs a goal: `relay init --goal <text>`");
@@ -285,7 +299,8 @@ pub fn run_with(argv: &[String], writer: &mut OutputWriter, deps: CliDeps) -> i3
         Command::Config { action, key } => {
             config_command(writer, json, &workspace, &action, key.as_deref())
         }
-        Command::Tui => crate::tui::run(&workspace, deps.session_options.clone()),
+        // `relay tui` is the compatibility alias for the chat interface.
+        Command::Tui => chat_command(writer, &workspace, &deps, capability, None),
         // -- legacy mappings ------------------------------------------------
         Command::LegacyStatus => {
             legacy_note(writer, "status", "project summary");
@@ -411,6 +426,133 @@ fn summary_command(writer: &mut OutputWriter, json: bool, workspace: &Path, deps
         app::summary,
         render::render_summary,
     )
+}
+
+/// Conversational chat: the interactive driver on a fully interactive
+/// terminal, an actionable usage error everywhere else — printed before
+/// any terminal setup, so non-TTY callers never see raw mode.
+/// What dispatch does with a conversational invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChatPlan {
+    /// Open the interactive chat driver.
+    OpenInterface,
+    /// Reject with the scripted-turn guidance (never raw mode).
+    RejectScripted,
+}
+
+/// Decide the chat plan from the terminal capability alone (pure, tested).
+pub(crate) fn chat_plan(capability: TerminalCapability) -> ChatPlan {
+    if capability.interactive() {
+        ChatPlan::OpenInterface
+    } else {
+        ChatPlan::RejectScripted
+    }
+}
+
+/// Conversational chat: the interactive driver on a fully interactive
+/// terminal, an actionable usage error everywhere else — printed before
+/// any terminal setup, so non-TTY callers never see raw mode.
+fn chat_command(
+    writer: &mut OutputWriter,
+    workspace: &Path,
+    deps: &CliDeps,
+    capability: TerminalCapability,
+    initial_prompt: Option<&str>,
+) -> i32 {
+    if let ChatPlan::RejectScripted = chat_plan(capability) {
+        writer.error("relay: conversational chat needs an interactive terminal (stdin and stdout)");
+        writer.error("For one scripted conversational turn: relay --print \"<prompt>\"");
+        writer.error("Run `relay --help` for usage.");
+        return EXIT_USAGE;
+    }
+    crate::tui::run_chat(workspace, deps, initial_prompt)
+}
+
+/// Resolve the conversational provider: the same selection as `run` — the
+/// production wiring's provider name (default fake); injected test
+/// wirings carry run-command executors, so their scripted turns use the
+/// deterministic fake.
+pub(crate) fn conversational_provider(
+    runtime: &RuntimeSelection,
+) -> Result<(Arc<dyn ModelProvider>, String), AppError> {
+    match runtime {
+        RuntimeSelection::Production { provider } => providers::provider_by_name(provider),
+        RuntimeSelection::Injected(_) => providers::provider_by_name(providers::DEFAULT_PROVIDER),
+    }
+}
+
+/// `--print "<prompt>"`: one bounded conversational turn. Identical on a
+/// TTY and off it — no terminal mode is ever entered. The final assistant
+/// text goes to stdout; proposal outcomes, failures, and cancellation
+/// reasons go to stderr. Exit codes: 0 completed, 1 failed/cancelled or
+/// infrastructure error, 2 malformed invocation.
+fn print_command(writer: &mut OutputWriter, workspace: &Path, deps: &CliDeps, prompt: &str) -> i32 {
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        writer.error("relay: --print requires a prompt");
+        writer.error("Run `relay --help` for usage.");
+        return EXIT_USAGE;
+    }
+    let (provider, model) = match conversational_provider(&deps.runtime) {
+        Ok(resolved) => resolved,
+        Err(error) => return app_error(writer, error),
+    };
+    // The turn durably records its facts, so the session (and on a fresh
+    // workspace the project and conversation) is created here, not before.
+    let (session, _report) =
+        match ProjectSession::open_or_create(workspace, deps.session_options.clone()) {
+            Ok(opened) => opened,
+            Err(error) => return app_error(writer, error),
+        };
+    let (events, drain) = std::sync::mpsc::channel::<ConversationEvent>();
+    let turn = conversation::start_turn(
+        &session,
+        provider,
+        &model,
+        prompt,
+        &ConversationLimits::default(),
+        CancelToken::new(),
+        events,
+    );
+    // The sender drops when start_turn returns, ending this drain. Nothing
+    // streams live in --print; draining just guarantees no buffered event
+    // is silently dropped while the turn ran.
+    for event in drain.try_iter() {
+        let _ = event;
+    }
+    match turn {
+        Ok(result) => match result.status {
+            TurnStatus::Completed => {
+                for line in result.assistant_text.trim().lines() {
+                    writer.text(line);
+                }
+                // Proposal outcomes are turn diagnostics: stdout stays the
+                // clean, scriptable assistant reply.
+                for outcome in &result.proposals {
+                    let verb = if outcome.accepted {
+                        "applied"
+                    } else {
+                        "rejected"
+                    };
+                    writer.error(&format!("relay: proposal {verb}: {}", outcome.detail));
+                }
+                EXIT_OK
+            }
+            TurnStatus::Failed { message } => {
+                writer.error(&format!("relay: the conversational turn failed: {message}"));
+                EXIT_FAILURE
+            }
+            TurnStatus::Cancelled { reason } => {
+                writer.error(&format!(
+                    "relay: the conversational turn was cancelled: {reason}"
+                ));
+                EXIT_FAILURE
+            }
+        },
+        // Infrastructure failure: no terminal fact was recorded; the app
+        // error mapping already prints the actionable hint.
+        Err(error) => app_error(writer, error),
+    }
 }
 
 fn doctor_command(
@@ -695,5 +837,42 @@ fn split_reference(target: &str) -> (String, Option<u32>) {
     match target.split_once('@') {
         Some((artifact, version)) => (artifact.to_string(), version.parse::<u32>().ok()),
         None => (target.to_string(), None),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_opens_only_on_a_fully_interactive_terminal() {
+        assert_eq!(
+            chat_plan(TerminalCapability {
+                stdin_tty: true,
+                stdout_tty: true
+            }),
+            ChatPlan::OpenInterface
+        );
+        for (stdin_tty, stdout_tty) in [(true, false), (false, true), (false, false)] {
+            assert_eq!(
+                chat_plan(TerminalCapability {
+                    stdin_tty,
+                    stdout_tty
+                }),
+                ChatPlan::RejectScripted,
+                "stdin={stdin_tty} stdout={stdout_tty}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_conversational_provider_follows_the_run_selection() {
+        let (provider, model) = conversational_provider(&RuntimeSelection::Production {
+            provider: "fake".to_string(),
+        })
+        .unwrap();
+        assert_eq!(model, "fake-standard");
+        assert_eq!(provider.name().as_str(), "fake");
     }
 }

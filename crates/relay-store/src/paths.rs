@@ -1,9 +1,10 @@
 //! `.relay` directory layout (`docs/event-format.md` §4).
 //!
-//! Mirrors `src/storage/paths.ts` for the legacy pieces (root, `state.db`,
-//! `artifacts/`) and adds the Rust store layout (`manifest.json`, `events/`,
-//! `index.sqlite`, `locks/`, `recovery/`). This module only computes paths;
-//! callers own creation.
+//! The legacy pieces (root, `state.db`, `artifacts/`) historically mirrored
+//! the retired TypeScript store's paths and are kept so legacy data can
+//! still be read; the Rust store layout (`manifest.json`, `events/`,
+//! `index.sqlite`, `locks/`, `recovery/`) is added on top. This module only
+//! computes paths; callers own creation.
 
 use std::path::Path;
 use std::path::PathBuf;

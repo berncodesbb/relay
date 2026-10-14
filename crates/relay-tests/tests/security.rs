@@ -1,7 +1,8 @@
 //! Security integration suite (runtime/security owner).
 //!
 //! Adversarial coverage for the `relay-tools` boundary, ported from the
-//! TypeScript suites in `test/unit/tools/*.test.ts` and escalated into
+//! TypeScript suites in `test/unit/tools/*.test.ts` (retired tree, removed
+//! 2026-10-14) and escalated into
 //! attack scenarios:
 //!
 //! - workspace containment: traversal, absolute/home/drive paths, symlink

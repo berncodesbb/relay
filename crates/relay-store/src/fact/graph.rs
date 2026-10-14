@@ -7,7 +7,10 @@
 //! `derived_from` inputs, evidence with outcomes and targets, attempts with
 //! grant summaries and conclusions, and declared invalidations — alongside
 //! the storage-owned `facts` sequence index and checkpoint (see
-//! [`crate::fact::projection`]).
+//! [`crate::fact::projection`]). Conversation facts are deliberately
+//! pass-through: the transcript projection is replay-derived in
+//! `relay-domain`'s [`ProjectGraph`](relay_domain::ProjectGraph), never
+//! SQL rows.
 //!
 //! **What is deliberately absent:** readiness, blockers, awaiting-human,
 //! completion, and recommendations. Those are engine-derived over the
@@ -24,8 +27,6 @@ use relay_domain::DomainFact;
 use relay_domain::Operation;
 use relay_domain::ScopePath;
 use relay_domain::ids::ArtifactId;
-use relay_domain::ids::AttemptId;
-use relay_domain::ids::DecisionId;
 use relay_domain::ids::WorkItemId;
 use relay_domain::work::ExecutorClass;
 
@@ -274,6 +275,19 @@ impl FactFold for GraphFold {
                     ],
                 )?;
             }
+            // Conversation facts project no SQLite rows: the durable
+            // transcript view lives in the replay-derived
+            // `ProjectGraph` (see `GraphFactStore::project_graph`), and
+            // bounded transcript reads fold from the authoritative JSONL.
+            // The storage-owned `facts` row for each record and the
+            // revision stamp below still cover every conversation fact, so
+            // SQLite stays a non-authoritative lookup index that can be
+            // deleted and rebuilt at any time.
+            DomainFact::ConversationStarted { .. }
+            | DomainFact::UserMessageRecorded { .. }
+            | DomainFact::AssistantMessageRecorded { .. }
+            | DomainFact::ConversationTurnFailed { .. }
+            | DomainFact::ConversationTurnCancelled { .. } => {}
         }
         upsert_meta_revision(tx, record.sequence)?;
         Ok(())
@@ -1391,16 +1405,4 @@ pub fn graph_meta(conn: &Connection) -> Result<GraphMeta> {
         source: Some(error),
     })
     .map(|meta| meta.unwrap_or_default())
-}
-
-/// One attempt row by id (helper for reconciliation views).
-pub fn attempt_id(conn: &Connection, id: &AttemptId) -> Result<Option<AttemptRow>> {
-    let all = attempts(conn, None, None)?;
-    Ok(all.into_iter().find(|attempt| attempt.id == id.as_str()))
-}
-
-/// One decision row by id (helper for inspect views).
-pub fn decision_by_id(conn: &Connection, id: &DecisionId) -> Result<Option<DecisionRow>> {
-    let all = decisions(conn, DecisionFilter::All)?;
-    Ok(all.into_iter().find(|decision| decision.id == id.as_str()))
 }

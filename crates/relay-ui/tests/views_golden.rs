@@ -2,8 +2,9 @@
 //! `tests/fixtures/cases/*`, replaying `events.jsonl` through `relay-core`
 //! and building the status/why views must reproduce the committed
 //! `expected-status.json` / `expected-why.json` canonical goldens exactly.
-//! `sessionKey` comes from the case's `meta.json`, mirroring the TypeScript
-//! exporter (`scripts/export-compatibility-fixtures.mjs`).
+//! `sessionKey` comes from the case's `meta.json`, mirroring the retired
+//! TypeScript exporter (`scripts/export-compatibility-fixtures.mjs`, removed
+//! from the tree 2026-10-14); the committed goldens are now frozen evidence.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 

@@ -258,8 +258,6 @@ fn workspace_writes_are_serialized() {
         Orchestrator::new(Arc::clone(&sink) as Arc<_>, relay_executor::system_clock())
             .with_executors(executors)
             .with_grants(Arc::new(|work: &relay_domain::WorkNode| {
-                let ids = relay_executor::IdSource::new();
-                let _ = ids;
                 grant_from_work(
                     GrantId::parse("grant_write").unwrap(),
                     work,

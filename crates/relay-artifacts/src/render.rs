@@ -7,7 +7,9 @@
 //! table cells are escaped so values cannot break out of the table. No HTML is
 //! emitted.
 //!
-//! Byte-for-byte port of `src/artifacts/render.ts`.
+//! Byte-for-byte port of `src/artifacts/render.ts` (retired TypeScript tree,
+//! removed from the repository 2026-10-14); output parity is pinned by the
+//! frozen fixtures under `tests/fixtures/cases/e2e-demo-run/artifacts`.
 
 use relay_core::ArtifactKind;
 use serde_json::Value;

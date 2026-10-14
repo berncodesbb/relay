@@ -4,6 +4,10 @@ use std::collections::BTreeMap;
 
 use crate::artifact::{ArtifactContent, ArtifactDigest, ArtifactVersionRef};
 use crate::attempt::AttemptConclusion;
+use crate::conversation::{
+    ConversationNode, MESSAGE_TEXT_MAX_CHARS, RecordedMessage, Speaker, TURN_RELATED_MAX,
+    TranscriptEntry, TurnNode, TurnOutcome, TurnReferences,
+};
 use crate::decision::{Decision, DecisionResolution};
 use crate::dependency::{DependencyEdge, DependencyKind};
 use crate::error::FactError;
@@ -12,8 +16,8 @@ use crate::facts::{DomainFact, InvalidationCause, InvalidationTarget};
 use crate::goal::Goal;
 use crate::grant::{CapabilityGrant, Operation};
 use crate::ids::{
-    ArtifactId, ArtifactVersion, AttemptId, DecisionId, EvidenceId, ProjectId, ProjectRevision,
-    WorkItemId,
+    ArtifactId, ArtifactVersion, AttemptId, ConversationId, DecisionId, EvidenceId, MessageId,
+    ProjectId, ProjectRevision, TurnId, WorkItemId,
 };
 use crate::validation::{check_work_shape, find_cycle, grant_covers_scopes, scopes_within_ceiling};
 use crate::work::WorkItem;
@@ -183,7 +187,11 @@ pub struct DeclaredInvalidation {
 /// capabilities, sequences) and stamps each node with the revision of its
 /// last change so receipt acceptance can detect material changes. Facts
 /// that do not reference each other are order-independent: shuffling them
-/// yields a graph with identical derived state.
+/// yields a graph with identical derived state. One deliberate exception:
+/// conversation turns of independent conversations commute, but
+/// [`latest_conversation`](Self::latest_conversation) tracks the most
+/// recently applied `ConversationStarted`, so the *order of conversation
+/// starts* selects which conversation a resumable session opens.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProjectGraph {
     project: Option<ProjectId>,
@@ -195,6 +203,13 @@ pub struct ProjectGraph {
     evidence: BTreeMap<EvidenceId, Evidence>,
     attempts: BTreeMap<AttemptId, AttemptNode>,
     invalidations: BTreeMap<InvalidationTarget, Vec<DeclaredInvalidation>>,
+    conversations: BTreeMap<ConversationId, ConversationNode>,
+    // Derived registries of the conversation fold: which conversation owns
+    // each turn/message id, so freshness and cross-conversation checks are
+    // exact. Pure functions of `conversations`.
+    turn_owners: BTreeMap<TurnId, ConversationId>,
+    message_owners: BTreeMap<MessageId, ConversationId>,
+    latest_conversation: Option<ConversationId>,
     revision: ProjectRevision,
 }
 
@@ -308,6 +323,68 @@ impl ProjectGraph {
             } => {
                 self.apply_invalidation_declared(fact.kind(), target, cause, changed_input.clone())?
             }
+            DomainFact::ConversationStarted {
+                conversation,
+                started_at_ms,
+            } => self.apply_conversation_started(fact.kind(), conversation, *started_at_ms)?,
+            DomainFact::UserMessageRecorded {
+                conversation,
+                turn,
+                message,
+                text,
+                at_ms,
+            } => self.apply_user_message_recorded(
+                fact.kind(),
+                conversation,
+                turn,
+                message,
+                text,
+                *at_ms,
+            )?,
+            DomainFact::AssistantMessageRecorded {
+                conversation,
+                turn,
+                message,
+                text,
+                at_ms,
+                related_attempts,
+                related_decisions,
+                related_work,
+            } => self.apply_assistant_message_recorded(
+                fact.kind(),
+                conversation,
+                turn,
+                message,
+                text,
+                *at_ms,
+                related_attempts,
+                related_decisions,
+                related_work,
+            )?,
+            DomainFact::ConversationTurnFailed {
+                conversation,
+                turn,
+                safe_message,
+                at_ms,
+            } => self.apply_conversation_turn_failed(
+                fact.kind(),
+                conversation,
+                turn,
+                safe_message,
+                *at_ms,
+            )?,
+            DomainFact::ConversationTurnCancelled {
+                conversation,
+                turn,
+                reason,
+                at_ms,
+            } => self.apply_conversation_turn_cancelled(
+                fact.kind(),
+                conversation,
+                turn,
+                reason,
+                *at_ms,
+            )?,
         }
         self.revision = ProjectRevision::from_count(self.revision.get() + 1);
         Ok(())
@@ -1033,6 +1110,203 @@ impl ProjectGraph {
         Ok(())
     }
 
+    fn apply_conversation_started(
+        &mut self,
+        kind: &'static str,
+        conversation: &ConversationId,
+        started_at_ms: i64,
+    ) -> Result<(), FactError> {
+        if self.conversations.contains_key(conversation) {
+            return Err(FactError::Duplicate {
+                fact: kind,
+                detail: format!("conversation {conversation} is already started"),
+            });
+        }
+        self.conversations.insert(
+            conversation.clone(),
+            ConversationNode {
+                started_at_ms,
+                turns: BTreeMap::new(),
+            },
+        );
+        // The most recently applied start is the resumed conversation;
+        // deterministic under the sequential fold.
+        self.latest_conversation = Some(conversation.clone());
+        Ok(())
+    }
+
+    fn apply_user_message_recorded(
+        &mut self,
+        kind: &'static str,
+        conversation: &ConversationId,
+        turn: &TurnId,
+        message: &MessageId,
+        text: &str,
+        at_ms: i64,
+    ) -> Result<(), FactError> {
+        self.conversation_node(kind, conversation)?;
+        self.check_turn_fresh(kind, conversation, turn)?;
+        self.check_message_fresh(kind, conversation, message)?;
+        if text.is_empty() {
+            return Err(FactError::InvalidState {
+                fact: kind,
+                detail: format!("turn {turn} user message text must not be empty"),
+            });
+        }
+        if text.chars().count() > MESSAGE_TEXT_MAX_CHARS {
+            return Err(FactError::InvalidState {
+                fact: kind,
+                detail: format!(
+                    "turn {turn} user message text is {len} chars; the maximum is {MESSAGE_TEXT_MAX_CHARS}",
+                    len = text.chars().count()
+                ),
+            });
+        }
+        let node = self
+            .conversations
+            .get_mut(conversation)
+            .ok_or(FactError::UnknownReference {
+                fact: kind,
+                detail: conversation.to_string(),
+            })?;
+        node.turns.insert(
+            turn.clone(),
+            TurnNode {
+                user: Some(RecordedMessage {
+                    message: message.clone(),
+                    text: text.to_string(),
+                    at_ms,
+                }),
+                outcome: None,
+            },
+        );
+        self.turn_owners.insert(turn.clone(), conversation.clone());
+        self.message_owners
+            .insert(message.clone(), conversation.clone());
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_assistant_message_recorded(
+        &mut self,
+        kind: &'static str,
+        conversation: &ConversationId,
+        turn: &TurnId,
+        message: &MessageId,
+        text: &str,
+        at_ms: i64,
+        related_attempts: &[AttemptId],
+        related_decisions: &[DecisionId],
+        related_work: &[WorkItemId],
+    ) -> Result<(), FactError> {
+        self.open_turn(kind, conversation, turn)?;
+        self.check_message_fresh(kind, conversation, message)?;
+        if text.chars().count() > MESSAGE_TEXT_MAX_CHARS {
+            return Err(FactError::InvalidState {
+                fact: kind,
+                detail: format!(
+                    "turn {turn} assistant message text is {len} chars; the maximum is {MESSAGE_TEXT_MAX_CHARS}",
+                    len = text.chars().count()
+                ),
+            });
+        }
+        for (label, count) in [
+            ("related_attempts", related_attempts.len()),
+            ("related_decisions", related_decisions.len()),
+            ("related_work", related_work.len()),
+        ] {
+            if count > TURN_RELATED_MAX {
+                return Err(FactError::InvalidState {
+                    fact: kind,
+                    detail: format!(
+                        "turn {turn} lists {count} {label}; the maximum is {TURN_RELATED_MAX} per related list"
+                    ),
+                });
+            }
+        }
+        // Related ids are annotations, not references: they are not
+        // required to exist in the graph (conversation facts may be
+        // appended before or without the named attempts, decisions, work).
+        let node = self
+            .conversations
+            .get_mut(conversation)
+            .ok_or(FactError::UnknownReference {
+                fact: kind,
+                detail: conversation.to_string(),
+            })?;
+        let turn_node = node.turns.get_mut(turn).ok_or(FactError::InvalidState {
+            fact: kind,
+            detail: format!("turn {turn} has no recorded user message"),
+        })?;
+        turn_node.outcome = Some(TurnOutcome::Completed {
+            message: message.clone(),
+            text: text.to_string(),
+            at_ms,
+            related: TurnReferences {
+                attempts: related_attempts.to_vec(),
+                decisions: related_decisions.to_vec(),
+                work: related_work.to_vec(),
+            },
+        });
+        self.message_owners
+            .insert(message.clone(), conversation.clone());
+        Ok(())
+    }
+
+    fn apply_conversation_turn_failed(
+        &mut self,
+        kind: &'static str,
+        conversation: &ConversationId,
+        turn: &TurnId,
+        safe_message: &str,
+        at_ms: i64,
+    ) -> Result<(), FactError> {
+        self.open_turn(kind, conversation, turn)?;
+        let node = self
+            .conversations
+            .get_mut(conversation)
+            .ok_or(FactError::UnknownReference {
+                fact: kind,
+                detail: conversation.to_string(),
+            })?;
+        let turn_node = node.turns.get_mut(turn).ok_or(FactError::InvalidState {
+            fact: kind,
+            detail: format!("turn {turn} has no recorded user message"),
+        })?;
+        turn_node.outcome = Some(TurnOutcome::Failed {
+            safe_message: safe_message.to_string(),
+            at_ms,
+        });
+        Ok(())
+    }
+
+    fn apply_conversation_turn_cancelled(
+        &mut self,
+        kind: &'static str,
+        conversation: &ConversationId,
+        turn: &TurnId,
+        reason: &str,
+        at_ms: i64,
+    ) -> Result<(), FactError> {
+        self.open_turn(kind, conversation, turn)?;
+        let node = self
+            .conversations
+            .get_mut(conversation)
+            .ok_or(FactError::UnknownReference {
+                fact: kind,
+                detail: conversation.to_string(),
+            })?;
+        let turn_node = node.turns.get_mut(turn).ok_or(FactError::InvalidState {
+            fact: kind,
+            detail: format!("turn {turn} has no recorded user message"),
+        })?;
+        turn_node.outcome = Some(TurnOutcome::Cancelled {
+            reason: reason.to_string(),
+            at_ms,
+        });
+        Ok(())
+    }
+
     // -- internal helpers ---------------------------------------------------
 
     /// The revision this fact will land at once applied.
@@ -1073,6 +1347,115 @@ impl ProjectGraph {
                 fact: kind,
                 detail: format!("attempt {attempt} does not exist"),
             })
+    }
+
+    fn conversation_node(
+        &self,
+        kind: &'static str,
+        conversation: &ConversationId,
+    ) -> Result<&ConversationNode, FactError> {
+        self.conversations
+            .get(conversation)
+            .ok_or_else(|| FactError::UnknownReference {
+                fact: kind,
+                detail: format!("conversation {conversation} does not exist"),
+            })
+    }
+
+    /// Reject a turn id that already exists: a duplicate within the same
+    /// conversation, a cross-conversation reference otherwise.
+    fn check_turn_fresh(
+        &self,
+        kind: &'static str,
+        conversation: &ConversationId,
+        turn: &TurnId,
+    ) -> Result<(), FactError> {
+        match self.turn_owners.get(turn) {
+            Some(owner) if owner == conversation => Err(FactError::Duplicate {
+                fact: kind,
+                detail: format!(
+                    "turn {turn} already exists in conversation {conversation}; a turn records exactly one user message"
+                ),
+            }),
+            Some(owner) => Err(FactError::InvalidState {
+                fact: kind,
+                detail: format!(
+                    "cross-conversation reference: turn {turn} already belongs to conversation {owner}"
+                ),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Reject a message id that was already recorded (same conversation:
+    /// duplicate; another conversation: cross-conversation reference).
+    fn check_message_fresh(
+        &self,
+        kind: &'static str,
+        conversation: &ConversationId,
+        message: &MessageId,
+    ) -> Result<(), FactError> {
+        match self.message_owners.get(message) {
+            Some(owner) if owner == conversation => Err(FactError::Duplicate {
+                fact: kind,
+                detail: format!("message {message} is already recorded"),
+            }),
+            Some(owner) => Err(FactError::InvalidState {
+                fact: kind,
+                detail: format!(
+                    "cross-conversation reference: message {message} already belongs to conversation {owner}"
+                ),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Validate a terminal conversation fact's target: the conversation
+    /// must exist, the turn must belong to it and have been started by its
+    /// user message, and no outcome may be recorded yet.
+    fn open_turn(
+        &self,
+        kind: &'static str,
+        conversation: &ConversationId,
+        turn: &TurnId,
+    ) -> Result<&TurnNode, FactError> {
+        self.conversation_node(kind, conversation)?;
+        match self.turn_owners.get(turn) {
+            Some(owner) if owner == conversation => {}
+            Some(owner) => {
+                return Err(FactError::InvalidState {
+                    fact: kind,
+                    detail: format!(
+                        "cross-conversation reference: turn {turn} belongs to conversation {owner}"
+                    ),
+                });
+            }
+            None => {
+                return Err(FactError::InvalidState {
+                    fact: kind,
+                    detail: format!(
+                        "terminal outcome for turn {turn} without a started turn (no user message recorded)"
+                    ),
+                });
+            }
+        }
+        let node = self
+            .conversations
+            .get(conversation)
+            .and_then(|conversation_node| conversation_node.turns.get(turn))
+            .ok_or_else(|| FactError::InvalidState {
+                fact: kind,
+                detail: format!("turn {turn} has no recorded user message"),
+            })?;
+        if node.outcome.is_some() {
+            return Err(FactError::InvalidState {
+                fact: kind,
+                detail: format!(
+                    "turn {turn} already has a terminal outcome (multiple terminal outcomes)"
+                ),
+            });
+        }
+        Ok(node)
     }
 
     // -- read accessors -----------------------------------------------------
@@ -1189,19 +1572,87 @@ impl ProjectGraph {
         self.attempts.get(id)
     }
 
-    /// All declared invalidations, keyed by target.
-    pub fn declared_invalidations(
-        &self,
-    ) -> &BTreeMap<InvalidationTarget, Vec<DeclaredInvalidation>> {
-        &self.invalidations
-    }
-
     /// Declared invalidations for one target.
     pub fn invalidations_for(&self, target: &InvalidationTarget) -> &[DeclaredInvalidation] {
         self.invalidations
             .get(target)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    /// All conversations in deterministic (id) order.
+    pub fn conversations(&self) -> impl Iterator<Item = (&ConversationId, &ConversationNode)> {
+        self.conversations.iter()
+    }
+
+    /// The most recently applied `ConversationStarted`, when any
+    /// conversation exists. Deterministic under the sequential fold —
+    /// resumable sessions resume this one.
+    pub fn latest_conversation(&self) -> Option<ConversationId> {
+        self.latest_conversation.clone()
+    }
+
+    /// Look up one conversation.
+    pub fn conversation(&self, id: &ConversationId) -> Option<&ConversationNode> {
+        self.conversations.get(id)
+    }
+
+    /// Turns of `conversation` that recorded a user message but no terminal
+    /// outcome: the restart-time *interrupted* derivation, in deterministic
+    /// (turn id) order. An assistant response is never invented for them.
+    pub fn interrupted_turns(&self, conversation: &ConversationId) -> Vec<TurnId> {
+        self.conversations
+            .get(conversation)
+            .map(|node| {
+                node.turns
+                    .iter()
+                    .filter(|(_, turn)| turn.is_interrupted())
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The most recent `max_entries` durable transcript entries of
+    /// `conversation`, in chronological order: user and assistant
+    /// messages, with in-flight turns contributing their user side only.
+    /// Unknown conversations and `max_entries == 0` yield an empty tail.
+    ///
+    /// Entries sort by their caller-supplied `at_ms` (the fold validates no
+    /// time ordering); the stable sort keeps deterministic turn-id order
+    /// for entries sharing a timestamp.
+    pub fn transcript_tail(
+        &self,
+        conversation: &ConversationId,
+        max_entries: usize,
+    ) -> Vec<TranscriptEntry> {
+        let Some(node) = self.conversations.get(conversation) else {
+            return Vec::new();
+        };
+        let mut entries = Vec::new();
+        for (turn_id, turn) in &node.turns {
+            if let Some(user) = &turn.user {
+                entries.push(TranscriptEntry {
+                    turn: turn_id.clone(),
+                    speaker: Speaker::User,
+                    text: user.text.clone(),
+                    at_ms: user.at_ms,
+                });
+            }
+            if let Some(TurnOutcome::Completed { text, at_ms, .. }) = &turn.outcome {
+                entries.push(TranscriptEntry {
+                    turn: turn_id.clone(),
+                    speaker: Speaker::Assistant,
+                    text: text.clone(),
+                    at_ms: *at_ms,
+                });
+            }
+        }
+        entries.sort_by_key(|entry| entry.at_ms);
+        if entries.len() > max_entries {
+            entries.drain(..entries.len() - max_entries);
+        }
+        entries
     }
 }
 

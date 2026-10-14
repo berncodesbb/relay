@@ -33,6 +33,7 @@ use relay_domain::AttemptId;
 use relay_domain::AttemptOutcome;
 use relay_domain::AttemptReceipt;
 use relay_domain::CapabilityGrant;
+use relay_domain::ConversationId;
 use relay_domain::Decision;
 use relay_domain::DecisionId;
 use relay_domain::DecisionOption;
@@ -54,6 +55,7 @@ use relay_domain::ProjectRevision;
 use relay_domain::Provenance;
 use relay_domain::ProvenanceSource;
 use relay_domain::ScopePath;
+use relay_domain::Speaker;
 use relay_domain::Usage;
 use relay_domain::WorkItemId;
 use relay_domain::WorkKind;
@@ -1230,6 +1232,214 @@ fn domain_doctor_reports_healthy_store() -> Result<()> {
     assert!(
         findings.iter().any(|f| f.code == "facts-invalid"),
         "{findings:?}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Conversation facts: round-trip, rebuild equivalence, fail-closed decoding.
+// ---------------------------------------------------------------------------
+
+/// A domain-valid conversation history exercising all five conversation
+/// fact kinds across two conversations: a completed turn (with related
+/// annotations naming ids that do not exist in the graph), a failed turn,
+/// an interrupted turn, and a cancelled turn in an older conversation.
+/// No goal and no work: conversations are legal without either.
+fn conversation_stream() -> Result<Vec<DomainFact>> {
+    let archive: ConversationId = parse_id("cnv_archive")?;
+    let chat: ConversationId = parse_id("cnv_chat")?;
+    Ok(vec![
+        DomainFact::ProjectCreated {
+            project: domain_project()?,
+        },
+        DomainFact::ConversationStarted {
+            conversation: archive.clone(),
+            started_at_ms: CLOCK_MS,
+        },
+        DomainFact::ConversationStarted {
+            conversation: chat.clone(),
+            started_at_ms: CLOCK_MS + 1,
+        },
+        DomainFact::UserMessageRecorded {
+            conversation: chat.clone(),
+            turn: parse_id("turn_1")?,
+            message: parse_id("msg_u1")?,
+            text: "Explain this repository".to_string(),
+            at_ms: CLOCK_MS + 2,
+        },
+        DomainFact::AssistantMessageRecorded {
+            conversation: chat.clone(),
+            turn: parse_id("turn_1")?,
+            message: parse_id("msg_a1")?,
+            text: "It is a work-graph CLI harness".to_string(),
+            at_ms: CLOCK_MS + 3,
+            // Annotations only: none of these ids exist in the graph.
+            related_attempts: vec![parse_id("att_ghost")?],
+            related_decisions: vec![parse_id("dec_ghost")?],
+            related_work: vec![parse_id("work_ghost")?],
+        },
+        DomainFact::UserMessageRecorded {
+            conversation: chat.clone(),
+            turn: parse_id("turn_2")?,
+            message: parse_id("msg_u2")?,
+            text: "Ship it".to_string(),
+            at_ms: CLOCK_MS + 4,
+        },
+        DomainFact::ConversationTurnFailed {
+            conversation: chat.clone(),
+            turn: parse_id("turn_2")?,
+            safe_message: "provider unavailable".to_string(),
+            at_ms: CLOCK_MS + 5,
+        },
+        DomainFact::UserMessageRecorded {
+            conversation: chat.clone(),
+            turn: parse_id("turn_3")?,
+            message: parse_id("msg_u3")?,
+            text: "Never answered".to_string(),
+            at_ms: CLOCK_MS + 6,
+        },
+        DomainFact::UserMessageRecorded {
+            conversation: archive.clone(),
+            turn: parse_id("turn_old")?,
+            message: parse_id("msg_old-u")?,
+            text: "Old question".to_string(),
+            at_ms: CLOCK_MS - 10,
+        },
+        DomainFact::ConversationTurnCancelled {
+            conversation: archive,
+            turn: parse_id("turn_old")?,
+            reason: "user interrupted".to_string(),
+            at_ms: CLOCK_MS - 9,
+        },
+    ])
+}
+
+#[test]
+fn conversation_facts_round_trip_rebuild_and_fail_closed() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let workspace = dir.path();
+    let facts = conversation_stream()?;
+    let store = relay_store::GraphFactStore::create(
+        workspace,
+        &domain_project()?,
+        Integrity::Checksums,
+        options(),
+    )?;
+    let outcome = store.append(&facts)?;
+    assert_eq!(outcome.len(), facts.len());
+    assert_eq!(
+        store.revision()?,
+        ProjectRevision::from_count(facts.len() as u64)
+    );
+
+    // The typed timeline replays in append order with contiguous sequence.
+    let timeline = store.read_timeline()?;
+    let kinds: Vec<&'static str> = timeline.iter().map(|f| f.fact.kind()).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "project_created",
+            "conversation_started",
+            "conversation_started",
+            "user_message_recorded",
+            "assistant_message_recorded",
+            "user_message_recorded",
+            "conversation_turn_failed",
+            "user_message_recorded",
+            "user_message_recorded",
+            "conversation_turn_cancelled",
+        ]
+    );
+    for (index, fact) in timeline.iter().enumerate() {
+        assert_eq!(fact.sequence, (index as u64) + 1);
+    }
+
+    // The pure fold projects the conversation state, without any goal/work.
+    let graph = store.project_graph()?;
+    assert!(graph.goal().is_none());
+    assert_eq!(graph.works().count(), 0);
+    assert_eq!(graph.conversations().count(), 2);
+    assert_eq!(graph.latest_conversation(), Some(parse_id("cnv_chat")?));
+    let chat: ConversationId = parse_id("cnv_chat")?;
+    let archive: ConversationId = parse_id("cnv_archive")?;
+    assert_eq!(
+        graph.interrupted_turns(&chat),
+        vec![parse_id::<relay_domain::TurnId>("turn_3")?]
+    );
+    let tail = graph.transcript_tail(&chat, 10);
+    assert_eq!(tail.len(), 4);
+    assert_eq!(tail[0].speaker, Speaker::User);
+    assert_eq!(tail[1].speaker, Speaker::Assistant);
+    // The cancelled turn contributes its user side only.
+    assert_eq!(graph.transcript_tail(&archive, 10).len(), 1);
+
+    // The SQL projection is unchanged conversation-wise (no conversation
+    // tables) and the revision stamp counts every conversation fact.
+    let before = graph_view(&store)?;
+    assert!(before.works.is_empty());
+    assert_eq!(before.meta.revision, facts.len() as u64);
+    drop(store);
+
+    // Delete the projection database entirely: the JSONL log alone
+    // rebuilds the same SQL view and the same folded conversation state.
+    let db = workspace.join(".relay-graph").join("projection.sqlite");
+    for suffix in ["", "-wal", "-shm"] {
+        let path = db.with_file_name(format!("projection.sqlite{suffix}"));
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+    }
+    assert!(!db.exists());
+    let (reopened, report) = relay_store::GraphFactStore::open(workspace, options())?;
+    assert!(
+        matches!(
+            report.reconcile,
+            Some(relay_store::FactReconcileOutcome::ReplayedSuffix { from: 1, to }) if to == facts.len() as u64
+        ),
+        "expected a full replay, got {:?}",
+        report.reconcile
+    );
+    let after = graph_view(&reopened)?;
+    assert_eq!(after, before);
+    assert_eq!(reopened.project_graph()?, graph);
+
+    // Doctor passes on a conversation-fact store.
+    let findings = relay_store::fact_doctor_check(workspace, &options());
+    assert!(
+        !findings
+            .iter()
+            .any(|f| f.severity == relay_store::fact::doctor::FactSeverity::Error),
+        "{findings:?}"
+    );
+    drop(reopened);
+
+    // Fail-closed: a hand-written "conversation_started" record at payload
+    // version 2 is refused by the domain gate at append time…
+    let newer_dir = tempfile::tempdir()?;
+    let raw = FactStore::create(newer_dir.path(), STREAM, Integrity::Checksums, options())?;
+    let (kind, payload) = relay_domain::fact_to_parts(&facts[1]);
+    let v2 = FactInput::new(kind, 2, Json::from_serde(&payload)?);
+    let error = raw
+        .append_facts(&[v2], &relay_store::DomainFactValidator, &NoFold)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(error.contains("version 2"), "{error}");
+    assert!(error.contains("Upgrade Relay"), "{error}");
+
+    // …and a store that already contains one fails to open through the
+    // domain seam (nothing downstream may read past an unknown version).
+    let older_dir = tempfile::tempdir()?;
+    let raw = FactStore::create(older_dir.path(), STREAM, Integrity::Checksums, options())?;
+    raw.append_facts(
+        &[FactInput::new(kind, 2, Json::from_serde(&payload)?)],
+        &AcceptAllFacts,
+        &NoFold,
+    )?;
+    drop(raw);
+    assert!(
+        relay_store::GraphFactStore::open(older_dir.path(), options()).is_err(),
+        "a v2 conversation record must fail closed at open"
     );
     Ok(())
 }

@@ -1108,7 +1108,7 @@ impl<'a> Extractor<'a> {
                     .map_err(|error| StoreError::Legacy {
                         reason: format!("building verify-criteria work: {error}"),
                     })?,
-                    None => continue_as_corrective(definition, &work_id, objective)?,
+                    None => continue_as_corrective(&work_id, objective)?,
                 }
             } else {
                 relay_workflows::instantiate_executor(
@@ -1329,11 +1329,7 @@ impl<'a> Extractor<'a> {
     }
 }
 
-fn continue_as_corrective(
-    definition: &relay_workflows::WorkDefinition,
-    work_id: &WorkItemId,
-    objective: String,
-) -> Result<WorkItem> {
+fn continue_as_corrective(work_id: &WorkItemId, objective: String) -> Result<WorkItem> {
     // Verification without an importable criterion becomes corrective work
     // (receipt-completing), recorded as an inference.
     let mut work = WorkItem::new(
@@ -1348,7 +1344,6 @@ fn continue_as_corrective(
         CompletionRule::Receipt,
     );
     work.required = false;
-    let _ = definition;
     Ok(work)
 }
 

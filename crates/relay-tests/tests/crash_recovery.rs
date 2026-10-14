@@ -22,8 +22,10 @@ use common::{
     completed_receipt, graph_store, model_work, options, parse, published, revision_of,
     seed_history, workspace_work,
 };
+use relay_domain::ConversationId;
 use relay_domain::DomainFact;
 use relay_domain::ProjectRevision;
+use relay_domain::Speaker;
 use relay_store::{CrashAt, FaultPoint, StoreError};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -368,5 +370,145 @@ fn revision_pins_refuse_stale_appends_after_recovery() -> Result<()> {
         .unwrap_or_default();
     assert!(error.contains("stale expected revision"), "{error}");
     assert_eq!(stale_writer.revision()?, ProjectRevision::from_count(3));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Conversation recovery: interrupted turns, never an invented assistant.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn interrupted_conversation_turn_recovers_without_invented_assistant_output() -> Result<()> {
+    let (dir, store) = graph_store()?;
+    store.append(&seed_history(&parse("prj_crash")?)?)?;
+    // A conversation whose last durable fact is the user message: the
+    // process died mid-turn, before any assistant or terminal fact.
+    store.append(&[
+        DomainFact::ConversationStarted {
+            conversation: parse("cnv_chat")?,
+            started_at_ms: common::CLOCK_MS,
+        },
+        DomainFact::UserMessageRecorded {
+            conversation: parse("cnv_chat")?,
+            turn: parse("turn_1")?,
+            message: parse("msg_u1")?,
+            text: "Fix the failing tests".to_string(),
+            at_ms: common::CLOCK_MS,
+        },
+    ])?;
+    drop(store);
+
+    // Reopen: the turn derives as interrupted — the transcript carries the
+    // user message only; no assistant message is ever invented.
+    let (reopened, _) = relay_store::GraphFactStore::open(dir.path(), options())?;
+    let graph = reopened.project_graph()?;
+    let conversation: ConversationId = parse("cnv_chat")?;
+    assert_eq!(
+        graph.interrupted_turns(&conversation),
+        vec![parse::<relay_domain::TurnId>("turn_1")?]
+    );
+    let transcript = graph.transcript_tail(&conversation, 10);
+    assert_eq!(transcript.len(), 1);
+    assert_eq!(transcript[0].speaker, Speaker::User);
+    assert_eq!(transcript[0].text, "Fix the failing tests");
+
+    // Appending the terminal fact later works: the turn completes and the
+    // interrupted set empties.
+    reopened.append(&[DomainFact::AssistantMessageRecorded {
+        conversation: conversation.clone(),
+        turn: parse("turn_1")?,
+        message: parse("msg_a1")?,
+        text: "The suite is green again.".to_string(),
+        at_ms: common::CLOCK_MS + 10,
+        related_attempts: vec![],
+        related_decisions: vec![],
+        related_work: vec![],
+    }])?;
+    let graph = reopened.project_graph()?;
+    assert!(graph.interrupted_turns(&conversation).is_empty());
+    let transcript = graph.transcript_tail(&conversation, 10);
+    assert_eq!(transcript.len(), 2);
+    assert_eq!(transcript[1].speaker, Speaker::Assistant);
+
+    // A second terminal fact for the same turn is refused (never a double
+    // conclusion), and the store stays consistent.
+    let error = reopened
+        .append(&[DomainFact::ConversationTurnCancelled {
+            conversation: conversation.clone(),
+            turn: parse("turn_1")?,
+            reason: "late cancel".to_string(),
+            at_ms: common::CLOCK_MS + 20,
+        }])
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(error.contains("would not fold"), "{error}");
+    assert!(error.contains("terminal outcome"), "{error}");
+    drop(reopened);
+    let (final_open, _) = relay_store::GraphFactStore::open(dir.path(), options())?;
+    assert!(
+        final_open
+            .project_graph()?
+            .interrupted_turns(&conversation)
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
+fn store_truncated_mid_conversation_folds_the_consistent_prefix() -> Result<()> {
+    let (dir, store) = graph_store()?;
+    store.append(&seed_history(&parse("prj_crash")?)?)?;
+    store.append(&[
+        DomainFact::ConversationStarted {
+            conversation: parse("cnv_chat")?,
+            started_at_ms: common::CLOCK_MS,
+        },
+        DomainFact::UserMessageRecorded {
+            conversation: parse("cnv_chat")?,
+            turn: parse("turn_1")?,
+            message: parse("msg_u1")?,
+            text: "What broke?".to_string(),
+            at_ms: common::CLOCK_MS,
+        },
+    ])?;
+    drop(store);
+
+    // A foreign truncated tail (crashed writer): the half line is
+    // quarantined and the consistent prefix folds.
+    let segment = dir
+        .path()
+        .join(".relay-graph")
+        .join("facts")
+        .join("0000000000000001-open.jsonl");
+    let mut text = std::fs::read_to_string(&segment)?;
+    text.push_str("{\"checksum\":\"partial");
+    std::fs::write(&segment, text)?;
+
+    let (reopened, report) = relay_store::GraphFactStore::open(dir.path(), options())?;
+    assert_eq!(report.recovered_tails.len(), 1);
+    let graph = reopened.project_graph()?;
+    let conversation: ConversationId = parse("cnv_chat")?;
+    assert_eq!(
+        graph.interrupted_turns(&conversation),
+        vec![parse::<relay_domain::TurnId>("turn_1")?],
+        "the durable user message survives; the turn is interrupted"
+    );
+    let transcript = graph.transcript_tail(&conversation, 10);
+    assert_eq!(transcript.len(), 1);
+    assert_eq!(transcript[0].speaker, Speaker::User);
+
+    // The store continues appending after recovery.
+    reopened.append(&[DomainFact::ConversationTurnFailed {
+        conversation,
+        turn: parse("turn_1")?,
+        safe_message: "interrupted by restart".to_string(),
+        at_ms: common::CLOCK_MS + 1,
+    }])?;
+    drop(reopened);
+    let (final_open, _) = relay_store::GraphFactStore::open(dir.path(), options())?;
+    let graph = final_open.project_graph()?;
+    let conversation: ConversationId = parse("cnv_chat")?;
+    assert!(graph.interrupted_turns(&conversation).is_empty());
     Ok(())
 }

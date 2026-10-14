@@ -1,6 +1,8 @@
 //! Read-only legacy import (`.relay/state.db` → canonical store) per
 //! `docs/event-format.md` §10, plus import of a canonical JSONL directory
-//! produced by `scripts/export-legacy-project.mjs`.
+//! in the format specified by `docs/event-format.md` (the same layout as
+//! the frozen exporter fixtures under `tests/fixtures/cases/` and as any
+//! canonical store's `events/` directory).
 //!
 //! The legacy TypeScript store keeps events in a SQLite table `events`
 //! (`id, project_id, sequence, session_id, type, schema_version, timestamp,
@@ -251,8 +253,8 @@ pub fn migrate_legacy_state_db(
     })))
 }
 
-/// Import a canonical JSONL directory (the exporter output, which follows
-/// `docs/event-format.md`) as the workspace's store.
+/// Import a canonical JSONL directory (format per `docs/event-format.md`)
+/// as the workspace's store.
 ///
 /// The directory must contain an `events/` subdirectory with JSONL segment
 /// files; a `manifest.json` and `artifacts/` are honored when present.
@@ -559,8 +561,9 @@ fn build_envelopes(
         return Err(StoreError::Legacy {
             reason: format!(
                 "the legacy database holds multiple projects ({project_id} and {}). The Rust \
-                 store is one project per workspace; export each project into its own \
-                 workspace with scripts/export-legacy-project.mjs and import them separately",
+                 store is one project per workspace; split the events so each workspace's \
+                 legacy database holds a single project, then run `relay migrate` on each \
+                 workspace separately",
                 distinct.join(", ")
             ),
         });

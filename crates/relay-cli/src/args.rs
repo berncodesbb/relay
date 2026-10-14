@@ -12,6 +12,11 @@
 //! anywhere; `--workspace <path>` (or `--workspace=<path>`) selects the
 //! project directory (default: current directory); `--json` is accepted for
 //! every command; only long options exist.
+//!
+//! Chat-first invocation: a bare `relay` opens the workspace chat, a single
+//! unknown positional is a one-shot chat prompt (guarded against misspelled
+//! command names), and `--print "<prompt>"` runs one non-interactive
+//! conversational turn. Both chat forms compose with `--workspace` only.
 
 use std::path::PathBuf;
 
@@ -23,6 +28,9 @@ pub const USAGE: &str = "\
 relay — carry product intent from discovery through delivery (work-graph preview)
 
 Usage:
+  relay                                           Open or resume the workspace chat (terminal)
+  relay \"<prompt>\"                                Open the chat and submit the prompt once
+  relay --print \"<prompt>\"                        One conversational turn; print the reply and exit
   relay init --goal <text>                        Create a project and declare its goal
   relay project summary                           Goal, phase-grouped progress, recommendation
   relay work ready|blocked|list                   Ready / blocked / all work, with explanations
@@ -41,10 +49,11 @@ Usage:
   relay doctor check|rebuild-projection           Verify / rebuild the local fact store
   relay migrate --workspace <legacy-copy>         Migrate a legacy project copy (--dry-run to plan)
   relay config show|path|get <key>                Inspect effective configuration
-  relay tui                                       Interactive terminal interface (q quits)
+  relay tui                                       Compatibility alias for the chat interface
 
 Options:
   --workspace <path>    Operate on this directory (default: current directory)
+  --print <prompt>      One scripted conversational turn; prints the reply and exits
   --json                Machine-readable output where supported
   --autonomy <level>    manual | safe | until-decision | bounded:<n>  (default: safe)
   --provider <name>     fake | openai | anthropic  (default: fake, offline)
@@ -79,6 +88,16 @@ pub enum Command {
     Help,
     /// `-V`/`--version`.
     Version,
+    /// Bare invocation: open or resume chat (interactive only).
+    Chat {
+        /// A prompt submitted once the interface is ready.
+        prompt: Option<String>,
+    },
+    /// `--print "<prompt>"`: one bounded conversational turn, print, exit.
+    Print {
+        /// The prompt.
+        prompt: String,
+    },
     /// `init --goal <text>`.
     Init {
         /// The project goal.
@@ -223,16 +242,6 @@ pub enum ParseResult {
     },
 }
 
-impl ParseResult {
-    /// The error message, when this is an error.
-    pub fn error_message(&self) -> Option<&str> {
-        match self {
-            ParseResult::Err { error, .. } => Some(error),
-            ParseResult::Ok(_) => None,
-        }
-    }
-}
-
 /// Top-level commands of the new grammar (exposed so tests can assert the
 /// help text lists every one).
 pub const COMMANDS: [&str; 15] = [
@@ -256,9 +265,43 @@ pub const COMMANDS: [&str; 15] = [
 /// Legacy commands that must be recognized and mapped (never reproduced).
 pub const LEGACY_COMMANDS: [&str; 6] = ["status", "why", "inspect", "mode", "auto", "pause"];
 
+/// Every recognized command name — the new grammar, the legacy mappings,
+/// and the `help`/`version` words. The chat prompt fallback uses this both
+/// to keep known commands winning and to keep misspelled command-like
+/// words from silently becoming prompts.
+pub const KNOWN_COMMAND_NAMES: [&str; 23] = [
+    // New grammar.
+    "init",
+    "project",
+    "work",
+    "decisions",
+    "artifact",
+    "evidence",
+    "run",
+    "cancel",
+    "explain",
+    "expand",
+    "import-prd",
+    "doctor",
+    "migrate",
+    "config",
+    "tui",
+    // Legacy names, mapped rather than reproduced.
+    "status",
+    "why",
+    "inspect",
+    "mode",
+    "auto",
+    "pause",
+    // Reserved words.
+    "help",
+    "version",
+];
+
 /// Flags that consume the next token when not in `--name=value` form.
-const VALUE_FLAGS: [&str; 8] = [
+const VALUE_FLAGS: [&str; 9] = [
     "workspace",
+    "print",
     "goal",
     "choice",
     "rationale",
@@ -296,9 +339,16 @@ fn flag<'a>(flags: &'a Flags, name: &str) -> Option<&'a FlagValue> {
         .map(|(_, value)| value)
 }
 
+/// Whether the token is `--help`/`-h` or `--version`/`-V`, which win
+/// immediately from any position — including the position right after a
+/// value flag, which must not swallow them as its value.
+fn wins_immediately(token: &str) -> bool {
+    token == "--help" || token == "-h" || token == "--version" || token == "-V"
+}
+
 /// Split argv into the leading command, positionals, and flags. Help and
 /// version win immediately; single-dash tokens other than `-h`/`-V` are
-/// rejected.
+/// rejected. `--print` never consumes option-shaped text as its prompt.
 fn tokenize(argv: &[String]) -> (Option<String>, Vec<String>, Flags, Vec<String>) {
     let mut flags: Flags = Vec::new();
     let mut positionals: Vec<String> = Vec::new();
@@ -307,11 +357,13 @@ fn tokenize(argv: &[String]) -> (Option<String>, Vec<String>, Flags, Vec<String>
     let mut index = 0;
     while index < argv.len() {
         let token = &argv[index];
-        if token == "--help" || token == "-h" {
-            return (Some("help".to_string()), positionals, flags, errors);
-        }
-        if token == "--version" || token == "-V" {
-            return (Some("version".to_string()), positionals, flags, errors);
+        if wins_immediately(token) {
+            let word = if token == "--help" || token == "-h" {
+                "help"
+            } else {
+                "version"
+            };
+            return (Some(word.to_string()), positionals, flags, errors);
         }
         if token.starts_with("--") {
             let (name, value) = match token.find('=') {
@@ -321,7 +373,11 @@ fn tokenize(argv: &[String]) -> (Option<String>, Vec<String>, Flags, Vec<String>
                 ),
                 None => {
                     let name = token.strip_prefix("--").unwrap_or_default().to_string();
-                    if VALUE_FLAGS.contains(&name.as_str()) && index + 1 < argv.len() {
+                    let consumes_next = VALUE_FLAGS.contains(&name.as_str())
+                        && index + 1 < argv.len()
+                        && (name != "print" || !argv[index + 1].starts_with('-'))
+                        && !wins_immediately(&argv[index + 1]);
+                    if consumes_next {
                         index += 1;
                         (name, FlagValue::String(argv[index].clone()))
                     } else {
@@ -374,6 +430,62 @@ fn exactly_one(positionals: &[String], what: &str) -> Result<String, String> {
     }
 }
 
+/// Whether the token is a recognized command name (new grammar, legacy
+/// mapping, or the `help`/`version` words).
+fn is_known_command_name(token: &str) -> bool {
+    KNOWN_COMMAND_NAMES.contains(&token)
+}
+
+/// The command a misspelled single-word positional most likely meant:
+/// `statusx` starts with `status` (prefix rule), and `decision` dropped the
+/// trailing "s" of `decisions` (typical-plural rule). Multi-word input is
+/// a prompt, not a typo, so the guard never fires on it.
+fn likely_command(token: &str) -> Option<&'static str> {
+    if token.is_empty() || token.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let mut best: Option<&'static str> = None;
+    for name in KNOWN_COMMAND_NAMES {
+        if token.starts_with(name)
+            && token.len() > name.len()
+            && best.is_none_or(|current| current.len() < name.len())
+        {
+            best = Some(name);
+        }
+    }
+    if best.is_some() {
+        return best;
+    }
+    KNOWN_COMMAND_NAMES
+        .iter()
+        .copied()
+        .find(|name| name.strip_suffix('s') == Some(token))
+}
+
+/// Chat (bare or prompt form) and `--print` compose with `--workspace`
+/// (and, for the print form, `--print` itself) only. Returns the first
+/// flag name that breaks that contract.
+fn disallowed_conversational_flag(flags: &Flags) -> Option<String> {
+    flags
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .find(|name| *name != "workspace" && *name != "print")
+        .map(str::to_string)
+}
+
+/// The usage error for a flag that does not compose with chat.
+fn chat_flag_error(name: &str) -> String {
+    if name == "json" {
+        "--json does not apply to chat; for one scripted conversational turn use: relay --print \
+         \"<prompt>\""
+            .to_string()
+    } else if name.is_empty() {
+        "unknown option \"--\" (only long options are supported)".to_string()
+    } else {
+        format!("flag --{name} does not compose with chat (only --workspace does)")
+    }
+}
+
 /// Parse `argv` (without the program name).
 pub fn parse_arguments(argv: &[String]) -> ParseResult {
     let (command, positionals, flags, errors) = tokenize(argv);
@@ -383,12 +495,6 @@ pub fn parse_arguments(argv: &[String]) -> ParseResult {
             usage: true,
         };
     }
-    let Some(command) = command else {
-        return ParseResult::Err {
-            error: "no command given".to_string(),
-            usage: true,
-        };
-    };
     let workspace = match parse_workspace(&flags) {
         Ok(workspace) => workspace,
         Err(_) => PathBuf::from("."),
@@ -396,8 +502,8 @@ pub fn parse_arguments(argv: &[String]) -> ParseResult {
     let json = flag(&flags, "json") == Some(&FlagValue::Boolean(true));
     let dry_run = flag(&flags, "dry-run") == Some(&FlagValue::Boolean(true));
 
-    if command == "help" || command == "version" {
-        let parsed = if command == "help" {
+    if command.as_deref() == Some("help") || command.as_deref() == Some("version") {
+        let parsed = if command.as_deref() == Some("help") {
             Command::Help
         } else {
             Command::Version
@@ -408,6 +514,45 @@ pub fn parse_arguments(argv: &[String]) -> ParseResult {
             json,
         }));
     }
+
+    // `--print "<prompt>"`: one bounded conversational turn, no terminal.
+    // It composes with `--workspace` only and never with a command.
+    if flag(&flags, "print").is_some() {
+        if command.is_some() || !positionals.is_empty() {
+            return usage_error(
+                "--print runs one conversational turn and composes only with --workspace",
+            );
+        }
+        if let Some(name) = disallowed_conversational_flag(&flags) {
+            return usage_error(format!(
+                "--print composes only with --workspace (also got --{name})"
+            ));
+        }
+        let prompt = flag(&flags, "print").and_then(FlagValue::as_str);
+        let prompt_is_text = prompt.is_some_and(|text| !text.is_empty() && !text.starts_with('-'));
+        if !prompt_is_text {
+            return usage_error("--print requires a prompt: relay --print \"<prompt>\"");
+        }
+        return ParseResult::Ok(Box::new(ParsedArguments {
+            command: Command::Print {
+                prompt: prompt.unwrap_or_default().to_string(),
+            },
+            workspace,
+            json: false,
+        }));
+    }
+
+    let Some(command) = command else {
+        // Bare invocation: open or resume chat (interactive only).
+        if let Some(name) = disallowed_conversational_flag(&flags) {
+            return usage_error(chat_flag_error(&name));
+        }
+        return ParseResult::Ok(Box::new(ParsedArguments {
+            command: Command::Chat { prompt: None },
+            workspace,
+            json,
+        }));
+    };
 
     let parsed = match command.as_str() {
         "init" => Command::Init {
@@ -595,11 +740,38 @@ pub fn parse_arguments(argv: &[String]) -> ParseResult {
             reason: non_empty(positionals.join(" ")),
         },
         other => {
-            return usage_error(format!(
-                "unknown command \"{other}\"; the legacy commands {} are mapped where honest and \
-                 refused with guidance elsewhere",
-                LEGACY_COMMANDS.join(", ")
-            ));
+            // Known names that failed a more specific guard (for example
+            // `relay expand extra`) and unknown first positionals followed
+            // by more arguments keep today's error: a chat prompt is
+            // exactly one argument.
+            if is_known_command_name(other) || !positionals.is_empty() {
+                return usage_error(format!(
+                    "unknown command \"{other}\"; the legacy commands {} are mapped where honest \
+                     and refused with guidance elsewhere",
+                    LEGACY_COMMANDS.join(", ")
+                ));
+            }
+            // Option-like input is never prompt text.
+            if other.starts_with('-') {
+                return usage_error(format!(
+                    "unknown option \"{other}\" (only long options are supported)"
+                ));
+            }
+            // A single command-like word is more likely a typo than a
+            // prompt; misspelled commands must not silently become
+            // mutating prompts.
+            if let Some(likely) = likely_command(other) {
+                return usage_error(format!(
+                    "unknown command \"{other}\"; did you mean `{likely}`? (to send it as one \
+                     conversational turn: relay --print \"{other}\")"
+                ));
+            }
+            if let Some(name) = disallowed_conversational_flag(&flags) {
+                return usage_error(chat_flag_error(&name));
+            }
+            Command::Chat {
+                prompt: Some(other.to_string()),
+            }
         }
     };
 
@@ -753,10 +925,12 @@ mod tests {
 
     #[test]
     fn rejects_unknown_commands_and_short_options() {
-        assert!(matches!(parse(&[]), ParseResult::Err { usage: true, .. }));
-        let ParseResult::Err { error, .. } = parse(&["frobnicate"]) else {
+        // An unknown first positional followed by more arguments keeps
+        // today's unknown-command error (a chat prompt is one argument).
+        let ParseResult::Err { error, usage } = parse(&["frobnicate", "extra"]) else {
             panic!("expected an error");
         };
+        assert!(usage);
         assert!(error.contains("frobnicate"));
         let ParseResult::Err { error, .. } = parse(&["status", "-x"]) else {
             panic!("expected an error");
@@ -785,5 +959,197 @@ mod tests {
         };
         assert!(parsed.workspace.ends_with("sub/dir"));
         assert!(parsed.workspace.is_absolute());
+    }
+
+    // -- chat-first invocation -----------------------------------------
+
+    #[test]
+    fn usage_documents_the_chat_invocation() {
+        assert!(USAGE.contains("relay --print"), "{USAGE}");
+        assert!(
+            USAGE.contains("Open or resume the workspace chat"),
+            "bare relay line: {USAGE}"
+        );
+        assert!(
+            USAGE.contains("Open the chat and submit the prompt once"),
+            "prompt line: {USAGE}"
+        );
+    }
+
+    #[test]
+    fn known_command_names_cover_every_command_and_legacy_name() {
+        for command in COMMANDS {
+            assert!(KNOWN_COMMAND_NAMES.contains(&command), "{command}");
+        }
+        for command in LEGACY_COMMANDS {
+            assert!(KNOWN_COMMAND_NAMES.contains(&command), "{command}");
+        }
+        for word in ["help", "version"] {
+            assert!(KNOWN_COMMAND_NAMES.contains(&word), "{word}");
+        }
+    }
+
+    /// The Phase 0 invocation table, parser side: what each shape parses
+    /// into before terminal capability decides interactive behavior.
+    #[test]
+    fn invocation_table_parses_as_specified() {
+        let cases: Vec<(Vec<&str>, Command)> = vec![
+            // Bare invocation: chat, with or without a workspace.
+            (vec![], Command::Chat { prompt: None }),
+            (vec!["--workspace", "/tmp"], Command::Chat { prompt: None }),
+            // Exactly one unknown positional: a chat prompt.
+            (
+                vec!["explain this repository"],
+                Command::Chat {
+                    prompt: Some("explain this repository".to_string()),
+                },
+            ),
+            (
+                vec!["frobnicate"],
+                Command::Chat {
+                    prompt: Some("frobnicate".to_string()),
+                },
+            ),
+            (
+                vec!["frobnicate", "--workspace", "/tmp"],
+                Command::Chat {
+                    prompt: Some("frobnicate".to_string()),
+                },
+            ),
+            // `--print` in both spellings, composing with `--workspace`.
+            (
+                vec!["--print", "summarize the project"],
+                Command::Print {
+                    prompt: "summarize the project".to_string(),
+                },
+            ),
+            (
+                vec!["--print=summarize"],
+                Command::Print {
+                    prompt: "summarize".to_string(),
+                },
+            ),
+            (
+                vec!["--workspace", "/tmp", "--print", "hi"],
+                Command::Print {
+                    prompt: "hi".to_string(),
+                },
+            ),
+            // `tui` stays the compatibility alias.
+            (vec!["tui"], Command::Tui),
+        ];
+        for (argv, expected) in cases {
+            let parsed = parse(&argv);
+            assert!(
+                matches!(&parsed, ParseResult::Ok(p) if p.command == expected),
+                "{argv:?} => {parsed:?}"
+            );
+        }
+    }
+
+    /// The error half of the invocation table: these shapes must be usage
+    /// errors, never chat prompts.
+    #[test]
+    fn invocation_table_rejects_as_specified() {
+        let cases: Vec<Vec<&str>> = vec![
+            // Chat composes with --workspace only.
+            vec!["--json"],
+            vec!["--no-color"],
+            vec!["--frobnicate"],
+            vec!["--"],
+            vec!["--json", "hello there"],
+            vec!["hello there", "--dry-run"],
+            // Option-like input is never prompt text.
+            vec!["-"],
+            vec!["-x"],
+            // More than one positional with an unknown first positional.
+            vec!["frobnicate", "and", "more"],
+            // Known commands keep their guarded errors.
+            vec!["tui", "extra"],
+            vec!["status", "extra"],
+            // `--print` needs text and composes only with --workspace.
+            vec!["--print"],
+            vec!["--print="],
+            vec!["--print", "-x"],
+            vec!["--print", "--json"],
+            vec!["--print", "hi", "--json"],
+            vec!["--print", "hi", "tui"],
+            vec!["tui", "--print", "hi"],
+        ];
+        for argv in cases {
+            assert!(
+                matches!(parse(&argv), ParseResult::Err { usage: true, .. }),
+                "{argv:?} must be a usage error"
+            );
+        }
+    }
+
+    #[test]
+    fn json_with_chat_points_at_print() {
+        let ParseResult::Err { error, usage } = parse(&["--json"]) else {
+            panic!("expected an error");
+        };
+        assert!(usage);
+        assert!(error.contains("--print"), "{error}");
+        let ParseResult::Err { error, .. } = parse(&["--print", "hi", "--json"]) else {
+            panic!("expected an error");
+        };
+        assert!(error.contains("only with --workspace"), "{error}");
+    }
+
+    #[test]
+    fn misspelled_command_like_words_are_usage_errors_not_prompts() {
+        let cases = [
+            ("statusx", "status"),
+            ("configx", "config"),
+            ("works", "work"),
+            ("runs", "run"),
+            ("decision", "decisions"),
+            ("tui2", "tui"),
+        ];
+        for (token, suggestion) in cases {
+            let ParseResult::Err { error, usage } = parse(&[token]) else {
+                panic!("{token} should be a usage error");
+            };
+            assert!(usage, "{token}");
+            assert!(
+                error.contains(&format!("did you mean `{suggestion}`?")),
+                "{token}: {error}"
+            );
+        }
+        // Multi-word input is a prompt, not a typo, even when the first
+        // word is command-like.
+        assert!(matches!(
+            parse(&["work on the csv export please"]),
+            ParseResult::Ok(p) if matches!(&p.command, Command::Chat { prompt: Some(text) } if text == "work on the csv export please")
+        ));
+        // Non-command-like single words stay prompts.
+        assert!(matches!(
+            parse(&["hello"]),
+            ParseResult::Ok(p) if matches!(&p.command, Command::Chat { prompt: Some(text) } if text == "hello")
+        ));
+    }
+
+    #[test]
+    fn help_and_version_win_from_any_position() {
+        for (argv, expected) in [
+            (vec!["--help"], Command::Help),
+            (vec!["-h"], Command::Help),
+            (vec!["--version"], Command::Version),
+            (vec!["-V"], Command::Version),
+            (vec!["work", "ready", "-V"], Command::Version),
+            (vec!["frobnicate", "--help"], Command::Help),
+            (vec!["--print", "hi", "--help"], Command::Help),
+            (vec!["--print", "--version"], Command::Version),
+            // A value flag must not swallow help/version as its value.
+            (vec!["run", "--provider", "--help"], Command::Help),
+            (vec!["--workspace", "--version"], Command::Version),
+        ] {
+            let parsed = parse(&argv);
+            assert!(
+                matches!(&parsed, ParseResult::Ok(p) if p.command == expected),
+                "{argv:?} => {parsed:?}"
+            );
+        }
     }
 }

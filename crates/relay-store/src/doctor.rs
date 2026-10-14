@@ -12,7 +12,6 @@ use crate::error::Result;
 use crate::error::StoreError;
 use crate::log::OpenMode;
 use crate::paths::RelayPaths;
-use crate::projection::SqliteProjection;
 use crate::store::RebuildReport;
 use crate::store::RelayStore;
 use crate::store::StoreOptions;
@@ -271,9 +270,4 @@ fn read_index_checkpoint(path: &Path) -> Result<Option<crate::projection::Checkp
 pub fn rebuild_index(workspace_root: &Path, options: StoreOptions) -> Result<RebuildReport> {
     let (store, _report) = RelayStore::open(workspace_root, options)?;
     store.rebuild_index()
-}
-
-/// Convenience: open the projection of an existing store for inspection.
-pub fn open_projection(paths: &RelayPaths, options: &StoreOptions) -> Result<SqliteProjection> {
-    SqliteProjection::open(&paths.index_db, &paths.recovery_dir, options.clock.as_ref())
 }

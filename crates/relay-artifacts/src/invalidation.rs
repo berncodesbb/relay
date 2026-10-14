@@ -1,6 +1,7 @@
 //! Deterministic downstream artifact invalidation.
 //!
-//! Port of `src/artifacts/invalidation.ts`. When an approved artifact is
+//! Port of `src/artifacts/invalidation.ts` (retired TypeScript tree, removed
+//! from the repository 2026-10-14). When an approved artifact is
 //! revised, every existing artifact that is transitively downstream of it in
 //! the core dependency graph is stale until it is regenerated and
 //! re-approved. The plan computed here is purely a function of the core graph
@@ -12,6 +13,7 @@ pub use relay_core::kind_to_mode;
 
 use relay_core::{ARTIFACT_KINDS, ArtifactKind, downstream_artifact_kinds};
 
+use crate::drafts::expected_kinds_detail;
 use crate::error::UnknownArtifactKindError;
 
 /// Input to [`plan_invalidation_from_names`]: the revised kind plus the kinds
@@ -49,14 +51,7 @@ pub fn plan_invalidation_from_names(
     let revised = relay_core::ArtifactKind::parse(&input.revised_kind).ok_or_else(|| {
         UnknownArtifactKindError {
             kind: input.revised_kind.clone(),
-            detail: format!(
-                "expected one of: {}",
-                ARTIFACT_KINDS
-                    .iter()
-                    .map(|kind| kind.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
+            detail: expected_kinds_detail(),
         }
     })?;
     let existing: Vec<ArtifactKind> = input

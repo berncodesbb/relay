@@ -88,7 +88,6 @@ pub struct SessionSnapshot {
 pub struct ProjectSession {
     workspace_root: PathBuf,
     store: Arc<GraphFactStore>,
-    options: SessionOptions,
     clock: Clock,
     state: Mutex<SessionSnapshot>,
 }
@@ -165,7 +164,6 @@ impl ProjectSession {
         let session = ProjectSession {
             workspace_root: workspace_root.to_path_buf(),
             store: Arc::clone(&store),
-            options,
             clock,
             state: Mutex::new(SessionSnapshot {
                 graph: ProjectGraph::default(),
@@ -218,11 +216,6 @@ impl ProjectSession {
         (self.clock)()
     }
 
-    /// The session options (clock and store configuration).
-    pub fn options(&self) -> &SessionOptions {
-        &self.options
-    }
-
     /// The cached graph snapshot.
     pub fn graph(&self) -> ProjectGraph {
         self.lock_state().graph.clone()
@@ -231,11 +224,6 @@ impl ProjectSession {
     /// The cached engine evaluation.
     pub fn evaluation(&self) -> Evaluation {
         self.lock_state().evaluation.clone()
-    }
-
-    /// The cached snapshot (graph plus evaluation).
-    pub fn snapshot(&self) -> SessionSnapshot {
-        self.lock_state().clone()
     }
 
     /// Whether the session's store carries an initialized project.

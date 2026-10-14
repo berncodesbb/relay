@@ -1,6 +1,7 @@
 //! Deterministic in-process provider for tests and demos.
 //!
-//! Ported from `src/providers/fake.ts`. The fake provider never touches the
+//! Ported from `src/providers/fake.ts` (retired TypeScript tree, removed from
+//! the repository 2026-10-14). The fake provider never touches the
 //! network. Callers script per-purpose responses (with optional ordered
 //! failures for retry tests); unmatched calls fall back to a simple echo. It
 //! records a call log so tests can assert routing, retries, and cancellation

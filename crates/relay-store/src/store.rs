@@ -34,7 +34,6 @@ use crate::log::RecoveredTail;
 use crate::log::TailState;
 use crate::paths::RelayPaths;
 use crate::projection::Checkpoint;
-use crate::projection::EventRow;
 use crate::projection::ProjectSummaryRow;
 use crate::projection::ReconcileOutcome;
 use crate::projection::SqliteProjection;
@@ -399,17 +398,6 @@ impl RelayStore {
         match projection.as_ref() {
             Some(projection) => projection.event_count().map(Some),
             None => Ok(None),
-        }
-    }
-
-    /// Projection events after `sequence` (query view).
-    pub fn projection_events_after(&self, sequence: u64, limit: u64) -> Result<Vec<EventRow>> {
-        let projection = self.projection.lock().map_err(|_| StoreError::Invalid {
-            reason: "the projection mutex was poisoned by a panic in another thread".to_string(),
-        })?;
-        match projection.as_ref() {
-            Some(projection) => projection.events_after(sequence, limit),
-            None => Ok(vec![]),
         }
     }
 

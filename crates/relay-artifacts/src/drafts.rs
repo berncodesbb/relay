@@ -2,8 +2,9 @@
 //!
 //! Every artifact Relay persists starts life as a draft proposed by a model
 //! and is therefore untrusted. This module is the single validation gate
-//! before any artifact is rendered or written. It is a port of
-//! `src/artifacts/schemas.ts` (Zod v4): same field names (camelCase in JSON),
+//! before any artifact is rendered or written. It is a port of the retired
+//! `src/artifacts/schemas.ts` (removed from the tree 2026-10-14; Zod v4):
+//! same field names (camelCase in JSON),
 //! same bounds, same optionality, and the same Zod-v4 issue text — `path:
 //! message` with the path rendered as dotted segments (or `(root)`), so the
 //! controller can feed identical diagnostics back to models.
@@ -25,7 +26,7 @@ use relay_core::{ARTIFACT_KINDS, ArtifactKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::error::{ArtifactsError, InvalidArtifactDraftError, UnknownArtifactKindError};
+use crate::error::{ArtifactsError, InvalidArtifactDraftError};
 
 /// Shared bounds documentation lives in the schema constants below; titles are
 /// single-line so they stay renderable as headings.
@@ -1433,15 +1434,6 @@ pub fn expected_kinds_detail() -> String {
     )
 }
 
-/// Resolve the draft schema kind for `kind`, mirroring `artifactDraftSchema`'s
-/// throw for unknown kinds.
-pub fn artifact_draft_kind(kind: &str) -> Result<ArtifactKind, UnknownArtifactKindError> {
-    ArtifactKind::parse(kind).ok_or_else(|| UnknownArtifactKindError {
-        kind: kind.to_string(),
-        detail: expected_kinds_detail(),
-    })
-}
-
 /// Validate an untrusted draft payload against the schema for `kind` without
 /// failing. Failures surface as human-readable issue strings.
 pub fn parse_artifact_draft(kind: ArtifactKind, value: &Value) -> ParseArtifactDraftResult {
@@ -1466,16 +1458,6 @@ pub fn parse_artifact_draft(kind: ArtifactKind, value: &Value) -> ParseArtifactD
             },
         },
     }
-}
-
-/// String-kind variant of [`parse_artifact_draft`] that fails for unknown
-/// kinds with the TypeScript error.
-pub fn parse_artifact_draft_by_name(
-    kind: &str,
-    value: &Value,
-) -> Result<ParseArtifactDraftResult, UnknownArtifactKindError> {
-    let kind = artifact_draft_kind(kind)?;
-    Ok(parse_artifact_draft(kind, value))
 }
 
 /// Validate a draft and fail with [`InvalidArtifactDraftError`] on failure.

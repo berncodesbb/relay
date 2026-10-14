@@ -21,11 +21,6 @@ impl StoreFactSink {
     pub fn new(store: Arc<GraphFactStore>) -> Self {
         StoreFactSink { store }
     }
-
-    /// The underlying store handle.
-    pub fn store(&self) -> Arc<GraphFactStore> {
-        Arc::clone(&self.store)
-    }
 }
 
 impl FactSink for StoreFactSink {

@@ -1,6 +1,7 @@
 //! Tool registry contracts.
 //!
-//! Ported from `src/tools/registry.ts`. Tools are schema-validated,
+//! Ported from `src/tools/registry.ts` (retired TypeScript tree, removed
+//! from the repository 2026-10-14). Tools are schema-validated,
 //! capability-classified, time-bounded, and cancelable. The registry is the
 //! only surface the agent loop uses; it never spawns processes or touches the
 //! filesystem directly.
@@ -98,12 +99,6 @@ impl ToolContext {
             signal: CancelToken::new(),
             log: Arc::new(|_message| {}),
         }
-    }
-
-    /// Replace the log sink.
-    pub fn with_log(mut self, log: ToolLog) -> Self {
-        self.log = log;
-        self
     }
 
     /// Whether the cancellation signal fired.

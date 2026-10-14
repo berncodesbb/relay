@@ -1,5 +1,11 @@
 # Relay AI development harness implementation plan
 
+> **Historical (2026-10-14):** this is the original TypeScript/Node.js
+> implementation plan. That implementation was removed from the repository
+> after the Rust work-graph became the sole product; see
+> `2026-10-14-remove-typescript-rust-only-codebase.md`. Retained as design
+> history; not current instructions.
+
 ## Objective
 
 Build Relay as a local-first, model-agnostic TypeScript CLI that preserves product intent from discovery through delivery. Relay should infer the user's intent, select an appropriate workflow mode and model, create durable reviewable artifacts, advance automatically when evidence and policy allow, and pause when human judgment or authorization is required.

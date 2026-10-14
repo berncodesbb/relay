@@ -1,6 +1,7 @@
 //! Versioned Markdown artifact storage under `.relay/artifacts/`.
 //!
-//! Port of `ArtifactMarkdownStore` in `src/artifacts/markdown-store.ts`. Each
+//! Port of `ArtifactMarkdownStore` in `src/artifacts/markdown-store.ts`
+//! (retired TypeScript tree, removed from the repository 2026-10-14). Each
 //! artifact version is an immutable file `<kind>/v<n>-<slug>.md` with YAML
 //! frontmatter (id, kind, version, title, status, timestamps) followed by the
 //! rendered body. Existing version files are never overwritten, and all reads

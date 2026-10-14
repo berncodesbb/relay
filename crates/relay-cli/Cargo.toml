@@ -24,6 +24,7 @@ relay-engine = { workspace = true }
 relay-workflows = { workspace = true }
 relay-config = { workspace = true }
 relay-ui = { workspace = true }
+relay-providers = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 ratatui = "0.29"

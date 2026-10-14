@@ -1,7 +1,8 @@
 //! Filesystem tools: bounded reads, directory inventory, and create-only
 //! writes.
 //!
-//! Ported from `src/tools/filesystem.ts`. Reads never return binary blobs and
+//! Ported from `src/tools/filesystem.ts` (retired TypeScript tree, removed
+//! from the repository 2026-10-14). Reads never return binary blobs and
 //! always pass through redaction and output bounds. Writes only create NEW
 //! files (overwrites are refused so user changes survive) and are atomic via
 //! write-temp-then-link with a rename fallback guarded by a re-stat.

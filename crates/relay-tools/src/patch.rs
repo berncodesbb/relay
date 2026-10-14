@@ -1,6 +1,7 @@
 //! Unified-diff patch application tool.
 //!
-//! Ported from `src/tools/patch.ts`. The entire patch is parsed and applied
+//! Ported from `src/tools/patch.ts` (retired TypeScript tree, removed from
+//! the repository 2026-10-14). The entire patch is parsed and applied
 //! in memory first: every context line must match the current file exactly
 //! or nothing is written (atomic across all files). File deletion, traversal,
 //! and absolute-path headers are rejected, and a re-stat guard aborts when a

@@ -1,6 +1,7 @@
 //! Workspace-bounded tools for Relay.
 //!
-//! Ported from the TypeScript reference implementation in `src/tools/**`.
+//! Ported from the retired TypeScript implementation in `src/tools/**`
+//! (removed from the tree 2026-10-14).
 //! Tools are schema-validated, capability-classified, time-bounded, and
 //! cancelable. The registry is the only surface the agent loop uses; it never
 //! spawns processes or touches the filesystem directly.
@@ -68,7 +69,8 @@ use relay_config::ToolSettings;
 
 /// Build a registry containing every built-in tool, configured by `settings`.
 ///
-/// Port of `createDefaultToolRegistry` in `src/tools/index.ts`, where a
+/// Port of `createDefaultToolRegistry` in `src/tools/index.ts` (retired
+/// TypeScript tree, removed from the repository 2026-10-14), where a
 /// registration failure throws; here the error propagates to the caller.
 pub fn create_default_tool_registry(
     settings: &ToolSettings,

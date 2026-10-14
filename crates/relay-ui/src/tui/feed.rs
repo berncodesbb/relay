@@ -11,7 +11,8 @@ use relay_core::project_state::ProjectState;
 
 /// Read-only snapshot provider for the terminal interface.
 ///
-/// Mirrors the structural `TuiController` port of `src/tui/view-model.ts`:
+/// Mirrors the structural `TuiController` port of the retired
+/// `src/tui/view-model.ts` (removed from the tree 2026-10-14):
 /// reads may fail before a project is initialized, and callers fall back to
 /// the empty projection (the reference's `readControllerState`).
 pub trait ControllerFeed {

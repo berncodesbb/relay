@@ -688,23 +688,9 @@ pub fn has_live_instance(graph: &ProjectGraph, kind: &str) -> bool {
         .any(|(_, node)| node.work.kind.as_str() == kind && !node.is_declared_terminal())
 }
 
-/// Count live instances of a kind.
-pub fn live_instance_count(graph: &ProjectGraph, kind: &str) -> usize {
-    graph
-        .works()
-        .filter(|(_, node)| node.work.kind.as_str() == kind && !node.is_declared_terminal())
-        .count()
-}
-
 /// A Requires edge from `from` to `to`.
 pub fn requires_edge(from: &WorkItemId, to: &WorkItemId) -> DependencyEdge {
     DependencyEdge::new(from.clone(), to.clone(), DependencyKind::Requires)
-}
-
-/// A Validates edge from `from` (verifier) to `to` (the work producing what
-/// is verified).
-pub fn validates_edge(from: &WorkItemId, to: &WorkItemId) -> DependencyEdge {
-    DependencyEdge::new(from.clone(), to.clone(), DependencyKind::Validates)
 }
 
 #[cfg(test)]

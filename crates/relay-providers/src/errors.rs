@@ -1,6 +1,7 @@
 //! Normalize provider transport errors into Relay-owned failures.
 //!
-//! Ported from `src/providers/errors.ts`. Transport errors (HTTP status
+//! Ported from `src/providers/errors.ts` (retired TypeScript tree, removed
+//! from the repository 2026-10-14). Transport errors (HTTP status
 //! failures, connection errors, timeouts, aborts) can carry request headers
 //! and bodies that must never reach Relay's logs. This mapper keeps only a
 //! trimmed, redacted `message`, classifies the failure into a provider-neutral
@@ -60,21 +61,9 @@ impl ErrorSignal {
         }
     }
 
-    /// Attach an HTTP status.
-    pub fn with_status(mut self, status: u16) -> Self {
-        self.status = Some(status);
-        self
-    }
-
     /// Attach a `retry-after` header value.
     pub fn with_retry_after(mut self, retry_after: Option<String>) -> Self {
         self.retry_after = retry_after;
-        self
-    }
-
-    /// Attach a wrapped cause.
-    pub fn with_cause(mut self, cause: ErrorSignal) -> Self {
-        self.cause = Some(Box::new(cause));
         self
     }
 

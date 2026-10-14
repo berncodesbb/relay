@@ -1,6 +1,7 @@
 //! Shared argument-schema helpers for tool definitions.
 //!
-//! Port of `src/tools/schemas.ts`. In the TypeScript implementation tools
+//! Port of `src/tools/schemas.ts` (retired TypeScript tree, removed from
+//! the repository 2026-10-14). In the TypeScript implementation tools
 //! compose Zod builders; here each tool declares the JSON Schema
 //! (draft 2020-12, byte-compatible with the Zod `toJSONSchema` output that
 //! providers see) plus the runtime-only refinements Zod carried in `.refine`

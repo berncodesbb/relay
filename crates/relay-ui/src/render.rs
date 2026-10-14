@@ -1,5 +1,6 @@
 //! Human renderers for the status and why views. Ported from
-//! `src/cli/output.ts` (`renderStatus`/`renderWhy` and their internals): the
+//! `src/cli/output.ts` (`renderStatus`/`renderWhy` and their internals;
+//! retired TypeScript tree, removed from the repository 2026-10-14): the
 //! TypeScript renderers probe view fields defensively with type guards, so
 //! every field contributes a line only when it carries a non-blank value —
 //! the renderers below apply the same `stringOf` semantics (a string counts

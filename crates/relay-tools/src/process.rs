@@ -1,6 +1,7 @@
 //! Bounded subprocess tool.
 //!
-//! Ported from `src/tools/process.ts`. Runs a single executable with an
+//! Ported from `src/tools/process.ts` (retired TypeScript tree, removed
+//! from the repository 2026-10-14). Runs a single executable with an
 //! argument array — never a shell string — in the workspace (or a
 //! workspace-relative subdirectory), with an explicit environment allowlist,
 //! separate stream-collected stdout/stderr, a timeout that terminates the

@@ -1,6 +1,7 @@
 //! Anthropic adapter.
 //!
-//! Ported from `src/providers/anthropic.ts`. Translates Relay-owned requests
+//! Ported from `src/providers/anthropic.ts` (retired TypeScript tree,
+//! removed from the repository 2026-10-14). Translates Relay-owned requests
 //! into Anthropic Messages API wire calls and normalizes the raw stream events
 //! back into Relay-owned provider events. Anthropic requires `max_tokens`
 //! (defaulted here), has no native JSON-schema response mode (structured

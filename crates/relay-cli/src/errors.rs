@@ -1,5 +1,6 @@
 //! Central mapping from command failures to CLI exit codes and user-facing
-//! text, ported from `src/cli/errors.ts`. Errors carry the TypeScript
+//! text, ported from `src/cli/errors.ts` (retired TypeScript tree, removed
+//! from the repository 2026-10-14). Errors carry the TypeScript
 //! implementation's error *names* (rather than Rust types) so classification
 //! stays byte-compatible with the frozen `exit-codes.json` fixture: 0
 //! success, 1 runtime failure, 2 usage or configuration error.

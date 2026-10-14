@@ -2,9 +2,10 @@
 //!
 //! Recorded, sanitized SSE fixtures (the Anthropic Messages stream event
 //! sequence) replayed through the loopback mock server, asserting the exact
-//! normalized outputs and wire translations the TypeScript suite
-//! (`test/unit/providers/anthropic.test.ts`) pins down. No network access:
-//! everything runs against 127.0.0.1.
+//! normalized outputs and wire translations originally pinned by the retired
+//! TypeScript suite (`test/unit/providers/anthropic.test.ts`, removed from
+//! the tree 2026-10-14); those recorded fixtures are preserved here as the
+//! frozen goldens. No network access: everything runs against 127.0.0.1.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 

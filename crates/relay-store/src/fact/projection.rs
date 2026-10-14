@@ -416,58 +416,6 @@ impl FactProjection {
         let conn = self.connection()?;
         query(conn)
     }
-
-    /// Indexed facts after `sequence`, ordered, at most `limit` (query view
-    /// over the storage-owned table).
-    pub fn facts_after(&self, sequence: u64, limit: u64) -> Result<Vec<FactRow>> {
-        let conn = self.connection()?;
-        let mut statement = conn
-            .prepare(
-                "SELECT sequence, type, fact_version, recorded_at, payload, checksum
-                 FROM facts WHERE sequence > ? ORDER BY sequence ASC LIMIT ?;",
-            )
-            .map_err(|error| StoreError::Projection {
-                reason: "preparing facts_after".to_string(),
-                source: Some(error),
-            })?;
-        let rows = statement
-            .query_map(params![sequence as i64, limit as i64], |row| {
-                Ok(FactRow {
-                    sequence: row.get::<_, i64>(0)? as u64,
-                    fact_type: row.get(1)?,
-                    fact_version: row.get::<_, i64>(2)? as u32,
-                    recorded_at: row.get(3)?,
-                    payload: row.get(4)?,
-                    checksum: row.get(5)?,
-                })
-            })
-            .map_err(|error| StoreError::Projection {
-                reason: "querying facts_after".to_string(),
-                source: Some(error),
-            })?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
-    }
-}
-
-/// One indexed fact row (query view).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FactRow {
-    /// Sequence.
-    pub sequence: u64,
-    /// Fact type.
-    pub fact_type: String,
-    /// Fact version.
-    pub fact_version: u32,
-    /// Envelope timestamp.
-    pub recorded_at: String,
-    /// Canonical payload JSON.
-    pub payload: String,
-    /// Record checksum.
-    pub checksum: String,
 }
 
 fn insert_fact_row(tx: &rusqlite::Transaction<'_>, record: &FactRecord) -> Result<()> {

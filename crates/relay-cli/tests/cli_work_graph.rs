@@ -262,8 +262,6 @@ fn init_expand_run_resolve_inspect_explain_flow() {
 
     // The free-form clarification accepts any answer text (there are no
     // declared options to miss).
-
-    // Free-form clarification: any answer text is acceptable.
     let (code, out, err) = drive(
         root,
         &[

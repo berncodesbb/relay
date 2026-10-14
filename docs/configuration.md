@@ -6,7 +6,8 @@ Relay is configured in YAML. Configuration contains no credentials — only the 
 built-in defaults
   <  ~/.config/relay/config.yaml        (user layer)
   <  relay.config.yaml                  (project layer, workspace root)
-  <  CLI overrides                      (--role / --provider / --model / --auto)
+  <  invocation overrides               (--provider on the CLI; --role/--provider/--model
+                                          for embedders via relay-config's invocation API)
 ```
 
 Exact file names: `~/.config/relay/config.yaml` and `relay.config.yaml` at the workspace root (`--workspace` changes which directory is the root).
@@ -96,16 +97,17 @@ Resolution is deterministic configuration; models never choose their own roles.
 2. **Lookup order.** An explicit routing entry for the purpose (`intent`) wins; otherwise the current workflow mode's route is used; otherwise — legacy behavior, only for a non-mode purpose with no explicit entry — the first configured route in configuration order. A missing workflow-mode route is a configuration error, never a silent reroute through another mode.
 3. **Role → provider.** The route's role expands to a provider, a model, limits, and a fallback chain. Fallback routes whose provider is not registered (credential variable unset) drop out of the chain; an unregistered primary provider fails immediately with an actionable error.
 
-`relay why` shows the selected role next to provider, model, and purpose for routing events that carry one; events recorded before roles existed, or from legacy inline routes, render unchanged without a role.
+Model events may carry the attempted role as an optional payload field; events recorded before roles existed, or from legacy inline routes, carry none. `relay config show` prints the effective role catalog and routing table, including each role's provider, model, limits, and fallbacks.
 
-### Autonomy bounds
+### Autonomy
 
-| Value | Meaning |
-| --- | --- |
-| `off` | Pause at every checkpoint; non-read tools are denied entirely |
-| `next-checkpoint` | Default. Run until the next artifact approval or intervention |
-| `until:<mode>` | Run until the workflow enters `<mode>` (one of the seven modes) |
-| `workflow` | Run end to end, still pausing for consequential choices, approvals, destructive operations, and delivery |
+The `autonomy` field accepts the legacy vocabulary the schema retains
+(`off`, `next-checkpoint`, `workflow`, `until:<mode>`). The work-graph
+runner does not read it as its default: scheduling autonomy is selected
+per run on the command line, where the levels are `manual` (choose work
+explicitly), `safe` (the default), `until-decision` (run until a human
+decision is the blocking work), and `bounded:<n>` (at most `n` scheduling
+waves). See `relay run --help`.
 
 ## Examples
 
@@ -265,9 +267,10 @@ routing: { intent: fast, discovery: reasoning, specification: reasoning,
 - `routing` merges by routing key, and `providers` merges by provider name.
 - Cross-reference validation runs on the effective configuration after all layers merge, so a project layer may route a purpose to a role defined in the user layer.
 
-## CLI overrides
+## Invocation overrides
 
-Flags override every file layer for a single invocation. When combined, later wins:
+Overrides replace every file layer for a single invocation. The precedence
+model lives in `relay-config`'s invocation API — when combined, later wins:
 
 ```text
 configured route  <  --role <name>  <  --provider <name>  <  --model <name>
@@ -276,11 +279,17 @@ configured route  <  --role <name>  <  --provider <name>  <  --model <name>
 - `--role <name>` routes every model call this invocation to one configured role (with that role's fallback chain), regardless of mode or purpose. An unknown role fails with a usage error listing the available roles, before any project state is created.
 - `--provider <name>` forces one provider for all routes this invocation (models stay as routed).
 - `--model <name>` overrides the routed model.
-- `--auto <bound>` sets the autonomy bound for the run.
 
-`--provider` and `--model` are low-level overrides and may intentionally produce provider/model combinations that do not appear in the `models` catalog. `RELAY_FAKE=1` keeps its existing effect.
+`--provider` and `--model` are low-level overrides and may intentionally
+produce provider/model combinations that do not appear in the `models`
+catalog.
 
-Example: `relay run "refine the PRD" --role review --auto until:implementation`.
+The shipped CLI currently exposes `--provider <name>` (`fake` | `openai` |
+`anthropic`; default `fake`, fully offline) and honors `RELAY_FAKE=1` with
+the same effect. The `--role`/`--model` flags are available to embedders
+through the library API (`relay_config::apply_invocation_overrides`).
+Run-scheduling autonomy is chosen per run with `relay run --autonomy`
+(see above), not through a configuration override.
 
 ## Validation behavior
 

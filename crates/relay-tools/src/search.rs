@@ -1,6 +1,7 @@
 //! Workspace text search tool.
 //!
-//! Ported from `src/tools/search.ts`. Walks the workspace without following
+//! Ported from `src/tools/search.ts` (retired TypeScript tree, removed from
+//! the repository 2026-10-14). Walks the workspace without following
 //! symlinks, skipping vendored/build directories and oversized files, and
 //! matches per line: literal substring by default, or a caller-supplied
 //! regular expression. Output is always redacted and bounded, with a

@@ -1,12 +1,14 @@
 //! Plain-text output for non-interactive Relay commands, ported from
-//! `src/cli/output.ts`. All CLI output flows through an [`OutputWriter`] so
+//! `src/cli/output.ts` (retired TypeScript tree, removed 2026-10-14). All
+//! CLI output flows through an [`OutputWriter`] so
 //! commands never print directly and output can be captured in tests. This
 //! is the one place in the Relay crates that writes to stdout/stderr; the
 //! relay-ui renderers return strings and the writer serializes them.
 //!
 //! Plain text is suppressed in `--json` mode so machine output stays
-//! parseable; errors always print (to stderr); help/version bypass the
-//! writer entirely and go straight to stdout.
+//! parseable; errors always print (to stderr); help/version print through
+//! [`OutputWriter::always`], which `--json` never suppresses (and the
+//! binary passes a plain writer for `--help`/`-h`).
 
 use std::io::Write;
 
@@ -40,11 +42,6 @@ impl OutputWriter {
             json,
             target: OutputTarget::Buffers(out, err),
         }
-    }
-
-    /// Whether `--json` was requested.
-    pub fn is_json(&self) -> bool {
-        self.json
     }
 
     /// Write a plain-text line to stdout (suppressed in `--json` mode).

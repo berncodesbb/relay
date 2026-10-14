@@ -1,21 +1,23 @@
 //! Legacy migration integration suite (phase 3, storage/migration owner).
 //!
 //! Builds legacy `.relay/state.db` fixtures programmatically (applying the
-//! legacy schema translated from `src/storage/migrations/001-initial.ts`
-//! and `002-projects.ts`) in temp workspaces and exercises the §10
-//! contract: read-only source, staged destination with fresh hashes,
-//! artifact byte copy with SHA-256 digests, replay comparison, SQLite
-//! build, atomic directory switch with a retained backup, and clean
-//! failures that leave the original `.relay/` in charge.
+//! legacy store's schema, reproduced self-contained in `LEGACY_SCHEMA`
+//! below) in temp workspaces and exercises the §10 contract: read-only
+//! source, staged destination with fresh hashes, artifact byte copy with
+//! SHA-256 digests, replay comparison, SQLite build, atomic directory
+//! switch with a retained backup, and clean failures that leave the
+//! original `.relay/` in charge.
 //!
-//! The canonical-JSONL import path is exercised against the deterministic
-//! fixture corpus under `tests/fixtures/cases/` (core engineer's exporter
-//! output follows the same format), plus an optional cross-check against
-//! `scripts/export-legacy-project.mjs` when Node/tsx are available.
+//! The canonical-JSONL import path is exercised against the fixture
+//! corpus under `tests/fixtures/cases/`: frozen historical evidence
+//! exported by the retired TypeScript exporter (removed 2026-10-14). The
+//! corpus follows the same canonical JSONL format specified in
+//! `docs/event-format.md`; parity between the direct legacy-SQLite
+//! importer and the canonical-JSONL import is proven Rust-natively by
+//! `direct_import_matches_canonical_jsonl_import` below.
 
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Arc;
 
 use relay_store::FixedClock;
@@ -34,8 +36,10 @@ const SESSION: &str = "ses_00000000-0000-4000-8000-0000000000e1";
 const CLOCK_MS: i64 = 1_791_878_400_000;
 const REPO_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
-/// The legacy events/projects schema, translated verbatim from
-/// `src/storage/migrations/001-initial.ts` and `002-projects.ts`.
+/// The legacy events/projects schema: the legacy TypeScript store's
+/// layout, reproduced here so fixture building is self-contained
+/// (historically derived from that store's initial and projects
+/// migrations, which are no longer in the repository).
 const LEGACY_SCHEMA: &str = r#"
 CREATE TABLE events (
   id TEXT PRIMARY KEY,
@@ -559,7 +563,7 @@ fn noncontiguous_legacy_sequences_abort() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Canonical JSONL import (exporter / fixture corpus)
+// Canonical JSONL import (frozen fixture corpus)
 // ---------------------------------------------------------------------------
 
 fn fixture_cases() -> Result<Vec<PathBuf>> {
@@ -672,85 +676,55 @@ fn envelope_level_invalid_fixture_cases_are_rejected() -> Result<()> {
 }
 
 #[test]
-fn exporter_output_cross_checks_the_direct_importer() -> Result<()> {
-    // Requires node + tsx (dev environment); skip silently when absent so
-    // the suite stays offline/deterministic by default.
-    let repo = Path::new(REPO_ROOT);
-    let tsx = repo.join("node_modules/.bin/tsx");
-    if !tsx.exists() || Command::new("node").arg("--version").output().is_err() {
-        return Ok(());
-    }
-    let legacy = legacy_workspace(&typical_events(), &[("v1-demo-prd.md", "# PRD body\n")])?;
-    let out = tempfile::tempdir()?;
-    let status = Command::new("node")
-        .arg(repo.join("scripts/export-legacy-project.mjs"))
-        .arg("--db")
-        .arg(legacy.path().join(".relay/state.db"))
-        .arg("--out")
-        .arg(out.path())
-        .current_dir(repo)
-        .output()?;
-    if !status.status.success() {
-        return Ok(()); // exporter environment not usable; skip
-    }
-    let exported: Vec<PathBuf> = std::fs::read_dir(out.path())?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
-        .collect();
-    assert_eq!(exported.len(), 1, "one project exported");
-    let jsonl = exported.first().ok_or("export file")?.clone();
-    // The export carries events only; provide artifact bytes beside it so
-    // the import can copy and digest them.
-    std::fs::create_dir_all(out.path().join("artifacts/prd"))?;
-    std::fs::copy(
-        legacy.path().join(".relay/artifacts/prd/v1-demo-prd.md"),
-        out.path().join("artifacts/prd/v1-demo-prd.md"),
-    )?;
-
-    // Import the exporter output.
-    let via_export = tempfile::tempdir()?;
-    let export_report = migrated(relay_store::import_jsonl_directory(
-        via_export.path(),
-        &jsonl,
-        &migration_options(),
-    )?)?;
-    // Import the same legacy database directly. The legacy workspace's
-    // .relay was not consumed by the exporter; copy the database into a
-    // fresh workspace for the direct import.
-    let direct_ws = tempfile::tempdir()?;
-    std::fs::create_dir_all(direct_ws.path().join(".relay"))?;
-    std::fs::copy(
-        legacy.path().join(".relay/state.db"),
-        direct_ws.path().join(".relay/state.db"),
-    )?;
-    std::fs::create_dir_all(direct_ws.path().join(".relay/artifacts/prd"))?;
-    std::fs::copy(
-        legacy.path().join(".relay/artifacts/prd/v1-demo-prd.md"),
-        direct_ws.path().join(".relay/artifacts/prd/v1-demo-prd.md"),
-    )?;
+fn direct_import_matches_canonical_jsonl_import() -> Result<()> {
+    // Workspace A: the direct read-only importer over the legacy SQLite
+    // database.
+    let direct_ws = legacy_workspace(&typical_events(), &[("v1-demo-prd.md", "# PRD body\n")])?;
     let direct_report = migrated(relay_store::migrate_legacy_state_db(
         direct_ws.path(),
         &migration_options(),
     )?)?;
+    assert_eq!(direct_report.events_migrated, 6);
 
-    assert_eq!(export_report.events_migrated, direct_report.events_migrated);
-    let (export_store, _) = RelayStore::open(via_export.path(), store_options())?;
+    // Workspace B: import A's migrated store — a canonical store directory
+    // whose `events/*.jsonl` segments follow `docs/event-format.md` —
+    // through the JSONL import path. Artifacts sit beside the segments in
+    // the store layout, so the import copies and digests them itself; no
+    // external tooling is involved.
+    let via_jsonl = tempfile::tempdir()?;
+    let jsonl_report = migrated(relay_store::import_jsonl_directory(
+        via_jsonl.path(),
+        &direct_ws.path().join(".relay"),
+        &migration_options(),
+    )?)?;
+    assert_eq!(
+        jsonl_report.events_migrated, direct_report.events_migrated,
+        "both import paths must carry every event"
+    );
+    assert_eq!(
+        jsonl_report.artifacts, direct_report.artifacts,
+        "both import paths must carry the same artifact bytes"
+    );
+
+    // The two stores are equivalent: identical envelopes in order and an
+    // identical tail (the guarantee the retired exporter cross-check
+    // covered, now proven Rust-natively).
     let (direct_store, _) = RelayStore::open(direct_ws.path(), store_options())?;
-    let export_events: Vec<_> = export_store
-        .read_all()?
-        .into_iter()
-        .map(|r| r.envelope)
-        .collect();
+    let (jsonl_store, _) = RelayStore::open(via_jsonl.path(), store_options())?;
     let direct_events: Vec<_> = direct_store
         .read_all()?
         .into_iter()
         .map(|r| r.envelope)
         .collect();
+    let jsonl_events: Vec<_> = jsonl_store
+        .read_all()?
+        .into_iter()
+        .map(|r| r.envelope)
+        .collect();
     assert_eq!(
-        export_events, direct_events,
-        "exporter and direct import diverged"
+        jsonl_events, direct_events,
+        "direct import and canonical JSONL import diverged"
     );
-    assert_eq!(export_store.tail()?, direct_store.tail()?);
+    assert_eq!(jsonl_store.tail()?, direct_store.tail()?);
     Ok(())
 }

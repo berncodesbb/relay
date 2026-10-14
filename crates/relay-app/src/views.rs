@@ -11,9 +11,9 @@
 //! interface crates: these types are the single shape both render.
 
 use relay_domain::{
-    ArtifactId, ArtifactVersionRef, AttemptConclusion, AttemptOutcome, CompletionRule, DecisionId,
-    DomainFact, Evidence, EvidenceKind, EvidenceOutcome, EvidenceTarget, GraphChangeProposal,
-    ProjectGraph, ProjectRevision, WorkItemId, WorkNode,
+    AttemptConclusion, AttemptOutcome, CompletionRule, DecisionId, DomainFact, Evidence,
+    EvidenceKind, EvidenceOutcome, EvidenceTarget, GraphChangeProposal, ProjectGraph,
+    ProjectRevision, WorkItemId, WorkNode,
 };
 use relay_engine::evaluate::Evaluation;
 use relay_engine::explain::explain_status;
@@ -294,19 +294,6 @@ pub struct DecisionListView {
     pub revision: u64,
 }
 
-/// One published artifact version (list form).
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct ArtifactVersionEntryView {
-    /// The artifact identity.
-    pub artifact: String,
-    /// The version number.
-    pub version: u32,
-    /// The version title, when present.
-    pub title: Option<String>,
-    /// The structured schema tag.
-    pub schema: Option<String>,
-}
-
 /// A full artifact version with content and rendered view.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ArtifactDetailView {
@@ -367,6 +354,20 @@ pub struct InitView {
     pub applied: Vec<String>,
     /// The recommendation after initialization.
     pub recommendation: RecommendationView,
+}
+
+/// What declaring a goal on an existing, goal-less project did (the
+/// conversational `declare-goal` path).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DeclareGoalView {
+    /// The goal.
+    pub goal: GoalView,
+    /// Work items the expansion round declared.
+    pub work: Vec<String>,
+    /// Decisions the expansion round opened.
+    pub decisions: Vec<String>,
+    /// The revision after the declaration.
+    pub revision: u64,
 }
 
 /// One applied expansion proposal.
@@ -743,6 +744,27 @@ pub fn fact_summary(fact: &DomainFact) -> String {
         DomainFact::InvalidationDeclared { target, .. } => {
             format!("invalidation declared: {target:?}")
         }
+        DomainFact::ConversationStarted { conversation, .. } => {
+            format!("conversation started: {conversation}")
+        }
+        DomainFact::UserMessageRecorded {
+            conversation,
+            turn,
+            message,
+            ..
+        } => format!("user message recorded: {message} ({conversation}/{turn})"),
+        DomainFact::AssistantMessageRecorded {
+            conversation,
+            turn,
+            message,
+            ..
+        } => format!("assistant message recorded: {message} ({conversation}/{turn})"),
+        DomainFact::ConversationTurnFailed {
+            conversation, turn, ..
+        } => format!("conversation turn failed: {turn} ({conversation})"),
+        DomainFact::ConversationTurnCancelled {
+            conversation, turn, ..
+        } => format!("conversation turn cancelled: {turn} ({conversation})"),
     }
 }
 
@@ -1253,25 +1275,6 @@ pub fn summary_view(
         counts: status_counts(evaluation),
         phases: phase_progress(graph, catalog),
         recommendation: recommendation_view(graph, evaluation, &policy, catalog),
-    }
-}
-
-/// One published version in list form.
-pub fn artifact_version_entry(
-    artifact: &ArtifactId,
-    reference: &ArtifactVersionRef,
-    graph: &ProjectGraph,
-) -> ArtifactVersionEntryView {
-    let record = graph
-        .version_record(reference)
-        .map(|record| (record.title.clone(), record.content.clone()));
-    ArtifactVersionEntryView {
-        artifact: artifact.to_string(),
-        version: reference.version.get(),
-        title: record.as_ref().and_then(|(title, _)| title.clone()),
-        schema: record.as_ref().and_then(|(_, content)| {
-            relay_workflows::schemas::content_schema(content).map(str::to_string)
-        }),
     }
 }
 

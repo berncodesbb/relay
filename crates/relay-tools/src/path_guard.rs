@@ -1,6 +1,7 @@
 //! Workspace path boundary enforcement.
 //!
-//! Ported from `src/tools/path-guard.ts`. Every tool resolves user/model
+//! Ported from `src/tools/path-guard.ts` (retired TypeScript tree, removed
+//! from the repository 2026-10-14). Every tool resolves user/model
 //! supplied paths through [`resolve_workspace_path`], which rejects traversal,
 //! absolute paths, and home shortcuts, then resolves symlinks on the root and
 //! on every existing ancestor of the target so a link inside the workspace

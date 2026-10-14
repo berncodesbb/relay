@@ -1,7 +1,8 @@
 //! Layered Relay configuration.
 //!
 //! Relay is configured in YAML with strict, actionable validation. This crate
-//! ports the TypeScript reference implementation (`src/config/**`): raw layered
+//! ports the retired TypeScript implementation (`src/config/**`, removed from
+//! the tree 2026-10-14): raw layered
 //! parsing (defaults < user < project < invocation), the named model-role
 //! catalog with role-reference or legacy inline routing values, effective
 //! (merged) configuration cross-reference validation, the runtime-facing

@@ -20,8 +20,8 @@ use crate::session::ProjectSession;
 use crate::session::SessionOptions;
 use crate::session::workspace_name;
 use crate::views::{
-    self, ArtifactDetailView, CancelView, DecisionListView, DoctorFindingView, DoctorView,
-    EvidenceListView, ExpandView, ExplainView, ImportPrdView, InitView, MigrateView,
+    self, ArtifactDetailView, CancelView, DecisionListView, DeclareGoalView, DoctorFindingView,
+    DoctorView, EvidenceListView, ExpandView, ExplainView, ImportPrdView, InitView, MigrateView,
     PublishArtifactViewView, RebuildView, ResolveDecisionView, SummaryView, WorkDetailView,
     WorkListView,
 };
@@ -108,6 +108,103 @@ pub fn init(
             &catalog(),
         ),
     })
+}
+
+/// Declare a goal on an existing, goal-less project — the conversational
+/// `declare-goal` path. Appends `GoalDeclared` plus the same first workflow
+/// expansion round `init` applies, seeded from the live graph. Rejected when
+/// the project is not initialized or a goal already exists (a project
+/// carries one goal). Creates neither the project nor the workspace.
+pub fn declare_goal(
+    session: &ProjectSession,
+    outcome: &str,
+    success_definition: Option<&str>,
+) -> Result<DeclareGoalView, AppError> {
+    session.require_initialized()?;
+    let outcome = outcome.trim();
+    if outcome.is_empty() {
+        return Err(AppError::Rejected(
+            "declaring a goal needs a non-empty outcome".to_string(),
+        ));
+    }
+    if let Some(existing) = session.graph().goal() {
+        return Err(AppError::Rejected(format!(
+            "the project already carries a goal ({}); a goal is declared once",
+            existing.id
+        )));
+    }
+    let name = workspace_name(session.workspace_root());
+    let now = session.now_ms();
+    let mut goal = Goal::new(
+        ids::goal_id_for(&name),
+        outcome,
+        Provenance {
+            source: ProvenanceSource::User,
+            statement: Some(outcome.to_string()),
+            at_ms: now,
+        },
+        now,
+    );
+    if let Some(definition) = success_definition
+        .map(str::trim)
+        .filter(|definition| !definition.is_empty())
+    {
+        goal.success_definition = definition.to_string();
+    }
+    let declared = DomainFact::GoalDeclared { goal };
+    // Seed the expansion candidate from the live graph plus the new goal:
+    // unlike `init`, the project facts already exist on disk.
+    let mut candidate = session.graph().clone();
+    candidate
+        .apply(&declared)
+        .map_err(|error| AppError::Rejected(error.to_string()))?;
+    let mut facts = vec![declared];
+    for proposal in propose_next(&candidate, &catalog()) {
+        if let Ok(applied) = relay_engine::validate_graph_change(&candidate, &proposal) {
+            for fact in applied.facts {
+                candidate
+                    .apply(&fact)
+                    .map_err(|error| AppError::Rejected(error.to_string()))?;
+                facts.push(fact);
+            }
+        }
+    }
+    let outcome = session.append_validated(facts.clone())?;
+    let graph = session.graph();
+    let goal_view = graph
+        .goal()
+        .map(|goal| views::GoalView {
+            id: goal.id.to_string(),
+            outcome: goal.outcome.clone(),
+            success_definition: goal.success_definition.clone(),
+        })
+        .ok_or_else(|| {
+            AppError::Rejected(
+                "the goal fact did not fold; the store refused the batch".to_string(),
+            )
+        })?;
+    let (work, decisions) = declared_targets(&facts);
+    Ok(DeclareGoalView {
+        goal: goal_view,
+        work,
+        decisions,
+        revision: outcome.revision.get(),
+    })
+}
+
+/// The work and decision ids a batch of facts declared (for view related-id
+/// listings).
+fn declared_targets(facts: &[DomainFact]) -> (Vec<String>, Vec<String>) {
+    let mut work = Vec::new();
+    let mut decisions = Vec::new();
+    for fact in facts {
+        match fact {
+            DomainFact::WorkDeclared { work: item } => work.push(item.id.to_string()),
+            DomainFact::DecisionOpened { decision } => decisions.push(decision.id.to_string()),
+            _ => {}
+        }
+    }
+    (work, decisions)
 }
 
 /// Append the next workflow expansion round: every proposal validated by

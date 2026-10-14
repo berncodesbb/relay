@@ -1,6 +1,7 @@
 //! Fold a provider event stream into a single model turn result.
 //!
-//! Ported from `src/providers/collect.ts`. The agent loop streams events for
+//! Ported from `src/providers/collect.ts` (retired TypeScript tree, removed
+//! from the repository 2026-10-14). The agent loop streams events for
 //! live rendering and then needs one aggregated value to decide what happened.
 //! [`collect_turn`] is that fold: it concatenates text deltas, gathers tool
 //! calls in arrival order, keeps the last reported usage, captures structured

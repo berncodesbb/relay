@@ -1,13 +1,14 @@
 //! Artifact drafts, deterministic Markdown rendering, versioned immutable
 //! artifact storage, and invalidation planning for Relay.
 //!
-//! This crate is the Rust port of the TypeScript artifact layer
-//! (`src/artifacts/*`), which remains the compatibility oracle: draft
+//! This crate is the Rust port of the retired TypeScript artifact layer
+//! (`src/artifacts/*`, removed from the tree 2026-10-14): draft
 //! schemas and their Zod-v4 issue text, rendered Markdown bytes, YAML
 //! frontmatter bytes, filename slugs, versioned no-overwrite storage
-//! semantics, and the downstream invalidation plan all mirror the TypeScript
-//! implementation exactly. Byte-level parity is pinned by the golden
-//! fixtures under `tests/fixtures/cases/e2e-demo-run/artifacts`.
+//! semantics, and the downstream invalidation plan all mirror that retired
+//! implementation exactly. The compatibility oracle is the frozen golden
+//! fixtures under `tests/fixtures/cases/e2e-demo-run/artifacts`, which pin
+//! byte-level parity.
 //!
 //! Module map:
 //!
@@ -36,7 +37,7 @@ pub use drafts::{
     Evidence, ExecutionPlanDraft, Interface, Migration, OpportunityBriefDraft,
     ParseArtifactDraftResult, PlanTask, PrdDraft, RepositoryFinding, Requirement, Risk, TargetUser,
     TraceEntry, TrdDraft, VerificationReportDraft, VerificationResult, VerificationStatus,
-    format_zod_issues, parse_artifact_draft, parse_artifact_draft_by_name, require_artifact_draft,
+    format_zod_issues, parse_artifact_draft, require_artifact_draft,
 };
 pub use error::{
     ArtifactPathOutsideStoreError, ArtifactVersionExistsError, ArtifactsError,

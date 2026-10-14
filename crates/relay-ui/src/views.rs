@@ -1,5 +1,6 @@
 //! Read-only status and explanation views over project state and the event
-//! log. Ported byte-for-byte from `src/runtime/controller-views.ts`: the
+//! log. Ported byte-for-byte from `src/runtime/controller-views.ts` (retired
+//! TypeScript tree, removed from the repository 2026-10-14): the
 //! serde field order of every view struct is the TypeScript key order, so
 //! JSON output matches `JSON.stringify(view, null, 2)` exactly, and the
 //! canonical fixture goldens (`tests/fixtures/cases/*/expected-status.json`

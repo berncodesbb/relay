@@ -16,6 +16,10 @@
 //!   graph fact store (lock per append, never across executor work).
 //! - [`commands`]: the command handlers (init, expand, resolve, cancel,
 //!   import, publish, doctor, queries).
+//! - [`conversation`]: the conversational turn service — typed proposals,
+//!   bounded context, provider streaming, proposal application.
+//! - [`conversation_views`]: stable chat transcript views over the durable
+//!   conversation facts.
 //! - [`runner`]: orchestrator composition for `run` (which executors, which
 //!   model client, how jobs spawn).
 //! - [`providers`]: provider-name resolution for runs (preview wiring).
@@ -27,6 +31,8 @@
 //! - [`jobs`]: deterministic system jobs.
 
 pub mod commands;
+pub mod conversation;
+pub mod conversation_views;
 pub mod error;
 pub mod ids;
 pub mod jobs;

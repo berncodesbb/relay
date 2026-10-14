@@ -1,6 +1,7 @@
 //! Internal bounded subprocess execution shared by the process and git tools.
 //!
-//! Ported from `src/tools/spawn.ts`. Always spawns with an argument array
+//! Ported from `src/tools/spawn.ts` (retired TypeScript tree, removed from
+//! the repository 2026-10-14). Always spawns with an argument array
 //! (never a shell string), detaches the child into its own supervised tree so
 //! the whole tree can be terminated on timeout or cancellation, bounds
 //! collected stdout/stderr memory, and restricts inherited environment

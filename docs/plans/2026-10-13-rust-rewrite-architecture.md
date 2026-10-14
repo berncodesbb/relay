@@ -1,5 +1,11 @@
 # Relay Rust rewrite: target architecture and migration plan
 
+> **Historical (2026-10-14):** this plan describes the stopped one-for-one
+> compatibility port. It was superseded by the intent-first work-graph plan
+> (`2026-10-13-intent-first-rust-work-graph.md`), and the TypeScript
+> application it ports was removed from the repository. Retained as design
+> history; not current instructions.
+
 Status: accepted direction; implementation not started  
 Date: 2026-10-13  
 Scope: complete replacement of the TypeScript application with a Rust application while preserving Relay's product behavior and local-first guarantees

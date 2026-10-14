@@ -21,7 +21,8 @@
 //! `relay-core`) was retired with this restructuring: the work-graph
 //! application service in `relay-app` replaces it, and nothing in this
 //! crate touches `relay-core` anymore. The file is kept on disk at
-//! `src/ops.rs` as **inert reference material** — it is not declared as a
+//! `src/ops.rs` (this crate's own source directory) as **inert reference
+//! material** — it is not declared as a
 //! module, so it is neither compiled, formatted, nor linted; restore it
 //! with `pub mod ops;` (and the `relay-core`/`relay-store`/`serde_yaml`
 //! dependencies) only for archaeology.
@@ -29,10 +30,12 @@
 pub mod args;
 pub mod dispatch;
 pub mod errors;
+pub mod invocation;
 pub mod output;
 pub mod render;
 pub mod tui;
 
 pub use dispatch::{
-    CliDeps, EXIT_FAILURE, EXIT_OK, EXIT_USAGE, RuntimeSelection, run_main, run_with,
+    CliDeps, EXIT_FAILURE, EXIT_OK, EXIT_USAGE, RuntimeSelection, run_with, run_with_capability,
 };
+pub use invocation::{TerminalCapability, detect_terminal_capability, run};

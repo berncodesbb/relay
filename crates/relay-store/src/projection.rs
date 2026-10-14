@@ -24,7 +24,6 @@ use crate::error::Result;
 use crate::error::StoreError;
 use crate::fault::FaultInjector;
 use crate::fault::FaultPoint;
-use crate::fault::NoFaults;
 use crate::log::EventRecord;
 use crate::log::TailState;
 
@@ -658,22 +657,6 @@ impl SqliteProjection {
         }
         Ok(out)
     }
-
-    /// Count of `model_calls` rows.
-    pub fn model_calls_count(&self) -> Result<u64> {
-        let conn = self.connection()?;
-        let count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM model_calls;", [], |row| row.get(0))?;
-        Ok(count as u64)
-    }
-
-    /// Count of `tool_calls` rows.
-    pub fn tool_calls_count(&self) -> Result<u64> {
-        let conn = self.connection()?;
-        let count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM tool_calls;", [], |row| row.get(0))?;
-        Ok(count as u64)
-    }
 }
 
 /// Quarantine `index.sqlite` (+ WAL sidecars) into `recovery/`; returns the
@@ -1004,20 +987,6 @@ fn fold_event(tx: &rusqlite::Transaction<'_>, envelope: &EventEnvelope) -> Resul
         )?;
     }
     Ok(())
-}
-
-/// Convenience wrapper: quarantine the projection at `path` and rebuild it
-/// from the given records in one shot.
-pub fn rebuild_from_records(
-    path: &Path,
-    recovery_dir: &Path,
-    records: &[EventRecord],
-    clock: &dyn Clock,
-) -> Result<(SqliteProjection, Option<PathBuf>)> {
-    let mut projection = SqliteProjection::open(path, recovery_dir, clock)?;
-    let quarantine = projection.quarantine_and_recreate(clock)?;
-    projection.replay_all(records, clock, &NoFaults)?;
-    Ok((projection, quarantine))
 }
 
 #[cfg(test)]

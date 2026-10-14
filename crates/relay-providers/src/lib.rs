@@ -1,7 +1,8 @@
 //! Provider-neutral model contracts and adapters for Relay.
 //!
 //! This crate is the only contract between the runtime and model providers,
-//! ported from the TypeScript reference implementation in `src/providers/**`.
+//! ported from the retired TypeScript implementation in `src/providers/**`
+//! (removed from the tree 2026-10-14).
 //! It contains no provider SDK types: the neutral contract in [`contract`]
 //! describes requests, stream events, usage, finish reasons, and normalized
 //! failures, and the adapters ([`fake`], [`openai`], [`anthropic`]) translate
