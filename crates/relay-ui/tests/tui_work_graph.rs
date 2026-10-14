@@ -95,6 +95,7 @@ impl ModelClient for EchoModel {
             text: format!("echo: {}", request.prompt),
             input_tokens: 1,
             output_tokens: 1,
+            routes_attempted: Vec::new(),
         })
     }
 }

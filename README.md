@@ -35,7 +35,7 @@ The goal-first path still exists alongside the chat:
 ```bash
 relay init --goal "Cut onboarding drop-off by walking new users through one saved filter"
 relay project summary      # goal, phase-grouped progress, recommendation
-relay run                  # run ready work (offline by default: the fake provider)
+relay run                  # run ready work (offline by default: the fake connection)
 ```
 
 - `relay run` executes ready work within its autonomy level and stops at human decisions; it never auto-resolves them. Levels: `manual`, `safe` (default), `until-decision`, `bounded:<n>`.
@@ -70,17 +70,35 @@ Relay reads credentials from the environment and never writes them to project st
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...   # https://console.anthropic.com/settings/keys
 export OPENAI_API_KEY=sk-...          # https://platform.openai.com/api-keys
+# Connections you define name their own variables, e.g. for the glm example below:
+# export GLM_API_KEY=...
 ```
 
-Routing is deterministic configuration, never model output. Each routing purpose maps to a named model role, and each role maps to a provider (`anthropic`, `openai`, `fake`) and a model. Roles are user-defined — define your own in `relay.config.yaml`. See [docs/configuration.md](docs/configuration.md) for the full annotated configuration and examples.
+Routing is deterministic configuration, never model output: each model call resolves **purpose → model role → provider connection → adapter → model**. Purposes are the workflow phases (discovery … delivery) plus `intent` for conversational turns; roles are user-defined; connections are yours to name in `relay.config.yaml` and are backed by adapter kinds — `openai-chat` (any OpenAI-compatible Chat Completions endpoint), `anthropic`, or `fake` — so several connections can share one adapter:
 
-The offline fake provider is the default, so a fresh checkout runs end to end with no keys and no network:
+```yaml
+providers:
+  openai: { adapter: openai-chat, apiKeyEnv: OPENAI_API_KEY }
+  glm:
+    adapter: openai-chat
+    baseUrl: https://api.z.ai/api/paas/v4
+    apiKeyEnv: GLM_API_KEY
+    preset: glm
+models:
+  coding: { provider: glm, model: glm-4.6 }
+```
+
+See [docs/configuration.md](docs/configuration.md) for the full annotated configuration, capability presets, fallback and override semantics, and examples.
+
+The built-in defaults route everything to the offline fake provider, so a fresh checkout runs end to end with no keys, no configuration, and no network:
 
 ```bash
 relay init --goal "demo"
-relay run                       # fake provider: deterministic, offline
-relay run --provider anthropic  # opt in to a live provider
+relay run                       # built-in default: the offline fake connection
+relay run --provider glm        # force every route onto a connection you configured
 ```
+
+`--provider` keeps models as routed, so point it at a connection your roles use for live work. Configuration mistakes fail loudly and early: invalid files, unknown connection names, and missing credentials are usage errors (exit 2) raised before any project state is created, and the messages name the environment *variable* to set — never a value.
 
 ## Project files
 
@@ -118,7 +136,7 @@ Inside the chat:
 - Slash commands: `/status`, `/work`, `/decisions`, `/inspect <id>`, `/help`, `/quit` open the existing work-graph views as overlays.
 - While a turn runs, the interface stays live: assistant text streams (bounded, redacted) and compact activity lines show what Relay is doing. Submission is disabled while busy — input is never silently dropped.
 
-The model can answer, propose a goal, propose typed work or decision actions, run bounded ready work, or ask for clarification — but model text never mutates state by itself. Every proposal is decoded, validated, and applied individually through the existing deterministic application services; rejected proposals are reported in the transcript with a safe explanation, never coerced. Secrets are redacted before any text becomes durable or visible.
+Chat turns run on your configuration's `intent` route (the offline fake connection by default). The model can answer, propose a goal, propose typed work or decision actions, run bounded ready work, or ask for clarification — but model text never mutates state by itself. Every proposal is decoded, validated, and applied individually through the existing deterministic application services; rejected proposals are reported in the transcript with a safe explanation, never coerced. Secrets are redacted before any text becomes durable or visible.
 
 ## The work graph
 
@@ -167,7 +185,7 @@ relay expand                                  Apply the workflow's next proposed
 relay import-prd <file>                       Import an edited PRD view as a revision
 relay doctor check|rebuild-projection         Verify / rebuild the local fact store
 relay migrate --workspace <legacy-copy>       Migrate a legacy project copy (--dry-run to plan)
-relay config show|path|get <key>              Inspect effective configuration
+relay config show|path|get <key>              Inspect effective configuration (roles, connections, routing)
 relay tui                                     Compatibility alias for the chat interface
 
 Options:
@@ -175,7 +193,8 @@ Options:
   --print <prompt>      One scripted conversational turn; prints the reply and exits
   --json                Machine-readable output where supported
   --autonomy <level>    manual | safe | until-decision | bounded:<n>  (default: safe)
-  --provider <name>     fake | openai | anthropic  (default: fake, offline)
+  --provider <name>     A configured provider connection name (defaults provide
+                        fake, openai, anthropic; default: fake, offline)
   --max-ticks <n>       Scheduling waves per `run` (default: 1)
   -h, --help            Show this help
   -V, --version         Show the version
@@ -228,6 +247,7 @@ Deliberately out of scope for this release:
 - No hosted sync, accounts, collaboration, telemetry, or web interface.
 - No deployment execution, automatic publishing, automatic PR creation, or unattended release actions.
 - Static model routing only — no dynamic benchmarking or cost-optimized routing.
+- `openai-chat` targets Chat Completions compatibility only — no OpenAI Responses API support, and no per-vendor native adapters beyond Anthropic.
 
 ## License
 

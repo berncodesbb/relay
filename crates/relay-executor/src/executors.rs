@@ -457,6 +457,7 @@ impl Executor for ModelExecutor {
                 system: Some(Self::system_prompt()),
                 prompt,
                 max_output_tokens: spec.grant.budget.max_output_tokens,
+                temperature: None,
             };
             let response = match context.model.complete(&route, &request, &context.signal) {
                 Ok(response) => response,
@@ -785,6 +786,7 @@ mod tests {
                 text: self.text.clone(),
                 input_tokens: 3,
                 output_tokens: 5,
+                routes_attempted: Vec::new(),
             })
         }
     }
@@ -806,6 +808,7 @@ mod tests {
             Ok(ModelTurnResponse {
                 input_tokens: 3,
                 output_tokens: 5,
+                routes_attempted: Vec::new(),
                 text: if request.prompt.contains("rejected") {
                     self.second.clone()
                 } else {

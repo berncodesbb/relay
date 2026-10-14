@@ -1443,3 +1443,59 @@ fn conversation_facts_round_trip_rebuild_and_fail_closed() -> Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Routing facts (interface owner, Phase 4/5): the attempt-grant route's
+// provider is a provider *connection name* — an open, user-chosen string —
+// and the authoritative fact/replay contract is unchanged by routing.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn attempt_grant_routes_carry_connection_names_and_replay_unchanged() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let workspace = dir.path();
+    let project = domain_project()?;
+    let store =
+        relay_store::GraphFactStore::create(workspace, &project, Integrity::Checksums, options())?;
+    let work = WorkItem::new(
+        parse_id("work_route")?,
+        WorkKind::parse("implement-task")?,
+        ExecutorClass::Model,
+        "carry a connection-name route",
+        CompletionRule::Receipt,
+    );
+    // A user-configured connection name ("glm") with a role attached: the
+    // exact shape the application's purpose-resolved grants produce.
+    let route = relay_domain::ModelRoute {
+        provider: "glm".to_string(),
+        model: "glm-4.6".to_string(),
+        role: Some("coding".to_string()),
+    };
+    let mut grant = CapabilityGrant::read_only(parse_id("grant_route")?, vec![ScopePath::root()]);
+    grant.model_route = Some(route.clone());
+    store.append(&[
+        DomainFact::ProjectCreated {
+            project: project.clone(),
+        },
+        DomainFact::WorkDeclared { work },
+        DomainFact::AttemptStarted {
+            attempt: parse_id("att_route")?,
+            work: parse_id("work_route")?,
+            expected_revision: ProjectRevision::from_count(2),
+            grant,
+            started_at_ms: CLOCK_MS,
+        },
+    ])?;
+    drop(store);
+
+    // The folded graph carries the route verbatim: connection name, model,
+    // role — nothing rewrote it into an adapter kind.
+    let (reopened, _) = relay_store::GraphFactStore::open(workspace, options())?;
+    let graph = reopened.project_graph()?;
+    let attempt = graph
+        .attempt(&parse_id::<AttemptId>("att_route")?)
+        .ok_or("attempt folded")?;
+    assert_eq!(attempt.grant.model_route.as_ref(), Some(&route));
+    assert_eq!(route.provider, "glm");
+    Ok(())
+}

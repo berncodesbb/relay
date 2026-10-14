@@ -1,10 +1,16 @@
 //! Configuration schema: strict, actionable validation of one layer.
 //!
-//! Relay configuration is YAML, validated strictly: unknown providers, models,
-//! routing keys, or out-of-range values are rejected with actionable messages
-//! shaped like the TypeScript reference's Zod diagnostics (`path: message`).
-//! Configuration never contains credentials — only the names of environment
-//! variables that hold them.
+//! Relay configuration is YAML, validated strictly: unknown routing keys,
+//! malformed values, or out-of-range numbers are rejected with actionable
+//! messages shaped like the TypeScript reference's Zod diagnostics
+//! (`path: message`). Configuration never contains credentials — only the
+//! *names* of environment variables that hold them.
+//!
+//! Provider connections are named (`providers.<name>`) and bind a
+//! user-chosen connection identity to one shipped adapter kind
+//! ([`AdapterKind`]); several connections may share one adapter. The legacy
+//! keys `openai`, `anthropic`, and `fake` keep their version-1 spellings and
+//! infer their adapter when it is omitted.
 //!
 //! Routing entries may reference a named model role from the `models` catalog
 //! (a role-name string such as `reasoning`) or use the legacy inline form (a
@@ -19,12 +25,13 @@ use indexmap::IndexMap;
 use serde::Serialize;
 use std::fmt;
 
-/// Provider names accepted in configuration (`PROVIDER_NAMES` in the
-/// TypeScript reference).
-pub const PROVIDER_NAMES: [&str; 3] = ["openai", "anthropic", "fake"];
+use relay_providers::contract::{
+    ADAPTER_KINDS, FeatureSupport, InstructionStyle, OutputTokenParam, StructuredOutputMode,
+};
+pub use relay_providers::contract::{AdapterKind, CapabilityOverrides};
 
 /// The configuration schema version (still 1 for the backward-compatible
-/// role-catalog additions).
+/// named-connection additions).
 pub const CONFIG_SCHEMA_VERSION: i64 = 1;
 
 /// The canonical role-name rule: lowercase kebab-case, 1-64 characters.
@@ -33,6 +40,21 @@ pub const ROLE_NAME_PATTERN: &str = "^[a-z][a-z0-9-]{0,63}$";
 /// Diagnostic shown for role names that violate [`ROLE_NAME_PATTERN`].
 pub const ROLE_NAME_MESSAGE: &str =
     "role names are lowercase kebab-case, 1-64 characters, e.g. reasoning, ux-writing";
+
+/// Diagnostic shown for `providers` keys that violate the shared lowercase
+/// kebab-case rule (the same bound as [`ROLE_NAME_PATTERN`]).
+pub const CONNECTION_NAME_MESSAGE: &str = "provider connection names are lowercase kebab-case, 1-64 characters, e.g. openai, glm, local-gateway";
+
+/// Diagnostic shown for `provider` fields that are not a syntactically valid
+/// connection name. Whether a syntactically valid name references a defined
+/// connection is checked once layers merge (see
+/// [`crate::validate_effective_config`]), not per layer.
+pub const PROVIDER_REFERENCE_MESSAGE: &str =
+    "provider must be a provider connection name (lowercase kebab-case, e.g. openai, glm)";
+
+/// Diagnostic shown when `apiKeyEnv` is not an environment-variable name.
+/// The field holds the *name* of a variable, never a credential value.
+pub const API_KEY_ENV_MESSAGE: &str = "apiKeyEnv must name an environment variable (letters, digits, underscores; e.g. GLM_API_KEY), never hold a credential value";
 
 /// Diagnostic shown for routing values that are neither a role name nor a
 /// legacy inline route object.
@@ -67,6 +89,7 @@ pub const ALLOWED_ROUTING_KEYS: [&str; 8] = [
 
 /// Evaluates the canonical [`ROLE_NAME_PATTERN`] rule for a candidate role
 /// name (lowercase kebab-case, 1-64 characters, first character a letter).
+/// Connection names share this rule.
 pub fn is_valid_role_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
@@ -82,42 +105,76 @@ pub fn is_valid_role_name(name: &str) -> bool {
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// A configured provider connection: infrastructure, not responsibility.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ProviderName {
-    /// The OpenAI adapter.
-    OpenAi,
-    /// The Anthropic adapter.
-    Anthropic,
-    /// The deterministic offline fake adapter.
-    Fake,
+/// Serializes an adapter kind in its wire spelling (`openai-chat`,
+/// `anthropic`, `fake`) — the form accepted in YAML — rather than serde's
+/// default variant names, so inspection output matches configuration input.
+fn serialize_adapter_kind<S>(kind: &AdapterKind, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(kind.as_str())
 }
 
-impl ProviderName {
-    /// The configuration spelling of this provider.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ProviderName::OpenAi => "openai",
-            ProviderName::Anthropic => "anthropic",
-            ProviderName::Fake => "fake",
-        }
-    }
-
-    /// Parses a configured provider name.
-    pub fn parse(value: &str) -> Option<ProviderName> {
-        match value {
-            "openai" => Some(ProviderName::OpenAi),
-            "anthropic" => Some(ProviderName::Anthropic),
-            "fake" => Some(ProviderName::Fake),
-            _ => None,
-        }
-    }
+/// One configured provider connection: a user-chosen name bound to a
+/// protocol adapter plus optional endpoint, credential-variable name,
+/// capability preset, and per-field capability overrides. Connections are
+/// infrastructure, not responsibility — which connection a role uses is
+/// configured in `models`/`routing`, never here.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderConnection {
+    /// The wire-protocol adapter this connection speaks.
+    #[serde(serialize_with = "serialize_adapter_kind")]
+    pub adapter: AdapterKind,
+    /// Name of the environment variable that holds the API key; the key
+    /// itself never lives in configuration. `None` for credential-less
+    /// connections (the fake adapter).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    /// Optional proxy or self-hosted gateway endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Optional named capability preset. Its existence and adapter
+    /// compatibility are validated on the effective configuration (see
+    /// [`relay_providers::contract::resolve_capabilities`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    /// Explicit per-field capability overrides; the highest-precedence
+    /// capability source.
+    #[serde(skip_serializing_if = "CapabilityOverrides::is_empty")]
+    pub capabilities: CapabilityOverrides,
 }
 
-impl fmt::Display for ProviderName {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
+/// The `providers` section: named connections in configuration (insertion)
+/// order. Connection names share the bounded lowercase kebab-case rule with
+/// role names ([`is_valid_role_name`]).
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct Providers(
+    /// The named connections, keyed by connection name.
+    pub IndexMap<String, ProviderConnection>,
+);
+
+impl Providers {
+    /// Looks up one connection by name.
+    pub fn get(&self, name: &str) -> Option<&ProviderConnection> {
+        self.0.get(name)
+    }
+
+    /// Whether a connection with this name is defined.
+    pub fn contains(&self, name: &str) -> bool {
+        self.0.contains_key(name)
+    }
+
+    /// The defined connection names, in configuration order.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.0.keys().map(String::as_str)
+    }
+
+    /// Iterates `(name, connection)` pairs in configuration order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &ProviderConnection)> {
+        self.0
+            .iter()
+            .map(|(name, connection)| (name.as_str(), connection))
     }
 }
 
@@ -137,8 +194,8 @@ pub struct RouteLimits {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InlineFallback {
-    /// The fallback's provider.
-    pub provider: ProviderName,
+    /// The fallback's provider connection name.
+    pub provider: String,
     /// The fallback's model identifier.
     pub model: String,
 }
@@ -147,8 +204,8 @@ pub struct InlineFallback {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RouteConfig {
-    /// The route's provider.
-    pub provider: ProviderName,
+    /// The route's provider connection name.
+    pub provider: String,
     /// The route's model identifier.
     pub model: String,
     /// Inline fallback routes (at most three).
@@ -163,8 +220,8 @@ pub struct RouteConfig {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelRoleConfig {
-    /// The role's provider.
-    pub provider: ProviderName,
+    /// The role's provider connection name.
+    pub provider: String,
     /// The role's model identifier.
     pub model: String,
     /// Role-name references, resolved against the catalog after layers merge
@@ -198,28 +255,6 @@ impl Serialize for RoutingValue {
             RoutingValue::Inline(route) => route.serialize(serializer),
         }
     }
-}
-
-/// Provider connection settings. `api_key_env` names an environment variable;
-/// the key itself never lives in configuration.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProviderSettings {
-    /// Name of the environment variable that holds the API key.
-    pub api_key_env: String,
-    /// Optional proxy or self-hosted gateway endpoint.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub base_url: Option<String>,
-}
-
-/// The `providers` section: both vendor adapters, always present after
-/// parsing (defaults fill omitted entries).
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct Providers {
-    /// OpenAI connection settings.
-    pub openai: ProviderSettings,
-    /// Anthropic connection settings.
-    pub anthropic: ProviderSettings,
 }
 
 /// Budget limits for one run; every field has a default, so `budgets: {}` is
@@ -286,7 +321,7 @@ impl Default for ToolSettings {
 pub struct RelayConfig {
     /// Schema version (always 1 today).
     pub version: i64,
-    /// Provider connection settings.
+    /// Named provider connections, in configuration order.
     pub providers: Providers,
     /// Named model-role catalog; absent (`None`) in legacy inline-only
     /// configurations.
@@ -341,7 +376,8 @@ impl std::error::Error for ConfigValidationError {}
 /// One schema issue before formatting. `hard` marks the issue classes that
 /// make a Zod union option "aborted"; inside a routing value any hard issue
 /// collapses into the generic union diagnostic, while soft issues (string
-/// minimum length, number range) surface with their own paths.
+/// minimum length, number range, name-syntax violations) surface with their
+/// own paths.
 #[derive(Clone, Debug)]
 struct Issue {
     path: String,
@@ -372,18 +408,58 @@ fn invalid_input(expected: &str, received: &str) -> String {
     format!("Invalid input: expected {expected}, received {received}")
 }
 
-/// The provider section as filled in when the whole section is absent.
-fn default_providers() -> Providers {
-    Providers {
-        openai: ProviderSettings {
-            api_key_env: "OPENAI_API_KEY".to_string(),
-            base_url: None,
-        },
-        anthropic: ProviderSettings {
-            api_key_env: "ANTHROPIC_API_KEY".to_string(),
-            base_url: None,
-        },
+/// The legacy live connection keys that keep the version-1 defaulting
+/// quirks: they may omit `adapter`, and a present-but-incomplete object
+/// defaults `apiKeyEnv` to the field-level OPENAI_API_KEY.
+const LEGACY_LIVE_CONNECTION_NAMES: [&str; 2] = ["openai", "anthropic"];
+
+/// The adapter inferred for a legacy connection name when `adapter` is
+/// omitted; `None` for every other name.
+fn inferred_adapter(name: &str) -> Option<AdapterKind> {
+    match name {
+        "openai" => Some(AdapterKind::OpenaiChat),
+        "anthropic" => Some(AdapterKind::Anthropic),
+        "fake" => Some(AdapterKind::Fake),
+        _ => None,
     }
+}
+
+/// The env-var name used when a legacy key is absent from a present
+/// `providers` section (the object-level default of the version-1 schema).
+fn absent_default_env(name: &str) -> Option<&'static str> {
+    match name {
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        _ => Some("OPENAI_API_KEY"),
+    }
+}
+
+/// The env-var name a connection's adapter defaults to when `apiKeyEnv` is
+/// omitted on a non-legacy connection (`None`: the fake adapter needs no
+/// credential).
+fn adapter_default_env(adapter: AdapterKind) -> Option<&'static str> {
+    match adapter {
+        AdapterKind::OpenaiChat => Some("OPENAI_API_KEY"),
+        AdapterKind::Anthropic => Some("ANTHROPIC_API_KEY"),
+        AdapterKind::Fake => None,
+    }
+}
+
+/// Evaluates `^[A-Za-z_][A-Za-z0-9_]{0,127}$` for an environment-variable
+/// name. Anything else — including credential-looking values — is rejected
+/// by [`API_KEY_ENV_MESSAGE`].
+fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    let rest: usize = chars.count();
+    if rest > 127 {
+        return false;
+    }
+    name.chars()
+        .skip(1)
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn too_small_number(bound: i64) -> String {
@@ -398,21 +474,30 @@ fn string_too_small() -> String {
     "Too small: expected string to have >=1 characters".to_string()
 }
 
-fn enum_option() -> String {
-    "Invalid option: expected one of \"openai\"|\"anthropic\"|\"fake\"".to_string()
+/// The quoted adapter spellings joined the way the enum diagnostics print
+/// them.
+fn adapter_spellings() -> String {
+    ADAPTER_KINDS
+        .iter()
+        .map(|kind| format!("\"{}\"", kind.as_str()))
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
-/// Parses a provider enum. Any input that is not one of the three names —
-/// including the wrong type or a missing key — yields the enum diagnostic.
-fn parse_provider(value: Option<&RawValue>) -> Result<ProviderName, Issue> {
-    let name = match value {
-        Some(RawValue::String(name)) => name,
-        _ => return Err(Issue::new("", enum_option(), true)),
-    };
-    match ProviderName::parse(name) {
-        Some(provider) => Ok(provider),
-        None => Err(Issue::new("", enum_option(), true)),
-    }
+/// The diagnostic for an `adapter` value that is not a shipped kind.
+fn adapter_option() -> String {
+    format!("Invalid option: expected one of {}", adapter_spellings())
+}
+
+/// The diagnostic for a capability field value that is not one of its
+/// allowed wire spellings.
+fn invalid_option(allowed: &[&str]) -> String {
+    let joined = allowed
+        .iter()
+        .map(|spelling| format!("\"{spelling}\""))
+        .collect::<Vec<_>>()
+        .join("|");
+    format!("Invalid option: expected one of {joined}")
 }
 
 /// Parses a non-empty string. A too-short string is a soft issue; a non-string
@@ -426,6 +511,31 @@ fn parse_nonempty_string(value: &RawValue) -> Result<String, Issue> {
             invalid_input("string", other.type_name()),
             true,
         )),
+    }
+}
+
+/// Parses a provider connection-name reference (in `models`, inline routes,
+/// and inline fallbacks). Layer parsing validates only the name syntax;
+/// whether the named connection exists is checked once layers merge (see
+/// [`crate::validate_effective_config`]). A missing key or non-string is a
+/// hard issue; an invalid name keeps its own message (soft, like role-name
+/// violations).
+fn parse_provider_reference(value: Option<&RawValue>) -> Result<String, Issue> {
+    let name = match value {
+        Some(RawValue::String(name)) => name,
+        Some(other) => {
+            return Err(Issue::new(
+                "",
+                invalid_input("string", other.type_name()),
+                true,
+            ));
+        }
+        None => return Err(Issue::new("", invalid_input("string", "undefined"), true)),
+    };
+    if is_valid_role_name(name) {
+        Ok(name.clone())
+    } else {
+        Err(Issue::new("", PROVIDER_REFERENCE_MESSAGE, false))
     }
 }
 
@@ -564,35 +674,187 @@ fn is_valid_url(value: &str) -> bool {
     }
 }
 
-fn parse_provider_settings(
-    value: Option<&RawValue>,
-    path: &str,
-    absent_default_env: &str,
-    issues: &mut Vec<Issue>,
-) -> ProviderSettings {
-    let Some(mapping) = value.and_then(RawValue::as_mapping) else {
-        if let Some(other) = value {
+/// The provider section as filled in when the whole section is absent: the
+/// two legacy live connections with their version-1 defaults.
+fn default_providers() -> Providers {
+    legacy_live_providers()
+}
+
+/// Both legacy live connections with their object-level defaults (used when
+/// the section is absent and when a present section omits a legacy key).
+fn legacy_live_providers() -> Providers {
+    let mut connections = IndexMap::new();
+    for name in LEGACY_LIVE_CONNECTION_NAMES {
+        let adapter = inferred_adapter(name).unwrap_or(AdapterKind::OpenaiChat);
+        connections.insert(
+            name.to_string(),
+            ProviderConnection {
+                adapter,
+                api_key_env: absent_default_env(name).map(str::to_string),
+                base_url: None,
+                preset: None,
+                capabilities: CapabilityOverrides::default(),
+            },
+        );
+    }
+    Providers(connections)
+}
+
+/// Parses the `providers` section as an order-preserving record of named
+/// connections. Malformed connection names, unknown adapter spellings, and
+/// non-name `apiKeyEnv` values fail here with `providers.<name>...` paths.
+/// The legacy live keys are re-added with their object-level defaults when
+/// absent, preserving the version-1 shape of an always-complete section.
+fn parse_providers_section(raw: &RawValue, issues: &mut Vec<Issue>) -> Providers {
+    let Some(mapping) = raw.as_mapping() else {
+        issues.push(Issue::new(
+            "providers",
+            invalid_input("object", raw.type_name()),
+            true,
+        ));
+        return default_providers();
+    };
+    let mut connections: IndexMap<String, ProviderConnection> = IndexMap::new();
+    for (name, value) in mapping {
+        let connection =
+            parse_provider_connection(name, value, &format!("providers.{name}"), issues);
+        connections.insert(name.clone(), connection);
+    }
+    // Key diagnostics follow value diagnostics, matching the models catalog.
+    for name in mapping.keys() {
+        if !is_valid_role_name(name) {
             issues.push(Issue::new(
-                path,
-                invalid_input("object", other.type_name()),
-                true,
+                format!("providers.{name}"),
+                CONNECTION_NAME_MESSAGE,
+                false,
             ));
         }
-        return ProviderSettings {
-            api_key_env: absent_default_env.to_string(),
+    }
+    // Version-1 quirk: an absent legacy live key keeps its object-level
+    // default so the parsed section stays complete.
+    for name in LEGACY_LIVE_CONNECTION_NAMES {
+        if connections.contains_key(name) {
+            continue;
+        }
+        let adapter = inferred_adapter(name).unwrap_or(AdapterKind::OpenaiChat);
+        connections.insert(
+            name.to_string(),
+            ProviderConnection {
+                adapter,
+                api_key_env: absent_default_env(name).map(str::to_string),
+                base_url: None,
+                preset: None,
+                capabilities: CapabilityOverrides::default(),
+            },
+        );
+    }
+    Providers(connections)
+}
+
+/// Parses the `adapter` field: required for new connection names, inferred
+/// for the legacy `openai`, `anthropic`, and `fake` keys when omitted.
+fn parse_adapter_field(
+    name: &str,
+    mapping: &RawMapping,
+    path: &str,
+    issues: &mut Vec<Issue>,
+) -> AdapterKind {
+    match mapping.get("adapter") {
+        Some(RawValue::String(text)) => match AdapterKind::parse(text) {
+            Some(kind) => kind,
+            None => {
+                issues.push(Issue::new(
+                    format!("{path}.adapter"),
+                    adapter_option(),
+                    true,
+                ));
+                AdapterKind::Fake
+            }
+        },
+        Some(other) => {
+            issues.push(Issue::new(
+                format!("{path}.adapter"),
+                invalid_input("string", other.type_name()),
+                true,
+            ));
+            AdapterKind::Fake
+        }
+        None => match inferred_adapter(name) {
+            Some(kind) => kind,
+            None => {
+                issues.push(Issue::new(
+                    format!("{path}.adapter"),
+                    format!(
+                        "provider connections require an adapter ({spellings}); \
+                         only the legacy keys openai, anthropic, and fake may omit it",
+                        spellings = adapter_spellings()
+                    ),
+                    true,
+                ));
+                AdapterKind::Fake
+            }
+        },
+    }
+}
+
+/// Parses one named connection object. `name` selects the version-1 legacy
+/// quirks (adapter inference and the field-level OPENAI_API_KEY default);
+/// `path` is the `providers.<name>` dotted prefix for diagnostics.
+fn parse_provider_connection(
+    name: &str,
+    value: &RawValue,
+    path: &str,
+    issues: &mut Vec<Issue>,
+) -> ProviderConnection {
+    let Some(mapping) = value.as_mapping() else {
+        issues.push(Issue::new(
+            path.to_string(),
+            invalid_input("object", value.type_name()),
+            true,
+        ));
+        // The entry cannot define anything; keep the per-name defaults so the
+        // rest of the layer still parses. The layer fails on the issue above.
+        let adapter = inferred_adapter(name).unwrap_or(AdapterKind::Fake);
+        return ProviderConnection {
+            adapter,
+            api_key_env: absent_default_env(name).map(str::to_string),
             base_url: None,
+            preset: None,
+            capabilities: CapabilityOverrides::default(),
         };
     };
+
+    let adapter = parse_adapter_field(name, mapping, path, issues);
+
+    // Version-1 quirk: within a present object, an omitted (or rejected)
+    // apiKeyEnv defaults to OPENAI_API_KEY for BOTH legacy live keys; new
+    // names default per adapter.
+    let default_env = if LEGACY_LIVE_CONNECTION_NAMES.contains(&name) {
+        Some("OPENAI_API_KEY")
+    } else {
+        adapter_default_env(adapter)
+    };
     let api_key_env = match mapping.get("apiKeyEnv") {
-        None => "OPENAI_API_KEY".to_string(),
-        Some(RawValue::String(name)) if !name.is_empty() => name.clone(),
+        None => default_env.map(str::to_string),
+        Some(RawValue::String(text)) if !text.is_empty() => {
+            if is_valid_env_var_name(text) {
+                Some(text.clone())
+            } else {
+                issues.push(Issue::new(
+                    format!("{path}.apiKeyEnv"),
+                    API_KEY_ENV_MESSAGE,
+                    true,
+                ));
+                default_env.map(str::to_string)
+            }
+        }
         Some(RawValue::String(_)) => {
             issues.push(Issue::new(
                 format!("{path}.apiKeyEnv"),
                 string_too_small(),
                 false,
             ));
-            "OPENAI_API_KEY".to_string()
+            default_env.map(str::to_string)
         }
         Some(other) => {
             issues.push(Issue::new(
@@ -600,9 +862,10 @@ fn parse_provider_settings(
                 invalid_input("string", other.type_name()),
                 true,
             ));
-            "OPENAI_API_KEY".to_string()
+            default_env.map(str::to_string)
         }
     };
+
     let base_url = match mapping.get("baseUrl") {
         None => None,
         Some(RawValue::String(url)) if is_valid_url(url) => Some(url.clone()),
@@ -619,10 +882,186 @@ fn parse_provider_settings(
             None
         }
     };
-    ProviderSettings {
+
+    // Preset existence and adapter compatibility are validated on the
+    // effective configuration, where the failure can join the other
+    // provider diagnostics; here only non-empty-string-ness is checked.
+    let preset = match mapping.get("preset") {
+        None => None,
+        Some(value) => match parse_nonempty_string(value) {
+            Ok(preset) => Some(preset),
+            Err(issue) => {
+                issues.push(Issue::new(
+                    format!("{path}.preset"),
+                    issue.message,
+                    issue.hard,
+                ));
+                None
+            }
+        },
+    };
+
+    let capabilities = parse_capabilities(
+        mapping.get("capabilities"),
+        &format!("{path}.capabilities"),
+        issues,
+    );
+
+    ProviderConnection {
+        adapter,
         api_key_env,
         base_url,
+        preset,
+        capabilities,
     }
+}
+
+/// Parses one capability field's value against its allowed wire spellings.
+/// Wrong types are hard issues; unknown spellings list the allowed ones.
+fn capability_field<T: Copy>(
+    mapping: &RawMapping,
+    key: &str,
+    path: &str,
+    allowed: &[&str],
+    parse: fn(&str) -> Option<T>,
+    set: &mut Option<T>,
+    issues: &mut Vec<Issue>,
+) {
+    let Some(value) = mapping.get(key) else {
+        return;
+    };
+    match value {
+        RawValue::String(text) => match parse(text) {
+            Some(parsed) => *set = Some(parsed),
+            None => issues.push(Issue::new(
+                format!("{path}.{key}"),
+                invalid_option(allowed),
+                true,
+            )),
+        },
+        other => issues.push(Issue::new(
+            format!("{path}.{key}"),
+            invalid_input("string", other.type_name()),
+            true,
+        )),
+    }
+}
+
+fn parse_feature_support(text: &str) -> Option<FeatureSupport> {
+    match text {
+        "supported" => Some(FeatureSupport::Supported),
+        "unsupported" => Some(FeatureSupport::Unsupported),
+        _ => None,
+    }
+}
+
+/// Parses the optional `capabilities` override mapping. Unknown keys are
+/// ignored (Zod default-object behavior); every present value must match the
+/// wire spelling of its contract enum.
+fn parse_capabilities(
+    value: Option<&RawValue>,
+    path: &str,
+    issues: &mut Vec<Issue>,
+) -> CapabilityOverrides {
+    let mut overrides = CapabilityOverrides::default();
+    let Some(raw) = value else {
+        return overrides;
+    };
+    let Some(mapping) = raw.as_mapping() else {
+        issues.push(Issue::new(
+            path.to_string(),
+            invalid_input("object", raw.type_name()),
+            true,
+        ));
+        return overrides;
+    };
+    capability_field(
+        mapping,
+        "instructions",
+        path,
+        &["developer", "system-instruction"],
+        |text| match text {
+            "developer" => Some(InstructionStyle::Developer),
+            "system-instruction" => Some(InstructionStyle::SystemInstruction),
+            _ => None,
+        },
+        &mut overrides.instructions,
+        issues,
+    );
+    capability_field(
+        mapping,
+        "toolCalls",
+        path,
+        &["supported", "unsupported"],
+        parse_feature_support,
+        &mut overrides.tool_calls,
+        issues,
+    );
+    capability_field(
+        mapping,
+        "streamedToolArguments",
+        path,
+        &["supported", "unsupported"],
+        parse_feature_support,
+        &mut overrides.streamed_tool_arguments,
+        issues,
+    );
+    capability_field(
+        mapping,
+        "parallelToolCalls",
+        path,
+        &["supported", "unsupported"],
+        parse_feature_support,
+        &mut overrides.parallel_tool_calls,
+        issues,
+    );
+    capability_field(
+        mapping,
+        "structuredOutput",
+        path,
+        &["json-schema", "json-object", "unsupported"],
+        |text| match text {
+            "json-schema" => Some(StructuredOutputMode::JsonSchema),
+            "json-object" => Some(StructuredOutputMode::JsonObject),
+            "unsupported" => Some(StructuredOutputMode::Unsupported),
+            _ => None,
+        },
+        &mut overrides.structured_output,
+        issues,
+    );
+    capability_field(
+        mapping,
+        "streamedUsage",
+        path,
+        &["supported", "unsupported"],
+        parse_feature_support,
+        &mut overrides.streamed_usage,
+        issues,
+    );
+    capability_field(
+        mapping,
+        "outputTokenParam",
+        path,
+        &["max-tokens", "max-completion-tokens", "model-default"],
+        |text| match text {
+            "max-tokens" => Some(OutputTokenParam::MaxTokens),
+            "max-completion-tokens" => Some(OutputTokenParam::MaxCompletionTokens),
+            "model-default" => Some(OutputTokenParam::ModelDefault),
+            _ => None,
+        },
+        &mut overrides.output_token_param,
+        issues,
+    );
+    capability_field(
+        mapping,
+        "imageInput",
+        path,
+        &["supported", "unsupported"],
+        parse_feature_support,
+        &mut overrides.image_input,
+        issues,
+    );
+    overrides
 }
 
 fn parse_limits(
@@ -680,7 +1119,7 @@ fn float_int_limit_field(
 fn parse_route_config(value: &RawValue, path: &str) -> (RouteConfig, Vec<Issue>) {
     let mut issues = Vec::new();
     let empty = RouteConfig {
-        provider: ProviderName::OpenAi,
+        provider: String::new(),
         model: String::new(),
         fallbacks: None,
         limits: None,
@@ -693,7 +1132,7 @@ fn parse_route_config(value: &RawValue, path: &str) -> (RouteConfig, Vec<Issue>)
         ));
         return (empty, issues);
     };
-    let provider = match parse_provider(mapping.get("provider")) {
+    let provider = match parse_provider_reference(mapping.get("provider")) {
         Ok(provider) => provider,
         Err(issue) => {
             issues.push(Issue::new(
@@ -757,7 +1196,7 @@ fn parse_inline_fallbacks(
             ));
             continue;
         };
-        let provider = match parse_provider(mapping.get("provider")) {
+        let provider = match parse_provider_reference(mapping.get("provider")) {
             Ok(provider) => provider,
             Err(issue) => {
                 issues.push(Issue::new(
@@ -765,7 +1204,7 @@ fn parse_inline_fallbacks(
                     issue.message,
                     issue.hard,
                 ));
-                ProviderName::OpenAi
+                String::new()
             }
         };
         let model = match parse_nonempty_string(mapping.get("model").unwrap_or(&RawValue::Null)) {
@@ -800,7 +1239,7 @@ fn parse_inline_fallbacks(
 fn parse_model_role(value: &RawValue, path: &str) -> (ModelRoleConfig, Vec<Issue>) {
     let mut issues = Vec::new();
     let empty = ModelRoleConfig {
-        provider: ProviderName::OpenAi,
+        provider: String::new(),
         model: String::new(),
         fallbacks: None,
         limits: None,
@@ -813,7 +1252,7 @@ fn parse_model_role(value: &RawValue, path: &str) -> (ModelRoleConfig, Vec<Issue
         ));
         return (empty, issues);
     };
-    let provider = match parse_provider(mapping.get("provider")) {
+    let provider = match parse_provider_reference(mapping.get("provider")) {
         Ok(provider) => provider,
         Err(issue) => {
             issues.push(Issue::new(
@@ -963,35 +1402,7 @@ pub fn parse_relay_config(
 
     let providers = match root.get("providers") {
         None => default_providers(),
-        Some(raw) => match raw.as_mapping() {
-            Some(mapping) => {
-                // Zod quirk preserved: an *absent* provider key takes the
-                // object-level default (ANTHROPIC_API_KEY for anthropic),
-                // while a present-but-empty object takes the field-level
-                // default (OPENAI_API_KEY for both).
-                let openai = parse_provider_settings(
-                    mapping.get("openai"),
-                    "providers.openai",
-                    "OPENAI_API_KEY",
-                    &mut issues,
-                );
-                let anthropic = parse_provider_settings(
-                    mapping.get("anthropic"),
-                    "providers.anthropic",
-                    "ANTHROPIC_API_KEY",
-                    &mut issues,
-                );
-                Providers { openai, anthropic }
-            }
-            None => {
-                issues.push(Issue::new(
-                    "providers",
-                    invalid_input("object", raw.type_name()),
-                    true,
-                ));
-                default_providers()
-            }
-        },
+        Some(raw) => parse_providers_section(raw, &mut issues),
     };
 
     let mut routing: IndexMap<String, RoutingValue> = IndexMap::new();

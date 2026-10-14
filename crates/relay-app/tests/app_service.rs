@@ -81,6 +81,7 @@ impl ModelClient for EchoModel {
             text: format!("echo: {}", request.prompt),
             input_tokens: 1,
             output_tokens: 1,
+            routes_attempted: Vec::new(),
         })
     }
 }
@@ -906,12 +907,10 @@ fn a_fake_provider_run_publishes_the_brief_end_to_end() {
                 ..Default::default()
             },
         }]);
-    let route = relay_domain::ModelRoute {
-        provider: "fake".to_string(),
-        model: "fake-standard".to_string(),
-        role: None,
-    };
-    let wiring = RuntimeWiring::production(Arc::new(provider), route);
+    // The scripted provider serves the run under the `fake` connection of
+    // the offline default plan, exactly as a configured fake connection
+    // would.
+    let wiring = relay_app::TurnRouting::with_provider(Arc::new(provider)).run_wiring;
 
     let dir = tempfile::tempdir().unwrap();
     app::init(

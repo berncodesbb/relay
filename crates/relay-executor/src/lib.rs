@@ -21,7 +21,11 @@
 //!   the attempt's [`CancelToken`](relay_providers::contract::CancelToken),
 //!   which threads into tool execution and the process supervisor;
 //! - the [`ModelClient`] port over `relay-providers`' neutral contract, so
-//!   no provider type appears in any executor signature.
+//!   no provider type appears in any executor signature. Its production
+//!   implementation is [`RoutedModelClient`]: named provider connections
+//!   built once from effective configuration, purpose/role route plans
+//!   resolved after invocation overrides, and deterministic ordered
+//!   fallback for provider availability failures only.
 //!
 //! Capability enforcement is layered: the domain fold validates grants
 //! against work ceilings, the engine refuses overlapping write grants in
@@ -34,6 +38,7 @@ pub mod executors;
 pub mod model;
 pub mod orchestrator;
 pub mod planner;
+pub mod routed_model;
 pub mod sink;
 pub mod spec;
 
@@ -44,7 +49,8 @@ pub use executors::{
     WorkspacePlanner,
 };
 pub use model::{
-    ModelClient, ModelClientError, ModelTurnRequest, ModelTurnResponse, ProviderModelClient,
+    ModelCallFailure, ModelClient, ModelClientError, ModelTurnRequest, ModelTurnResponse,
+    ProviderModelClient, RouteAttemptFailure,
 };
 pub use orchestrator::{
     AbandonedReport, GrantSource, Orchestrator, OrchestratorError, Refusal, TickReport,
@@ -53,6 +59,9 @@ pub use orchestrator::{
 pub use planner::{
     CallRecord, ModelGuidedConfig, ModelGuidedVerifierPlanner, ModelGuidedWorkspacePlanner,
     ToolCallRequest, ToolRunner, ToolSession,
+};
+pub use routed_model::{
+    ConnectionState, PlannedRoute, ProviderRegistry, ResolvedRoutePlan, RoutedModelClient,
 };
 pub use sink::{FactSink, FactSinkError, InMemoryFactSink};
 pub use spec::{

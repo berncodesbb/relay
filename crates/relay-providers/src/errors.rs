@@ -150,7 +150,15 @@ fn safe_message(signal: &ErrorSignal, fallback: &str) -> String {
     } else {
         signal.message.as_str()
     };
-    trim_to_limit(redact_message(raw).trim())
+    normalized_message(raw.trim())
+}
+
+/// A bounded, redacted message for failures an adapter classifies itself
+/// (malformed stream payloads, capability preflight rejections): the same
+/// trim-and-redact treatment [`to_provider_failure`] applies, with the kind
+/// chosen by the caller because the transport signal alone cannot infer it.
+pub(crate) fn normalized_message(message: &str) -> String {
+    trim_to_limit(&redact_message(message)).trim().to_owned()
 }
 
 /// Map a provider error signal to a [`ProviderFailure`]. Classification
@@ -454,6 +462,15 @@ mod tests {
         let long = "x".repeat(500);
         let failure = to_provider_failure(sdk_like(Some(500), &long));
         assert_eq!(failure.message.chars().count(), 300);
+    }
+
+    #[test]
+    fn normalized_message_trims_and_redacts_directly_classified_failures() {
+        assert_eq!(normalized_message("clean message"), "clean message");
+        let long = format!("{} sk-abc123def456ghi789", "x".repeat(400));
+        let bounded = normalized_message(&long);
+        assert_eq!(bounded.chars().count(), 300);
+        assert!(!bounded.contains("sk-abc123def456ghi789"), "{bounded}");
     }
 
     #[test]

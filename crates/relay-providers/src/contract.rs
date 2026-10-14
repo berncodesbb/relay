@@ -309,6 +309,10 @@ pub enum ProviderErrorKind {
     Auth,
     /// The provider response could not be normalized.
     InvalidResponse,
+    /// The request requires a capability the connection's effective profile
+    /// does not allow; rejected before any HTTP call. Never retried or
+    /// fallen back from — the configuration must change.
+    UnsupportedCapability,
     /// Anything else.
     Unknown,
 }
@@ -324,6 +328,7 @@ impl ProviderErrorKind {
             ProviderErrorKind::Canceled => "canceled",
             ProviderErrorKind::Auth => "auth",
             ProviderErrorKind::InvalidResponse => "invalid-response",
+            ProviderErrorKind::UnsupportedCapability => "unsupported-capability",
             ProviderErrorKind::Unknown => "unknown",
         }
     }
@@ -377,41 +382,298 @@ impl fmt::Display for ProviderFailure {
 
 impl std::error::Error for ProviderFailure {}
 
-/// Names of the built-in providers.
+/// The wire-protocol adapter kinds Relay ships.
+///
+/// Adapter identity is which *protocol* a provider connection speaks, not
+/// which vendor it reaches: `openai-chat` covers every OpenAI-compatible
+/// Chat Completions endpoint (OpenAI, GLM, Groq, OpenRouter, local
+/// gateways). The user-facing *connection* identity is a configurable name
+/// (`providers.<name>` in Relay configuration); this enum never grows one
+/// variant per vendor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ProviderName {
-    /// The OpenAI chat-completions adapter.
-    Openai,
-    /// The Anthropic Messages adapter.
+pub enum AdapterKind {
+    /// OpenAI-compatible Chat Completions (`/chat/completions`).
+    OpenaiChat,
+    /// The native Anthropic Messages API.
     Anthropic,
     /// The deterministic in-process fake.
     Fake,
 }
 
-impl ProviderName {
-    /// The wire spelling of this provider.
+/// The adapter kinds Relay ships, in stable order.
+pub const ADAPTER_KINDS: [AdapterKind; 3] = [
+    AdapterKind::OpenaiChat,
+    AdapterKind::Anthropic,
+    AdapterKind::Fake,
+];
+
+impl AdapterKind {
+    /// The wire/configuration spelling of this adapter kind.
     pub fn as_str(self) -> &'static str {
         match self {
-            ProviderName::Openai => "openai",
-            ProviderName::Anthropic => "anthropic",
-            ProviderName::Fake => "fake",
+            AdapterKind::OpenaiChat => "openai-chat",
+            AdapterKind::Anthropic => "anthropic",
+            AdapterKind::Fake => "fake",
         }
     }
 
-    /// Parse the wire spelling of a provider.
+    /// Parse the wire/configuration spelling of an adapter kind.
     pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "openai" => Some(ProviderName::Openai),
-            "anthropic" => Some(ProviderName::Anthropic),
-            "fake" => Some(ProviderName::Fake),
+            "openai-chat" => Some(AdapterKind::OpenaiChat),
+            "anthropic" => Some(AdapterKind::Anthropic),
+            "fake" => Some(AdapterKind::Fake),
             _ => None,
         }
     }
 }
 
-impl fmt::Display for ProviderName {
+impl fmt::Display for AdapterKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// How an adapter represents Relay's system/developer instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InstructionStyle {
+    /// Sent as the protocol's developer-role message.
+    #[serde(rename = "developer")]
+    Developer,
+    /// Translated to a system-role message (documented safe fallback for
+    /// compatibility endpoints that do not recognize a developer role).
+    #[serde(rename = "system-instruction")]
+    SystemInstruction,
+}
+
+/// Whether a feature is available on an adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FeatureSupport {
+    /// The adapter implements the feature.
+    #[serde(rename = "supported")]
+    Supported,
+    /// The adapter does not implement the feature; requests that require it
+    /// fail before any HTTP call rather than being silently downgraded.
+    #[serde(rename = "unsupported")]
+    Unsupported,
+}
+
+/// How an adapter carries Relay's structured-output request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StructuredOutputMode {
+    /// Native `json_schema` response formats.
+    #[serde(rename = "json-schema")]
+    JsonSchema,
+    /// `json_object` response format with the JSON Schema embedded in the
+    /// instruction text (documented translation).
+    #[serde(rename = "json-object")]
+    JsonObject,
+    /// Structured output cannot be requested; fail before any HTTP call.
+    #[serde(rename = "unsupported")]
+    Unsupported,
+}
+
+/// The wire parameter an adapter uses for Relay's output-token ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OutputTokenParam {
+    /// Always `max_tokens`.
+    #[serde(rename = "max-tokens")]
+    MaxTokens,
+    /// Always `max_completion_tokens`.
+    #[serde(rename = "max-completion-tokens")]
+    MaxCompletionTokens,
+    /// Choose per model with the adapter's documented heuristic (the
+    /// OpenAI-compatible default: `gpt-5*`/`o<digit>*` models use
+    /// `max_completion_tokens`, others `max_tokens`).
+    #[serde(rename = "model-default")]
+    ModelDefault,
+}
+
+/// The effective capability profile of one adapter: what a connection built
+/// on that adapter can do, and which documented translations apply.
+///
+/// Effective profiles resolve deterministically as
+/// `adapter defaults -> optional preset -> explicit overrides`
+/// (see [`resolve_capabilities`]); a requested Relay feature is either
+/// translated by a documented rule recorded here or rejected with an
+/// actionable error before any HTTP request is issued.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdapterCapabilities {
+    /// How `system`/developer instructions are represented.
+    pub instructions: InstructionStyle,
+    /// Whether local function tools can be requested.
+    pub tool_calls: FeatureSupport,
+    /// Whether tool arguments may stream incrementally.
+    pub streamed_tool_arguments: FeatureSupport,
+    /// Whether parallel tool calls may be requested.
+    pub parallel_tool_calls: FeatureSupport,
+    /// How structured output is carried.
+    pub structured_output: StructuredOutputMode,
+    /// Whether token usage is reported on the stream.
+    pub streamed_usage: FeatureSupport,
+    /// The output-token parameter convention.
+    pub output_token_param: OutputTokenParam,
+    /// Whether image/file inputs can be sent (unsupported everywhere for
+    /// now; recorded so the gap fails early when Relay requests it).
+    pub image_input: FeatureSupport,
+}
+
+impl AdapterCapabilities {
+    /// The conservative adapter defaults for a kind.
+    pub fn defaults_for(kind: AdapterKind) -> Self {
+        match kind {
+            AdapterKind::OpenaiChat => AdapterCapabilities {
+                instructions: InstructionStyle::Developer,
+                tool_calls: FeatureSupport::Supported,
+                streamed_tool_arguments: FeatureSupport::Supported,
+                parallel_tool_calls: FeatureSupport::Unsupported,
+                structured_output: StructuredOutputMode::JsonSchema,
+                streamed_usage: FeatureSupport::Supported,
+                output_token_param: OutputTokenParam::ModelDefault,
+                image_input: FeatureSupport::Unsupported,
+            },
+            AdapterKind::Anthropic => AdapterCapabilities {
+                instructions: InstructionStyle::SystemInstruction,
+                tool_calls: FeatureSupport::Supported,
+                streamed_tool_arguments: FeatureSupport::Supported,
+                parallel_tool_calls: FeatureSupport::Unsupported,
+                structured_output: StructuredOutputMode::JsonObject,
+                streamed_usage: FeatureSupport::Supported,
+                output_token_param: OutputTokenParam::MaxTokens,
+                image_input: FeatureSupport::Unsupported,
+            },
+            AdapterKind::Fake => AdapterCapabilities {
+                instructions: InstructionStyle::SystemInstruction,
+                tool_calls: FeatureSupport::Supported,
+                streamed_tool_arguments: FeatureSupport::Supported,
+                parallel_tool_calls: FeatureSupport::Supported,
+                structured_output: StructuredOutputMode::JsonSchema,
+                streamed_usage: FeatureSupport::Supported,
+                output_token_param: OutputTokenParam::MaxTokens,
+                image_input: FeatureSupport::Unsupported,
+            },
+        }
+    }
+}
+
+/// Explicit per-field capability overrides from configuration. `None` fields
+/// inherit the preset value (when a preset is set) or the adapter default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapabilityOverrides {
+    /// Override the instruction representation.
+    pub instructions: Option<InstructionStyle>,
+    /// Override function-tool support.
+    pub tool_calls: Option<FeatureSupport>,
+    /// Override streamed tool arguments.
+    pub streamed_tool_arguments: Option<FeatureSupport>,
+    /// Override parallel tool calls.
+    pub parallel_tool_calls: Option<FeatureSupport>,
+    /// Override structured-output mode.
+    pub structured_output: Option<StructuredOutputMode>,
+    /// Override streamed usage.
+    pub streamed_usage: Option<FeatureSupport>,
+    /// Override the output-token parameter convention.
+    pub output_token_param: Option<OutputTokenParam>,
+    /// Override image/file input support.
+    pub image_input: Option<FeatureSupport>,
+}
+
+impl CapabilityOverrides {
+    /// Whether every field is unset.
+    pub fn is_empty(&self) -> bool {
+        *self == CapabilityOverrides::default()
+    }
+}
+
+/// The named capability presets Relay knows, in stable order. Presets are
+/// complete profiles layered over the adapter defaults before explicit
+/// overrides; the first is `glm` (OpenAI-compatible Chat Completions with
+/// conservative compatibility behavior).
+pub const PRESET_NAMES: [&str; 1] = ["glm"];
+
+/// The named preset profile, or `None` for an unknown preset name.
+pub fn preset_capabilities(name: &str) -> Option<AdapterCapabilities> {
+    match name {
+        // GLM's OpenAI-compatible endpoint: system instructions rather than
+        // the developer role, json-object structured output, no streamed
+        // usage guarantee, and plain max_tokens.
+        "glm" => Some(AdapterCapabilities {
+            instructions: InstructionStyle::SystemInstruction,
+            structured_output: StructuredOutputMode::JsonObject,
+            streamed_usage: FeatureSupport::Unsupported,
+            output_token_param: OutputTokenParam::MaxTokens,
+            ..AdapterCapabilities::defaults_for(AdapterKind::OpenaiChat)
+        }),
+        _ => None,
+    }
+}
+
+/// An invalid capability/preset combination, with an actionable message.
+#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[error("{0}")]
+pub struct CapabilityError(pub String);
+
+/// Resolve the effective capability profile: adapter defaults, then the
+/// named preset (when set), then explicit overrides (highest precedence).
+/// Unknown preset names fail with an actionable message.
+pub fn resolve_capabilities(
+    kind: AdapterKind,
+    preset: Option<&str>,
+    overrides: &CapabilityOverrides,
+) -> Result<AdapterCapabilities, CapabilityError> {
+    let mut capabilities = AdapterCapabilities::defaults_for(kind);
+    if let Some(preset) = preset {
+        let profile = preset_capabilities(preset).ok_or_else(|| {
+            CapabilityError(format!(
+                "unknown capability preset \"{preset}\" (available presets: {})",
+                PRESET_NAMES.join(", ")
+            ))
+        })?;
+        // A preset only refines the profile when the adapter kind matches
+        // the preset's protocol family; otherwise it is a configuration
+        // error rather than a silent mismatch.
+        let expected = preset_adapter(preset);
+        if expected != kind {
+            return Err(CapabilityError(format!(
+                "capability preset \"{preset}\" applies to the {expected} adapter, not {kind}"
+            )));
+        }
+        capabilities = profile;
+    }
+    if let Some(value) = overrides.instructions {
+        capabilities.instructions = value;
+    }
+    if let Some(value) = overrides.tool_calls {
+        capabilities.tool_calls = value;
+    }
+    if let Some(value) = overrides.streamed_tool_arguments {
+        capabilities.streamed_tool_arguments = value;
+    }
+    if let Some(value) = overrides.parallel_tool_calls {
+        capabilities.parallel_tool_calls = value;
+    }
+    if let Some(value) = overrides.structured_output {
+        capabilities.structured_output = value;
+    }
+    if let Some(value) = overrides.streamed_usage {
+        capabilities.streamed_usage = value;
+    }
+    if let Some(value) = overrides.output_token_param {
+        capabilities.output_token_param = value;
+    }
+    if let Some(value) = overrides.image_input {
+        capabilities.image_input = value;
+    }
+    Ok(capabilities)
+}
+
+/// The adapter kind a named preset is defined against.
+pub fn preset_adapter(name: &str) -> AdapterKind {
+    match name {
+        "glm" => AdapterKind::OpenaiChat,
+        _ => AdapterKind::Fake,
     }
 }
 
@@ -425,8 +687,9 @@ pub type ProviderEventStream<'a> = Box<dyn Iterator<Item = ProviderStreamEvent> 
 /// provider-side conversation ids are optional optimizations adapters may
 /// expose separately.
 pub trait ModelProvider: Send + Sync {
-    /// The provider's name.
-    fn name(&self) -> ProviderName;
+    /// The adapter kind this provider implements (protocol identity, not a
+    /// configured connection name).
+    fn name(&self) -> AdapterKind;
 
     /// Model ids this provider reports for configuration validation.
     fn models(&self) -> Vec<String>;
@@ -472,15 +735,60 @@ mod tests {
     }
 
     #[test]
-    fn provider_name_round_trips_wire_spellings() {
-        for provider in [
-            ProviderName::Openai,
-            ProviderName::Anthropic,
-            ProviderName::Fake,
-        ] {
-            assert_eq!(ProviderName::parse(provider.as_str()), Some(provider));
+    fn adapter_kind_round_trips_wire_spellings() {
+        for kind in ADAPTER_KINDS {
+            assert_eq!(AdapterKind::parse(kind.as_str()), Some(kind));
         }
-        assert_eq!(ProviderName::parse("bedrock"), None);
+        assert_eq!(AdapterKind::parse("openai"), None);
+        assert_eq!(AdapterKind::parse("bedrock"), None);
+    }
+
+    #[test]
+    fn capabilities_resolve_defaults_preset_then_overrides() {
+        let base = resolve_capabilities(
+            AdapterKind::OpenaiChat,
+            None,
+            &CapabilityOverrides::default(),
+        )
+        .expect("defaults resolve");
+        assert_eq!(base.instructions, InstructionStyle::Developer);
+        assert_eq!(base.structured_output, StructuredOutputMode::JsonSchema);
+
+        let glm = resolve_capabilities(
+            AdapterKind::OpenaiChat,
+            Some("glm"),
+            &CapabilityOverrides::default(),
+        )
+        .expect("preset resolves");
+        assert_eq!(glm.instructions, InstructionStyle::SystemInstruction);
+        assert_eq!(glm.structured_output, StructuredOutputMode::JsonObject);
+        assert_eq!(glm.streamed_usage, FeatureSupport::Unsupported);
+        assert_eq!(glm.output_token_param, OutputTokenParam::MaxTokens);
+
+        let overrides = CapabilityOverrides {
+            structured_output: Some(StructuredOutputMode::JsonSchema),
+            ..CapabilityOverrides::default()
+        };
+        let forced = resolve_capabilities(AdapterKind::OpenaiChat, Some("glm"), &overrides)
+            .expect("overrides win");
+        assert_eq!(forced.structured_output, StructuredOutputMode::JsonSchema);
+        assert_eq!(forced.instructions, InstructionStyle::SystemInstruction);
+
+        let error = resolve_capabilities(AdapterKind::OpenaiChat, Some("grok"), &overrides)
+            .expect_err("unknown preset");
+        assert!(
+            error.to_string().contains("unknown capability preset"),
+            "{error}"
+        );
+
+        let error = resolve_capabilities(AdapterKind::Anthropic, Some("glm"), &overrides)
+            .expect_err("preset/adapter mismatch");
+        assert!(
+            error
+                .to_string()
+                .contains("applies to the openai-chat adapter"),
+            "{error}"
+        );
     }
 
     #[test]

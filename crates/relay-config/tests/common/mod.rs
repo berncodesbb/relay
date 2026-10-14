@@ -5,8 +5,9 @@
 
 use relay_config::load::LoadOptions;
 use relay_config::schema::{
-    BudgetLimits, InlineFallback, ModelRoleConfig, ProviderName, ProviderSettings, Providers,
-    RelayConfig, RouteConfig, RouteLimits, RoutingValue, ToolSettings,
+    AdapterKind, BudgetLimits, CapabilityOverrides, InlineFallback, ModelRoleConfig,
+    ProviderConnection, Providers, RelayConfig, RouteConfig, RouteLimits, RoutingValue,
+    ToolSettings,
 };
 use relay_config::{default_config, load_config};
 use std::path::{Path, PathBuf};
@@ -85,9 +86,9 @@ pub fn role(name: &str) -> RoutingValue {
 }
 
 /// A legacy inline routing object.
-pub fn inline(provider: ProviderName, model: &str) -> RoutingValue {
+pub fn inline(provider: &str, model: &str) -> RoutingValue {
     RoutingValue::Inline(RouteConfig {
-        provider,
+        provider: provider.to_string(),
         model: model.to_string(),
         fallbacks: None,
         limits: None,
@@ -96,12 +97,12 @@ pub fn inline(provider: ProviderName, model: &str) -> RoutingValue {
 
 /// A legacy inline routing object with inline fallbacks.
 pub fn inline_with_fallbacks(
-    provider: ProviderName,
+    provider: &str,
     model: &str,
     fallbacks: Vec<InlineFallback>,
 ) -> RoutingValue {
     RoutingValue::Inline(RouteConfig {
-        provider,
+        provider: provider.to_string(),
         model: model.to_string(),
         fallbacks: Some(fallbacks),
         limits: None,
@@ -109,9 +110,9 @@ pub fn inline_with_fallbacks(
 }
 
 /// A model-role definition.
-pub fn model_role(provider: ProviderName, model: &str) -> ModelRoleConfig {
+pub fn model_role(provider: &str, model: &str) -> ModelRoleConfig {
     ModelRoleConfig {
-        provider,
+        provider: provider.to_string(),
         model: model.to_string(),
         fallbacks: None,
         limits: None,
@@ -120,16 +121,47 @@ pub fn model_role(provider: ProviderName, model: &str) -> ModelRoleConfig {
 
 /// A model-role definition with role-name fallbacks.
 pub fn model_role_with_fallbacks(
-    provider: ProviderName,
+    provider: &str,
     model: &str,
     fallbacks: Vec<&str>,
 ) -> ModelRoleConfig {
     ModelRoleConfig {
-        provider,
+        provider: provider.to_string(),
         model: model.to_string(),
         fallbacks: Some(fallbacks.iter().map(|name| name.to_string()).collect()),
         limits: None,
     }
+}
+
+/// A provider connection with no endpoint, preset, or overrides.
+pub fn connection(adapter: AdapterKind, api_key_env: Option<&str>) -> ProviderConnection {
+    ProviderConnection {
+        adapter,
+        api_key_env: api_key_env.map(str::to_string),
+        base_url: None,
+        preset: None,
+        capabilities: CapabilityOverrides::default(),
+    }
+}
+
+/// The three connections most hand-built test configurations need: the
+/// offline fake plus the two legacy live keys.
+pub fn test_providers() -> Providers {
+    Providers(
+        [
+            ("fake".to_string(), connection(AdapterKind::Fake, None)),
+            (
+                "openai".to_string(),
+                connection(AdapterKind::OpenaiChat, Some("OPENAI_API_KEY")),
+            ),
+            (
+                "anthropic".to_string(),
+                connection(AdapterKind::Anthropic, Some("ANTHROPIC_API_KEY")),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+    )
 }
 
 /// Mirrors the TypeScript tests' `configWith` helper: a configuration with a
@@ -140,16 +172,7 @@ pub fn config_with(
 ) -> RelayConfig {
     RelayConfig {
         version: 1,
-        providers: Providers {
-            openai: ProviderSettings {
-                api_key_env: "OPENAI_API_KEY".to_string(),
-                base_url: None,
-            },
-            anthropic: ProviderSettings {
-                api_key_env: "ANTHROPIC_API_KEY".to_string(),
-                base_url: None,
-            },
-        },
+        providers: test_providers(),
         models: models.map(|entries| {
             entries
                 .into_iter()
@@ -169,31 +192,13 @@ pub fn config_with(
 /// The seven inline mode routes the TypeScript normalize tests use.
 pub fn inline_routes() -> Vec<(&'static str, RoutingValue)> {
     vec![
-        (
-            "discovery",
-            inline(ProviderName::Anthropic, "claude-sonnet-5-5"),
-        ),
-        (
-            "specification",
-            inline(ProviderName::Anthropic, "claude-sonnet-5-5"),
-        ),
-        (
-            "technical-design",
-            inline(ProviderName::Anthropic, "claude-opus-5-5"),
-        ),
-        (
-            "planning",
-            inline(ProviderName::Anthropic, "claude-sonnet-5-5"),
-        ),
-        (
-            "implementation",
-            inline(ProviderName::Anthropic, "claude-sonnet-5-5"),
-        ),
-        ("verification", inline(ProviderName::OpenAi, "gpt-5.2")),
-        (
-            "delivery",
-            inline(ProviderName::Anthropic, "claude-haiku-4-5"),
-        ),
+        ("discovery", inline("anthropic", "claude-sonnet-5-5")),
+        ("specification", inline("anthropic", "claude-sonnet-5-5")),
+        ("technical-design", inline("anthropic", "claude-opus-5-5")),
+        ("planning", inline("anthropic", "claude-sonnet-5-5")),
+        ("implementation", inline("anthropic", "claude-sonnet-5-5")),
+        ("verification", inline("openai", "gpt-5.2")),
+        ("delivery", inline("anthropic", "claude-haiku-4-5")),
     ]
 }
 
@@ -264,6 +269,34 @@ budgets: {}
 models:
   reasoning: { provider: openai, model: gpt-5.2 }
 routing:
+  discovery: reasoning
+  specification: reasoning
+  technical-design: architect
+  planning: reasoning
+  implementation: coding
+  verification: review
+  delivery: fast
+"#;
+
+/// A named-connection layer: GLM through its OpenAI-compatible endpoint plus
+/// a second `openai-chat` connection, with a role using each.
+pub const NAMED_CONNECTIONS_YAML: &str = r#"
+version: 1
+budgets: {}
+providers:
+  glm:
+    adapter: openai-chat
+    baseUrl: https://api.z.ai/api/paas/v4
+    apiKeyEnv: GLM_API_KEY
+    preset: glm
+  local:
+    adapter: openai-chat
+    baseUrl: http://localhost:8080/v1
+models:
+  reasoning: { provider: glm, model: glm-4.7 }
+  coding: { provider: local, model: qwen3-coder }
+routing:
+  intent: fast
   discovery: reasoning
   specification: reasoning
   technical-design: architect

@@ -569,3 +569,78 @@ fn test_grants(
     let ids = Arc::new(relay_executor::IdSource::new());
     Arc::new(move |work| grant_from_work(ids.next_grant_id(), work, route.clone(), budget))
 }
+
+// ---------------------------------------------------------------------------
+// Credential hygiene across the routing seam (interface owner, Phase 5)
+// ---------------------------------------------------------------------------
+
+/// Shapes a credential-shaped substring must never appear in: a missing
+/// credential's diagnostic names the environment VARIABLE and nothing else,
+/// and no credential-shaped string reaches a grant, a fact, or the wire
+/// diagnostics the routed client synthesizes.
+#[test]
+fn missing_credential_diagnostics_name_the_variable_never_a_value() {
+    use relay_executor::routed_model::{ConnectionState, ProviderRegistry, ResolvedRoutePlan};
+    use relay_providers::openai::{OpenAIProvider, OpenAIProviderOptions};
+
+    let never_set = "RELAY_CAPSEC_TEST_NEVER_SET_KEY_2026_10_15";
+    let mut config = relay_config::default_config();
+    config.providers.0.insert(
+        "glm".to_owned(),
+        relay_config::ProviderConnection {
+            adapter: relay_config::AdapterKind::OpenaiChat,
+            api_key_env: Some(never_set.to_owned()),
+            base_url: Some("https://example.invalid/glm".to_owned()),
+            preset: None,
+            capabilities: relay_config::CapabilityOverrides::default(),
+        },
+    );
+
+    // The registry records the connection unavailable with the adapter's
+    // bounded reason: the variable NAME, never a value.
+    let registry = ProviderRegistry::from_effective_config(&config);
+    let reason = match registry.connection("glm") {
+        Some(ConnectionState::Unavailable { reason, .. }) => reason.clone(),
+        Some(ConnectionState::Ready { .. }) => panic!("glm must not be ready without its variable"),
+        None => panic!("glm must be registered"),
+    };
+    assert!(reason.contains(never_set), "{reason}");
+    for credential_shape in ["sk-", "sk-ant-", "Bearer "] {
+        assert!(!reason.contains(credential_shape), "{reason}");
+    }
+    assert!(registry.ready("glm").is_none());
+
+    // The adapter's own construction failure carries the same hygiene.
+    let failure = match OpenAIProvider::new(OpenAIProviderOptions {
+        api_key: None,
+        api_key_env: Some(never_set.to_owned()),
+        base_url: None,
+        capabilities: None,
+    }) {
+        Ok(_) => panic!("construction without the variable must fail"),
+        Err(failure) => failure,
+    };
+    assert!(failure.message.contains(never_set), "{}", failure.message);
+    assert!(!failure.message.contains("sk-"), "{}", failure.message);
+
+    // A grant's model route carries only the connection name — the fact
+    // surface has no room for credential-shaped strings, and the persisted
+    // JSON proves it.
+    let plan = ResolvedRoutePlan::from_normalized(
+        &relay_config::normalize_routing(&config),
+        &Default::default(),
+    );
+    let route = plan
+        .primary("intent")
+        .expect("intent resolves")
+        .route
+        .clone();
+    assert_eq!(route.provider, "fake", "the offline default stays usable");
+    let grant = grant(|grant| grant.model_route = Some(route));
+    let serialized = serde_json::to_string(&grant).unwrap();
+    assert!(!serialized.contains("sk-"), "{serialized}");
+    assert!(
+        !serialized.contains(never_set),
+        "only the connection name is recorded: {serialized}"
+    );
+}

@@ -10,10 +10,27 @@
 //! Provider wire types stay private to their adapter module and never appear
 //! in a public signature.
 //!
+//! Adapter identity is which *protocol* a connection speaks
+//! ([`AdapterKind`]: `openai-chat`, `anthropic`, `fake`), never which vendor
+//! it reaches; the user-facing *connection* identity is a configurable name
+//! (`providers.<name>`) owned by Relay's configuration, not this crate. Any
+//! number of connections can share one adapter — several `openai-chat`
+//! endpoints (OpenAI, GLM, local gateways) coexist as separate
+//! [`openai::OpenAIProvider`] instances with their own base URL, credential
+//! variable name, and effective capability profile.
+//!
+//! Each adapter enforces its connection's [`AdapterCapabilities`] profile
+//! (adapter defaults, then an optional preset such as `glm`, then explicit
+//! overrides, resolved with [`resolve_capabilities`] before construction) as
+//! a preflight before any HTTP request: a requested Relay feature is either
+//! translated by a documented rule or rejected with an actionable error,
+//! never silently downgraded.
+//!
 //! Errors are bounded and redacted: messages are trimmed to 300 characters and
 //! credential-shaped substrings are replaced before any failure is returned
-//! (see [`errors`]). API keys are read from the environment or passed in by
-//! the caller and are never logged, echoed, or embedded in errors.
+//! (see [`errors`]). API keys are read from the environment (through the
+//! connection's configured variable name) or passed in by the caller and are
+//! never logged, echoed, or embedded in errors.
 //!
 //! All tests in this crate are offline and deterministic: HTTP conformance
 //! tests replay recorded SSE fixtures through a loopback-only mock server.
@@ -28,8 +45,10 @@ mod sse;
 
 pub use collect::collect_turn;
 pub use contract::{
-    AssistantContent, CancelToken, FinishReason, JsonSchemaObject, ModelMessage, ModelProvider,
-    ModelRequest, ModelTurnResult, ProviderErrorKind, ProviderEventStream, ProviderFailure,
-    ProviderName, ProviderStreamEvent, StructuredOutput, StructuredOutputRequest, ToolCall,
-    ToolSpec,
+    ADAPTER_KINDS, AdapterCapabilities, AdapterKind, AssistantContent, CancelToken,
+    CapabilityError, CapabilityOverrides, FeatureSupport, FinishReason, InstructionStyle,
+    JsonSchemaObject, ModelMessage, ModelProvider, ModelRequest, ModelTurnResult, OutputTokenParam,
+    PRESET_NAMES, ProviderErrorKind, ProviderEventStream, ProviderFailure, ProviderStreamEvent,
+    StructuredOutput, StructuredOutputMode, StructuredOutputRequest, ToolCall, ToolSpec,
+    preset_adapter, preset_capabilities, resolve_capabilities,
 };

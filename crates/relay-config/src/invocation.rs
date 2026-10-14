@@ -4,17 +4,18 @@
 //! normalized routing view in the documented precedence — later wins:
 //!
 //! ```text
-//! configured route  <  --role <name>  <  --provider <name>  <  --model <name>
+//! configured route  <  --role <name>  <  --provider <connection>  <  --model <name>
 //! ```
 //!
 //! `--role` replaces the whole chain with one catalog role's expanded chain;
-//! `--provider` filters the chain to that provider; `--model` rewrites the
-//! model id on every surviving route. Provider *registration* (credential
-//! variables present in the environment) is a provider-time concern and is
-//! deliberately not modeled here.
+//! `--provider` filters the chain to routes on that provider *connection*
+//! (a `providers.<name>` key of the effective configuration, so the legacy
+//! `fake`/`openai`/`anthropic` spellings and any user-defined connection
+//! name all work); `--model` rewrites the model id on every surviving route.
+//! Provider *registration* (credential variables present in the environment)
+//! is a provider-time concern and is deliberately not modeled here.
 
 use crate::normalized::{NormalizedChain, NormalizedRouting};
-use crate::schema::ProviderName;
 
 /// Values carried from the parsed command line.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -22,8 +23,8 @@ pub struct InvocationOverrides {
     /// Route every call this invocation to one catalog role (with that role's
     /// fallback chain).
     pub role: Option<String>,
-    /// Keep only routes on this provider.
-    pub provider: Option<ProviderName>,
+    /// Keep only routes on this provider connection.
+    pub provider: Option<String>,
     /// Rewrite the model id on every surviving route.
     pub model: Option<String>,
 }
@@ -127,11 +128,12 @@ pub fn apply_invocation_overrides(
         )));
     }
 
-    if let Some(provider) = overrides.provider {
+    if let Some(provider) = overrides.provider.as_deref() {
         chain.retain(|route| route.provider == provider);
         if chain.is_empty() {
             return Err(RouteResolutionError::new(format!(
-                "provider override \"{provider}\" matched no route in the chain for purpose \"{purpose}\""
+                "provider connection override \"{provider}\" matched no route in the chain for \
+                 purpose \"{purpose}\""
             )));
         }
     }

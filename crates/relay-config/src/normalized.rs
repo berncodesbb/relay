@@ -5,9 +5,7 @@
 //! model router runs, everything is normalized into the concrete shapes here.
 //! The raw string/object union never leaks past this boundary.
 
-use crate::schema::{
-    ModelRoleConfig, ProviderName, RelayConfig, RouteConfig, RouteLimits, RoutingValue,
-};
+use crate::schema::{ModelRoleConfig, RelayConfig, RouteConfig, RouteLimits, RoutingValue};
 use indexmap::IndexMap;
 use std::collections::{HashSet, VecDeque};
 
@@ -18,15 +16,17 @@ pub const MAX_FALLBACKS: usize = 3;
 pub const INTENT_PURPOSE: &str = "intent";
 
 /// One concrete executable route. `role` is `None` for legacy inline routes;
-/// a role name is never fabricated.
+/// a role name is never fabricated. `provider` is a provider *connection*
+/// name (a `providers.<name>` key of the effective configuration), not an
+/// adapter kind.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct NormalizedRoute {
     /// The model-role name this route came from, or `None` for inline routes.
     /// Serialized as `null` (not omitted), matching the reference contract
     /// shape where `role` is always present on a normalized route.
     pub role: Option<String>,
-    /// The concrete provider.
-    pub provider: ProviderName,
+    /// The concrete provider connection name.
+    pub provider: String,
     /// The concrete model identifier.
     pub model: String,
     /// Optional per-route limits.
@@ -101,31 +101,44 @@ fn role_chain(primary: &str, models: &IndexMap<String, ModelRoleConfig>) -> Norm
         if let Some(definition) = models.get(&name) {
             chain.push(NormalizedRoute {
                 role: Some(name),
-                provider: definition.provider,
+                provider: definition.provider.clone(),
                 model: definition.model.clone(),
                 limits: definition.limits.clone(),
             });
         }
     }
-    chain
+    dedup_routes(chain)
 }
 
 fn inline_chain(route: &RouteConfig) -> NormalizedChain {
     let mut chain: NormalizedChain = vec![NormalizedRoute {
         role: None,
-        provider: route.provider,
+        provider: route.provider.clone(),
         model: route.model.clone(),
         limits: route.limits.clone(),
     }];
     for fallback in route.fallbacks.iter().flatten() {
         chain.push(NormalizedRoute {
             role: None,
-            provider: fallback.provider,
+            provider: fallback.provider.clone(),
             model: fallback.model.clone(),
             limits: None,
         });
     }
+    dedup_routes(chain)
+}
+
+/// Drops later routes whose `(provider connection, model)` pair was already
+/// seen: a fallback identical to an earlier route cannot succeed where the
+/// earlier one was tried, so only the first occurrence is kept. Deduplication
+/// never reorders and only ever shrinks a chain, so the
+/// one-primary-plus-[`MAX_FALLBACKS`] bound still holds.
+fn dedup_routes(chain: NormalizedChain) -> NormalizedChain {
+    let mut seen: HashSet<(String, String)> = HashSet::new();
     chain
+        .into_iter()
+        .filter(|route| seen.insert((route.provider.clone(), route.model.clone())))
+        .collect()
 }
 
 /// Expands a primary role through the role fallback graph in breadth-first

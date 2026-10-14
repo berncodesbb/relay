@@ -32,9 +32,9 @@ use relay_domain::{
 use relay_engine::SchedulingPolicy;
 use relay_engine::schedule::{Autonomy, recommend};
 use relay_executor::{
-    ExecutorSet, FactSink, ModelClient, ModelClientError, ModelTurnRequest, ModelTurnResponse,
-    Orchestrator, ProviderModelClient, ToolCallRequest, WorkspaceExecutor, WorkspacePlanner,
-    grant_from_work, sink::InMemoryFactSink,
+    ExecutorSet, FactSink, ModelCallFailure, ModelClient, ModelClientError, ModelTurnRequest,
+    ModelTurnResponse, Orchestrator, ProviderModelClient, ToolCallRequest, WorkspaceExecutor,
+    WorkspacePlanner, grant_from_work, sink::InMemoryFactSink,
 };
 use relay_providers::fake::{FakeProvider, FakeResponse};
 use serde_json::json;
@@ -160,9 +160,9 @@ impl ModelClient for RendezvousModel {
                 .unwrap_or_else(|poison| poison.into_inner());
             count = waited.0;
             if waited.1.timed_out() {
-                return Err(ModelClientError::Provider(
-                    "rendezvous timed out: attempts did not run concurrently".to_owned(),
-                ));
+                return Err(ModelClientError::Provider(ModelCallFailure::from_message(
+                    "rendezvous timed out: attempts did not run concurrently",
+                )));
             }
         }
         // A valid (empty-section) final object: the turn itself is the
@@ -171,6 +171,7 @@ impl ModelClient for RendezvousModel {
             text: "{}".to_owned(),
             input_tokens: 1,
             output_tokens: 1,
+            routes_attempted: Vec::new(),
         })
     }
 }
@@ -822,6 +823,7 @@ impl ModelClient for GuidedScriptModel {
             text,
             input_tokens: 2,
             output_tokens: 3,
+            routes_attempted: Vec::new(),
         })
     }
 }
@@ -889,4 +891,85 @@ fn a_model_guided_workspace_attempt_publishes_through_acceptance() {
             .work(&WorkItemId::parse("work_guided").unwrap())
             .unwrap()
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Routing seam (interface owner, Phase 4/5): the granted route reaches the
+// model client verbatim — the connection name the grant carries is the
+// name the client resolves, with no rewriting between grant and call.
+// ---------------------------------------------------------------------------
+
+/// A model client that records the route of every call it served.
+struct RouteRecordingModel {
+    routes: Mutex<Vec<ModelRoute>>,
+}
+
+impl ModelClient for RouteRecordingModel {
+    fn complete(
+        &self,
+        route: &ModelRoute,
+        _request: &ModelTurnRequest,
+        _signal: &relay_providers::contract::CancelToken,
+    ) -> Result<ModelTurnResponse, ModelClientError> {
+        self.routes
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(route.clone());
+        Ok(ModelTurnResponse {
+            text: "{}".to_owned(),
+            input_tokens: 1,
+            output_tokens: 1,
+            routes_attempted: vec![route.clone()],
+        })
+    }
+}
+
+#[test]
+fn the_granted_routes_connection_name_reaches_the_model_client_verbatim() {
+    let sink = Arc::new(
+        InMemoryFactSink::seeded(seed_facts(vec![model_work("work_route")])).expect("seed"),
+    );
+    // A user-chosen connection name with a role, exactly as the
+    // application's purpose-resolved grants carry them.
+    let granted = ModelRoute {
+        provider: "glm".to_owned(),
+        model: "glm-4.6".to_owned(),
+        role: Some("coding".to_owned()),
+    };
+    let ids = Arc::new(relay_executor::IdSource::new());
+    let route = granted.clone();
+    let grants: Arc<dyn Fn(&relay_domain::WorkNode) -> CapabilityGrant + Send + Sync> =
+        Arc::new(move |work| {
+            grant_from_work(
+                ids.next_grant_id(),
+                work,
+                Some(route.clone()),
+                Budget::default(),
+            )
+        });
+    let model = Arc::new(RouteRecordingModel {
+        routes: Mutex::new(Vec::new()),
+    });
+    let orchestrator = Arc::new(
+        Orchestrator::new(Arc::clone(&sink) as Arc<_>, relay_executor::system_clock())
+            .with_executors(ExecutorSet::new().with(Arc::new(relay_executor::ModelExecutor)))
+            .with_grants(grants)
+            .with_model(model.clone() as Arc<_>)
+            .with_spawn(relay_executor::inline_spawn()),
+    );
+    let report = orchestrator.tick().expect("tick");
+    assert_eq!(report.accepted.len(), 1, "{report:?}");
+
+    // The client saw the grant's route verbatim, and the started attempt's
+    // durable grant carries the same connection name.
+    let seen = model
+        .routes
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    assert_eq!(seen, vec![granted.clone()]);
+    let graph = sink.graph().expect("graph");
+    for (_, attempt) in graph.attempts() {
+        assert_eq!(attempt.grant.model_route.as_ref(), Some(&granted));
+    }
 }

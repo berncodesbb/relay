@@ -1,15 +1,18 @@
 //! Effective-configuration inspection.
 //!
 //! Library support for `relay config show` and `relay config get <key>`: a
-//! serializable view of the merged configuration (rendering the role catalog
-//! and routing map coherently — the CLI owns printing) and dotted-path lookup
-//! over that view (`models.<role>`, `routing.intent`,
-//! `models.<role>.fallbacks.0`, ...).
+//! serializable view of the merged configuration (rendering the provider
+//! connections, role catalog, and routing map coherently — the CLI owns
+//! printing) and dotted-path lookup over that view (`providers`,
+//! `providers.<name>`, `providers.<name>.baseUrl`, `models.<role>`,
+//! `routing.intent`, `models.<role>.fallbacks.0`, ...). Every connection
+//! renders its effective `adapter`, including connections whose adapter was
+//! inferred from a legacy key.
 //!
 //! The view is a [`serde_yaml::Value`] rather than a JSON value because its
 //! mappings preserve insertion order: merged-configuration key order (and
-//! catalog/routing order inside it) is part of the show/get output contract,
-//! and the reference prints these values as YAML.
+//! connection/catalog/routing order inside it) is part of the show/get output
+//! contract, and the reference prints these values as YAML.
 
 use crate::load::ConfigError;
 use crate::schema::RelayConfig;

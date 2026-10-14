@@ -41,6 +41,12 @@ pub enum AppError {
     /// Deterministic policy rejected the requested change.
     #[error("rejected: {0}")]
     Rejected(String),
+    /// Effective configuration, credentials, or route resolution failed
+    /// before any project state was created or changed. Usage/configuration
+    /// class: the interface maps this onto its usage exit code, distinct
+    /// from runtime failures.
+    #[error("configuration error: {0}")]
+    Configuration(String),
     /// The durable store failed (IO, corruption, lock, projection).
     #[error("store failure: {0}")]
     Store(#[source] relay_store::StoreError),

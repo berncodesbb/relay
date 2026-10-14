@@ -17,7 +17,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use relay_app::RuntimeWiring;
-use relay_app::providers::DEFAULT_PROVIDER;
 use relay_app::session::SessionOptions;
 use relay_domain::{
     ArtifactDigest, AttemptOutcome, AttemptReceipt, ExecutorClass, OutputProposal, Usage,
@@ -123,11 +122,6 @@ fn plain_deps() -> CliDeps {
     )
 }
 
-fn production_deps() -> CliDeps {
-    let _ = DEFAULT_PROVIDER;
-    CliDeps::production(None)
-}
-
 // ---------------------------------------------------------------------------
 // Scripted executors (offline, deterministic)
 // ---------------------------------------------------------------------------
@@ -204,6 +198,7 @@ impl ModelClient for EchoModel {
             text: format!("echo: {}", request.prompt),
             input_tokens: 1,
             output_tokens: 1,
+            routes_attempted: Vec::new(),
         })
     }
 }
@@ -948,5 +943,139 @@ fn run_never_auto_resolves_human_decisions() {
         open >= 1,
         "the clarification is still awaiting a human: {value}"
     );
-    let _ = production_deps();
+}
+
+// ---------------------------------------------------------------------------
+// Offline default characterization (plan Phase 0.1)
+// ---------------------------------------------------------------------------
+
+/// A fresh workspace with no configuration files and no credentials: bare
+/// `relay run` on the production wiring completes offline through the
+/// in-process fake provider (the only provider the default constructs), so
+/// no network call is possible. This behavior must survive the
+/// configuration-driven routing change unchanged.
+#[test]
+fn a_bare_run_completes_offline_on_the_fake_provider_without_configuration() {
+    let dir = tempfile::tempdir().ok().unwrap();
+    let root = dir.path();
+    // init declares the project (no provider involvement).
+    let (code, _out, err) = drive(
+        root,
+        &["init", "--goal", "export team reports as CSV"],
+        false,
+        CliDeps::production(None),
+    );
+    assert_eq!(code, EXIT_OK, "{err}");
+    // Answer the clarification so discovery work is ready to run.
+    let (code, out, err) = drive(
+        root,
+        &["decisions", "list", "--json"],
+        true,
+        CliDeps::production(None),
+    );
+    assert_eq!(code, EXIT_OK, "{err}");
+    let value: serde_json::Value = serde_json::from_str(out.trim()).ok().unwrap();
+    let id = value["decisions"][0]["id"].as_str().unwrap().to_string();
+    let (code, _out, err) = drive(
+        root,
+        &["decisions", "resolve", &id, "--choice", "csv export"],
+        false,
+        CliDeps::production(None),
+    );
+    assert_eq!(code, EXIT_OK, "{err}");
+
+    // The bare run: production deps, no --provider, no relay.config.yaml,
+    // no credentials. It completes (exit 0); the attempt's model call was
+    // served by the offline fake.
+    let (code, out, err) = drive(root, &["run"], true, CliDeps::production(None));
+    assert_eq!(code, EXIT_OK, "{err}");
+    let value: serde_json::Value = serde_json::from_str(out.trim()).ok().unwrap();
+    let ticks = value["ticks"].as_array().cloned().unwrap_or_default();
+    assert!(!ticks.is_empty(), "a tick ran offline: {out}");
+    // The model attempt ran and was answered by the fake (it fails the
+    // strict final-object decode, which is the truthful offline outcome —
+    // what matters is that the run completed without any provider or
+    // transport error).
+    assert!(
+        !ticks[0]["started"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .is_empty(),
+        "the discovery attempt started: {ticks:?}"
+    );
+    assert!(err.is_empty(), "no provider diagnostics: {err}");
+}
+
+/// `relay --print "hello"` in a fresh workspace with no configuration and no
+/// credentials: one scripted conversational turn through the offline fake,
+/// deterministic output, exit 0.
+#[test]
+fn print_completes_offline_on_the_fake_provider_without_configuration() {
+    let dir = tempfile::tempdir().ok().unwrap();
+    let root = dir.path();
+    let (code, out, err) = drive(
+        root,
+        &["--print", "hello"],
+        false,
+        CliDeps::production(None),
+    );
+    assert_eq!(code, EXIT_OK, "{err}");
+    assert_eq!(out, "hello\n", "the fake echoes the prompt: {out}");
+    assert!(err.is_empty(), "{err}");
+    // The turn is durable: the fresh workspace now carries the project,
+    // conversation, and turn facts — created by the turn, not before.
+    assert!(
+        root.join(".relay-graph").is_dir(),
+        "the scripted turn recorded durable facts"
+    );
+}
+
+/// The offline default survives a polluted environment: driving the real
+/// binary with sentinel credentials set (through `Command::env`, never
+/// `std::env::set_var`) must not tempt the default into a live call — the
+/// run and print paths still complete offline, and the sentinel never
+/// appears in any output.
+#[test]
+fn the_offline_default_survives_credential_pollution_in_the_environment() {
+    let dir = tempfile::tempdir().ok().unwrap();
+    let root = dir.path();
+    let sentinel_openai = "sk-openai-characterization-not-a-real-key";
+    let sentinel_anthropic = "sk-ant-characterization-not-a-real-key";
+    let invoke = |argv: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_relay"))
+            .current_dir(root)
+            .args(argv)
+            .env("OPENAI_API_KEY", sentinel_openai)
+            .env("ANTHROPIC_API_KEY", sentinel_anthropic)
+            .output()
+            .ok()
+            .unwrap()
+    };
+    // One scripted print turn: offline, deterministic, no secret echoed.
+    let output = invoke(&["--print", "hello from the polluted environment"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(stdout, "hello from the polluted environment\n", "{stdout}");
+    for text in [&stdout, &stderr] {
+        assert!(!text.contains(sentinel_openai), "{text}");
+        assert!(!text.contains(sentinel_anthropic), "{text}");
+    }
+    // And a bare run over the now-existing project completes offline too
+    // (the print turn created it; there is no ready work, so nothing runs).
+    let output = invoke(&["run"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !root.join("relay.config.yaml").exists(),
+        "no configuration file was invented"
+    );
 }

@@ -1,13 +1,17 @@
 //! Golden corpus verified against the TypeScript reference implementation
 //! (`src/config/**` as of the model-role routing work; that tree was removed
-//! from the repository 2026-10-14). Each case records the
-//! TypeScript behavior exactly: parsed-layer value equality for valid layers
-//! and byte-identical diagnostic strings for invalid ones, plus
-//! effective-validation scenarios on merged configurations.
+//! from the repository 2026-10-14). Each case records the TypeScript behavior
+//! exactly: parsed-layer value equality for valid layers and byte-identical
+//! diagnostic strings for invalid ones, plus effective-validation scenarios
+//! on merged configurations.
 //!
 //! The TypeScript oracle is retired, so this corpus is now frozen historical
 //! evidence; the expectations are checked in so the tests stay offline and
-//! deterministic.
+//! deterministic. The provider-connection generalization updated the
+//! providers shape (connections are now a named map carrying its effective
+//! adapter) and the provider-reference diagnostics (references are validated
+//! against the merged connection map instead of a closed enum); every other
+//! expectation is unchanged.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -37,7 +41,7 @@ routing:
   verification: review
   delivery: fast"#,
         TsOutcome::Ok(
-            r#"{"version":1,"providers":{"openai":{"apiKeyEnv":"OPENAI_API_KEY"},"anthropic":{"apiKeyEnv":"ANTHROPIC_API_KEY"}},"routing":{"intent":"fast","discovery":"reasoning","specification":"reasoning","technical-design":"architect","planning":"reasoning","implementation":"coding","verification":"review","delivery":"fast"},"models":{"reasoning":{"provider":"anthropic","model":"claude-sonnet-5-5"},"architect":{"provider":"anthropic","model":"claude-opus-5-5"},"coding":{"provider":"anthropic","model":"claude-sonnet-5-5"},"review":{"provider":"openai","model":"gpt-5.2","fallbacks":["reasoning"]},"fast":{"provider":"anthropic","model":"claude-haiku-4-5"}},"budgets":{"maxTurns":24,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":1800000,"maxRepeatedActions":3},"autonomy":"next-checkpoint","tools":{"commandTimeoutMs":120000,"maxSearchResults":200,"maxFileBytes":2000000}}"#,
+            r#"{"version":1,"providers":{"openai":{"adapter":"openai-chat","apiKeyEnv":"OPENAI_API_KEY"},"anthropic":{"adapter":"anthropic","apiKeyEnv":"ANTHROPIC_API_KEY"}},"routing":{"intent":"fast","discovery":"reasoning","specification":"reasoning","technical-design":"architect","planning":"reasoning","implementation":"coding","verification":"review","delivery":"fast"},"models":{"reasoning":{"provider":"anthropic","model":"claude-sonnet-5-5"},"architect":{"provider":"anthropic","model":"claude-opus-5-5"},"coding":{"provider":"anthropic","model":"claude-sonnet-5-5"},"review":{"provider":"openai","model":"gpt-5.2","fallbacks":["reasoning"]},"fast":{"provider":"anthropic","model":"claude-haiku-4-5"}},"budgets":{"maxTurns":24,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":1800000,"maxRepeatedActions":3},"autonomy":"next-checkpoint","tools":{"commandTimeoutMs":120000,"maxSearchResults":200,"maxFileBytes":2000000}}"#,
         ),
     ),
     (
@@ -57,7 +61,7 @@ routing:
   verification: { provider: openai, model: gpt-5.2 }
   delivery: fast"#,
         TsOutcome::Ok(
-            r#"{"version":1,"providers":{"openai":{"apiKeyEnv":"OPENAI_API_KEY"},"anthropic":{"apiKeyEnv":"ANTHROPIC_API_KEY"}},"routing":{"intent":"fast","discovery":"limited","specification":"reasoning-unknown","technical-design":{"provider":"anthropic","model":"claude-opus-5-5","fallbacks":[{"provider":"openai","model":"gpt-5.2"}]},"planning":{"provider":"anthropic","model":"claude-sonnet-5-5"},"implementation":{"provider":"anthropic","model":"claude-sonnet-5-5"},"verification":{"provider":"openai","model":"gpt-5.2"},"delivery":"fast"},"models":{"fast":{"provider":"anthropic","model":"claude-haiku-4-5"},"limited":{"provider":"openai","model":"gpt-5.2","limits":{"maxOutputTokens":8192,"temperature":0.3}}},"budgets":{"maxTurns":24,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":1800000,"maxRepeatedActions":3},"autonomy":"next-checkpoint","tools":{"commandTimeoutMs":120000,"maxSearchResults":200,"maxFileBytes":2000000}}"#,
+            r#"{"version":1,"providers":{"openai":{"adapter":"openai-chat","apiKeyEnv":"OPENAI_API_KEY"},"anthropic":{"adapter":"anthropic","apiKeyEnv":"ANTHROPIC_API_KEY"}},"routing":{"intent":"fast","discovery":"limited","specification":"reasoning-unknown","technical-design":{"provider":"anthropic","model":"claude-opus-5-5","fallbacks":[{"provider":"openai","model":"gpt-5.2"}]},"planning":{"provider":"anthropic","model":"claude-sonnet-5-5"},"implementation":{"provider":"anthropic","model":"claude-sonnet-5-5"},"verification":{"provider":"openai","model":"gpt-5.2"},"delivery":"fast"},"models":{"fast":{"provider":"anthropic","model":"claude-haiku-4-5"},"limited":{"provider":"openai","model":"gpt-5.2","limits":{"maxOutputTokens":8192,"temperature":0.3}}},"budgets":{"maxTurns":24,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":1800000,"maxRepeatedActions":3},"autonomy":"next-checkpoint","tools":{"commandTimeoutMs":120000,"maxSearchResults":200,"maxFileBytes":2000000}}"#,
         ),
     ),
     (
@@ -73,7 +77,7 @@ routing:
   verification: { provider: openai, model: gpt-5.2 }
   delivery: { provider: anthropic, model: claude-haiku-4-5 }"#,
         TsOutcome::Ok(
-            r#"{"version":1,"providers":{"openai":{"apiKeyEnv":"OPENAI_API_KEY"},"anthropic":{"apiKeyEnv":"ANTHROPIC_API_KEY"}},"routing":{"discovery":{"provider":"anthropic","model":"claude-sonnet-5-5"},"specification":{"provider":"anthropic","model":"claude-sonnet-5-5"},"technical-design":{"provider":"anthropic","model":"claude-opus-5-5"},"planning":{"provider":"openai","model":"gpt-5-mini","fallbacks":[{"provider":"anthropic","model":"claude-sonnet-5-5"}]},"implementation":{"provider":"anthropic","model":"claude-sonnet-5-5"},"verification":{"provider":"openai","model":"gpt-5.2"},"delivery":{"provider":"anthropic","model":"claude-haiku-4-5"}},"budgets":{"maxTurns":24,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":1800000,"maxRepeatedActions":3},"autonomy":"next-checkpoint","tools":{"commandTimeoutMs":120000,"maxSearchResults":200,"maxFileBytes":2000000}}"#,
+            r#"{"version":1,"providers":{"openai":{"adapter":"openai-chat","apiKeyEnv":"OPENAI_API_KEY"},"anthropic":{"adapter":"anthropic","apiKeyEnv":"ANTHROPIC_API_KEY"}},"routing":{"discovery":{"provider":"anthropic","model":"claude-sonnet-5-5"},"specification":{"provider":"anthropic","model":"claude-sonnet-5-5"},"technical-design":{"provider":"anthropic","model":"claude-opus-5-5"},"planning":{"provider":"openai","model":"gpt-5-mini","fallbacks":[{"provider":"anthropic","model":"claude-sonnet-5-5"}]},"implementation":{"provider":"anthropic","model":"claude-sonnet-5-5"},"verification":{"provider":"openai","model":"gpt-5.2"},"delivery":{"provider":"anthropic","model":"claude-haiku-4-5"}},"budgets":{"maxTurns":24,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":1800000,"maxRepeatedActions":3},"autonomy":"next-checkpoint","tools":{"commandTimeoutMs":120000,"maxSearchResults":200,"maxFileBytes":2000000}}"#,
         ),
     ),
     (
@@ -92,7 +96,7 @@ routing:
   verification: { provider: openai, model: m2 }
   delivery: { provider: anthropic, model: m1 }"#,
         TsOutcome::Ok(
-            r#"{"version":1,"providers":{"openai":{"apiKeyEnv":"MY_OPENAI_KEY","baseUrl":"https://gw.example/v1"},"anthropic":{"apiKeyEnv":"OPENAI_API_KEY","baseUrl":"https://anthro.example"}},"routing":{"discovery":{"provider":"anthropic","model":"m1"},"specification":{"provider":"anthropic","model":"m1"},"technical-design":{"provider":"anthropic","model":"m1"},"planning":{"provider":"anthropic","model":"m1"},"implementation":{"provider":"anthropic","model":"m1"},"verification":{"provider":"openai","model":"m2"},"delivery":{"provider":"anthropic","model":"m1"}},"budgets":{"maxTurns":24,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":1800000,"maxRepeatedActions":3},"autonomy":"next-checkpoint","tools":{"commandTimeoutMs":120000,"maxSearchResults":200,"maxFileBytes":2000000}}"#,
+            r#"{"version":1,"providers":{"openai":{"adapter":"openai-chat","apiKeyEnv":"MY_OPENAI_KEY","baseUrl":"https://gw.example/v1"},"anthropic":{"adapter":"anthropic","apiKeyEnv":"OPENAI_API_KEY","baseUrl":"https://anthro.example"}},"routing":{"discovery":{"provider":"anthropic","model":"m1"},"specification":{"provider":"anthropic","model":"m1"},"technical-design":{"provider":"anthropic","model":"m1"},"planning":{"provider":"anthropic","model":"m1"},"implementation":{"provider":"anthropic","model":"m1"},"verification":{"provider":"openai","model":"m2"},"delivery":{"provider":"anthropic","model":"m1"}},"budgets":{"maxTurns":24,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":1800000,"maxRepeatedActions":3},"autonomy":"next-checkpoint","tools":{"commandTimeoutMs":120000,"maxSearchResults":200,"maxFileBytes":2000000}}"#,
         ),
     ),
     (
@@ -109,7 +113,77 @@ routing:
   verification: { provider: openai, model: m2 }
   delivery: { provider: anthropic, model: m1 }"#,
         TsOutcome::Ok(
-            r#"{"version":1,"providers":{"openai":{"apiKeyEnv":"OPENAI_API_KEY"},"anthropic":{"apiKeyEnv":"OPENAI_API_KEY"}},"routing":{"discovery":{"provider":"anthropic","model":"m1"},"specification":{"provider":"anthropic","model":"m1"},"technical-design":{"provider":"anthropic","model":"m1"},"planning":{"provider":"anthropic","model":"m1"},"implementation":{"provider":"anthropic","model":"m1"},"verification":{"provider":"openai","model":"m2"},"delivery":{"provider":"anthropic","model":"m1"}},"budgets":{"maxTurns":24,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":1800000,"maxRepeatedActions":3},"autonomy":"next-checkpoint","tools":{"commandTimeoutMs":120000,"maxSearchResults":200,"maxFileBytes":2000000}}"#,
+            r#"{"version":1,"providers":{"anthropic":{"adapter":"anthropic","apiKeyEnv":"OPENAI_API_KEY"},"openai":{"adapter":"openai-chat","apiKeyEnv":"OPENAI_API_KEY"}},"routing":{"discovery":{"provider":"anthropic","model":"m1"},"specification":{"provider":"anthropic","model":"m1"},"technical-design":{"provider":"anthropic","model":"m1"},"planning":{"provider":"anthropic","model":"m1"},"implementation":{"provider":"anthropic","model":"m1"},"verification":{"provider":"openai","model":"m2"},"delivery":{"provider":"anthropic","model":"m1"}},"budgets":{"maxTurns":24,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":1800000,"maxRepeatedActions":3},"autonomy":"next-checkpoint","tools":{"commandTimeoutMs":120000,"maxSearchResults":200,"maxFileBytes":2000000}}"#,
+        ),
+    ),
+    (
+        "named_connections",
+        r#"version: 1
+budgets: {}
+providers:
+  glm:
+    adapter: openai-chat
+    baseUrl: https://api.z.ai/api/paas/v4
+    apiKeyEnv: GLM_API_KEY
+    preset: glm
+  local:
+    adapter: openai-chat
+    baseUrl: http://localhost:8080/v1
+models:
+  reasoning: { provider: glm, model: glm-4.7 }
+  coding: { provider: local, model: qwen3-coder }
+routing:
+  intent: fast
+  discovery: reasoning
+  specification: reasoning
+  technical-design: architect
+  planning: reasoning
+  implementation: coding
+  verification: review
+  delivery: fast"#,
+        TsOutcome::Ok(
+            r#"{"version":1,"providers":{"glm":{"adapter":"openai-chat","apiKeyEnv":"GLM_API_KEY","baseUrl":"https://api.z.ai/api/paas/v4","preset":"glm"},"local":{"adapter":"openai-chat","apiKeyEnv":"OPENAI_API_KEY","baseUrl":"http://localhost:8080/v1"},"openai":{"adapter":"openai-chat","apiKeyEnv":"OPENAI_API_KEY"},"anthropic":{"adapter":"anthropic","apiKeyEnv":"ANTHROPIC_API_KEY"}},"routing":{"intent":"fast","discovery":"reasoning","specification":"reasoning","technical-design":"architect","planning":"reasoning","implementation":"coding","verification":"review","delivery":"fast"},"models":{"reasoning":{"provider":"glm","model":"glm-4.7"},"coding":{"provider":"local","model":"qwen3-coder"}},"budgets":{"maxTurns":24,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":1800000,"maxRepeatedActions":3},"autonomy":"next-checkpoint","tools":{"commandTimeoutMs":120000,"maxSearchResults":200,"maxFileBytes":2000000}}"#,
+        ),
+    ),
+    (
+        "capabilities_override",
+        r#"version: 1
+budgets: {}
+providers:
+  glm:
+    adapter: openai-chat
+    preset: glm
+    capabilities:
+      instructions: system-instruction
+      structuredOutput: json-schema
+routing:
+  discovery: { provider: anthropic, model: m1 }
+  specification: { provider: anthropic, model: m1 }
+  technical-design: { provider: anthropic, model: m1 }
+  planning: { provider: anthropic, model: m1 }
+  implementation: { provider: anthropic, model: m1 }
+  verification: { provider: openai, model: m2 }
+  delivery: { provider: anthropic, model: m1 }"#,
+        TsOutcome::Ok(
+            r#"{"version":1,"providers":{"glm":{"adapter":"openai-chat","apiKeyEnv":"OPENAI_API_KEY","preset":"glm","capabilities":{"instructions":"system-instruction","toolCalls":null,"streamedToolArguments":null,"parallelToolCalls":null,"structuredOutput":"json-schema","streamedUsage":null,"outputTokenParam":null,"imageInput":null}},"openai":{"adapter":"openai-chat","apiKeyEnv":"OPENAI_API_KEY"},"anthropic":{"adapter":"anthropic","apiKeyEnv":"ANTHROPIC_API_KEY"}},"routing":{"discovery":{"provider":"anthropic","model":"m1"},"specification":{"provider":"anthropic","model":"m1"},"technical-design":{"provider":"anthropic","model":"m1"},"planning":{"provider":"anthropic","model":"m1"},"implementation":{"provider":"anthropic","model":"m1"},"verification":{"provider":"openai","model":"m2"},"delivery":{"provider":"anthropic","model":"m1"}},"budgets":{"maxTurns":24,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":1800000,"maxRepeatedActions":3},"autonomy":"next-checkpoint","tools":{"commandTimeoutMs":120000,"maxSearchResults":200,"maxFileBytes":2000000}}"#,
+        ),
+    ),
+    (
+        "explicit_fake_connection",
+        r#"version: 1
+budgets: {}
+providers:
+  fake: {}
+routing:
+  discovery: { provider: fake, model: m1 }
+  specification: { provider: fake, model: m1 }
+  technical-design: { provider: fake, model: m1 }
+  planning: { provider: fake, model: m1 }
+  implementation: { provider: fake, model: m1 }
+  verification: { provider: fake, model: m2 }
+  delivery: { provider: fake, model: m1 }"#,
+        TsOutcome::Ok(
+            r#"{"version":1,"providers":{"fake":{"adapter":"fake"},"openai":{"adapter":"openai-chat","apiKeyEnv":"OPENAI_API_KEY"},"anthropic":{"adapter":"anthropic","apiKeyEnv":"ANTHROPIC_API_KEY"}},"routing":{"discovery":{"provider":"fake","model":"m1"},"specification":{"provider":"fake","model":"m1"},"technical-design":{"provider":"fake","model":"m1"},"planning":{"provider":"fake","model":"m1"},"implementation":{"provider":"fake","model":"m1"},"verification":{"provider":"fake","model":"m2"},"delivery":{"provider":"fake","model":"m1"}},"budgets":{"maxTurns":24,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":1800000,"maxRepeatedActions":3},"autonomy":"next-checkpoint","tools":{"commandTimeoutMs":120000,"maxSearchResults":200,"maxFileBytes":2000000}}"#,
         ),
     ),
     (
@@ -126,7 +200,7 @@ routing:
   verification: { provider: openai, model: m2 }
   delivery: { provider: anthropic, model: m1 }"#,
         TsOutcome::Ok(
-            r#"{"version":1,"providers":{"openai":{"apiKeyEnv":"OPENAI_API_KEY"},"anthropic":{"apiKeyEnv":"ANTHROPIC_API_KEY"}},"routing":{"discovery":{"provider":"anthropic","model":"m1"},"specification":{"provider":"anthropic","model":"m1"},"technical-design":{"provider":"anthropic","model":"m1"},"planning":{"provider":"anthropic","model":"m1"},"implementation":{"provider":"anthropic","model":"m1"},"verification":{"provider":"openai","model":"m2"},"delivery":{"provider":"anthropic","model":"m1"}},"budgets":{"maxTurns":24,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":1800000,"maxRepeatedActions":3},"autonomy":"until:implementation","tools":{"commandTimeoutMs":120000,"maxSearchResults":200,"maxFileBytes":2000000}}"#,
+            r#"{"version":1,"providers":{"openai":{"adapter":"openai-chat","apiKeyEnv":"OPENAI_API_KEY"},"anthropic":{"adapter":"anthropic","apiKeyEnv":"ANTHROPIC_API_KEY"}},"routing":{"discovery":{"provider":"anthropic","model":"m1"},"specification":{"provider":"anthropic","model":"m1"},"technical-design":{"provider":"anthropic","model":"m1"},"planning":{"provider":"anthropic","model":"m1"},"implementation":{"provider":"anthropic","model":"m1"},"verification":{"provider":"openai","model":"m2"},"delivery":{"provider":"anthropic","model":"m1"}},"budgets":{"maxTurns":24,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":1800000,"maxRepeatedActions":3},"autonomy":"until:implementation","tools":{"commandTimeoutMs":120000,"maxSearchResults":200,"maxFileBytes":2000000}}"#,
         ),
     ),
     (
@@ -143,7 +217,7 @@ routing:
   verification: { provider: openai, model: m2 }
   delivery: { provider: anthropic, model: m1 }"#,
         TsOutcome::Ok(
-            r#"{"version":1,"providers":{"openai":{"apiKeyEnv":"OPENAI_API_KEY"},"anthropic":{"apiKeyEnv":"ANTHROPIC_API_KEY"}},"routing":{"discovery":{"provider":"anthropic","model":"m1"},"specification":{"provider":"anthropic","model":"m1"},"technical-design":{"provider":"anthropic","model":"m1"},"planning":{"provider":"anthropic","model":"m1"},"implementation":{"provider":"anthropic","model":"m1"},"verification":{"provider":"openai","model":"m2"},"delivery":{"provider":"anthropic","model":"m1"}},"budgets":{"maxTurns":7,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":600000,"maxRepeatedActions":3},"autonomy":"next-checkpoint","tools":{"commandTimeoutMs":120000,"maxSearchResults":5,"maxFileBytes":2000000}}"#,
+            r#"{"version":1,"providers":{"openai":{"adapter":"openai-chat","apiKeyEnv":"OPENAI_API_KEY"},"anthropic":{"adapter":"anthropic","apiKeyEnv":"ANTHROPIC_API_KEY"}},"routing":{"discovery":{"provider":"anthropic","model":"m1"},"specification":{"provider":"anthropic","model":"m1"},"technical-design":{"provider":"anthropic","model":"m1"},"planning":{"provider":"anthropic","model":"m1"},"implementation":{"provider":"anthropic","model":"m1"},"verification":{"provider":"openai","model":"m2"},"delivery":{"provider":"anthropic","model":"m1"}},"budgets":{"maxTurns":7,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":600000,"maxRepeatedActions":3},"autonomy":"next-checkpoint","tools":{"commandTimeoutMs":120000,"maxSearchResults":5,"maxFileBytes":2000000}}"#,
         ),
     ),
     (
@@ -160,7 +234,7 @@ routing:
   verification: { provider: openai, model: m2 }
   delivery: { provider: anthropic, model: m1 }"#,
         TsOutcome::Ok(
-            r#"{"version":1,"providers":{"openai":{"apiKeyEnv":"OPENAI_API_KEY"},"anthropic":{"apiKeyEnv":"ANTHROPIC_API_KEY"}},"routing":{"discovery":{"provider":"anthropic","model":"m1"},"specification":{"provider":"anthropic","model":"m1"},"technical-design":{"provider":"anthropic","model":"m1"},"planning":{"provider":"anthropic","model":"m1"},"implementation":{"provider":"anthropic","model":"m1"},"verification":{"provider":"openai","model":"m2"},"delivery":{"provider":"anthropic","model":"m1"}},"budgets":{"maxTurns":24,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":1800000,"maxRepeatedActions":3},"autonomy":"next-checkpoint","tools":{"commandTimeoutMs":120000,"maxSearchResults":200,"maxFileBytes":2000000}}"#,
+            r#"{"version":1,"providers":{"openai":{"adapter":"openai-chat","apiKeyEnv":"OPENAI_API_KEY"},"anthropic":{"adapter":"anthropic","apiKeyEnv":"ANTHROPIC_API_KEY"}},"routing":{"discovery":{"provider":"anthropic","model":"m1"},"specification":{"provider":"anthropic","model":"m1"},"technical-design":{"provider":"anthropic","model":"m1"},"planning":{"provider":"anthropic","model":"m1"},"implementation":{"provider":"anthropic","model":"m1"},"verification":{"provider":"openai","model":"m2"},"delivery":{"provider":"anthropic","model":"m1"}},"budgets":{"maxTurns":24,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":1800000,"maxRepeatedActions":3},"autonomy":"next-checkpoint","tools":{"commandTimeoutMs":120000,"maxSearchResults":200,"maxFileBytes":2000000}}"#,
         ),
     ),
     (
@@ -176,7 +250,7 @@ routing:
   verification: { provider: openai, model: m2 }
   delivery: { provider: anthropic, model: m1 }"#,
         TsOutcome::Ok(
-            r#"{"version":1,"providers":{"openai":{"apiKeyEnv":"OPENAI_API_KEY"},"anthropic":{"apiKeyEnv":"ANTHROPIC_API_KEY"}},"routing":{"discovery":{"provider":"openai","model":"gpt-5.2","fallbacks":[{"provider":"anthropic","model":"claude-sonnet-5-5"}],"limits":{"temperature":0.1}},"specification":{"provider":"anthropic","model":"m1"},"technical-design":{"provider":"anthropic","model":"m1"},"planning":{"provider":"anthropic","model":"m1"},"implementation":{"provider":"anthropic","model":"m1"},"verification":{"provider":"openai","model":"m2"},"delivery":{"provider":"anthropic","model":"m1"}},"budgets":{"maxTurns":24,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":1800000,"maxRepeatedActions":3},"autonomy":"next-checkpoint","tools":{"commandTimeoutMs":120000,"maxSearchResults":200,"maxFileBytes":2000000}}"#,
+            r#"{"version":1,"providers":{"openai":{"adapter":"openai-chat","apiKeyEnv":"OPENAI_API_KEY"},"anthropic":{"adapter":"anthropic","apiKeyEnv":"ANTHROPIC_API_KEY"}},"routing":{"discovery":{"provider":"openai","model":"gpt-5.2","fallbacks":[{"provider":"anthropic","model":"claude-sonnet-5-5"}],"limits":{"temperature":0.1}},"specification":{"provider":"anthropic","model":"m1"},"technical-design":{"provider":"anthropic","model":"m1"},"planning":{"provider":"anthropic","model":"m1"},"implementation":{"provider":"anthropic","model":"m1"},"verification":{"provider":"openai","model":"m2"},"delivery":{"provider":"anthropic","model":"m1"}},"budgets":{"maxTurns":24,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":1800000,"maxRepeatedActions":3},"autonomy":"next-checkpoint","tools":{"commandTimeoutMs":120000,"maxSearchResults":200,"maxFileBytes":2000000}}"#,
         ),
     ),
     (
@@ -194,7 +268,26 @@ routing:
   verification: { provider: openai, model: m2 }
   delivery: { provider: anthropic, model: m1 }"#,
         TsOutcome::Ok(
-            r#"{"version":1,"providers":{"openai":{"apiKeyEnv":"OPENAI_API_KEY"},"anthropic":{"apiKeyEnv":"ANTHROPIC_API_KEY"}},"routing":{"discovery":{"provider":"anthropic","model":"m1"},"specification":{"provider":"anthropic","model":"m1"},"technical-design":{"provider":"anthropic","model":"m1"},"planning":{"provider":"anthropic","model":"m1"},"implementation":{"provider":"anthropic","model":"m1"},"verification":{"provider":"openai","model":"m2"},"delivery":{"provider":"anthropic","model":"m1"}},"models":{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa":{"provider":"anthropic","model":"m1"}},"budgets":{"maxTurns":24,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":1800000,"maxRepeatedActions":3},"autonomy":"next-checkpoint","tools":{"commandTimeoutMs":120000,"maxSearchResults":200,"maxFileBytes":2000000}}"#,
+            r#"{"version":1,"providers":{"openai":{"adapter":"openai-chat","apiKeyEnv":"OPENAI_API_KEY"},"anthropic":{"adapter":"anthropic","apiKeyEnv":"ANTHROPIC_API_KEY"}},"routing":{"discovery":{"provider":"anthropic","model":"m1"},"specification":{"provider":"anthropic","model":"m1"},"technical-design":{"provider":"anthropic","model":"m1"},"planning":{"provider":"anthropic","model":"m1"},"implementation":{"provider":"anthropic","model":"m1"},"verification":{"provider":"openai","model":"m2"},"delivery":{"provider":"anthropic","model":"m1"}},"models":{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa":{"provider":"anthropic","model":"m1"}},"budgets":{"maxTurns":24,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":1800000,"maxRepeatedActions":3},"autonomy":"next-checkpoint","tools":{"commandTimeoutMs":120000,"maxSearchResults":200,"maxFileBytes":2000000}}"#,
+        ),
+    ),
+    (
+        "provider_typo_deferred",
+        // `openaai` is a syntactically valid connection name, so the layer
+        // parses; the existence of the connection is checked on the merged
+        // configuration (see the unknown_inline_connection effective case).
+        r#"version: 1
+budgets: {}
+routing:
+  discovery: { provider: openaai, model: m1 }
+  specification: { provider: anthropic, model: m1 }
+  technical-design: { provider: anthropic, model: m1 }
+  planning: { provider: anthropic, model: m1 }
+  implementation: { provider: anthropic, model: m1 }
+  verification: { provider: openai, model: m2 }
+  delivery: { provider: anthropic, model: m1 }"#,
+        TsOutcome::Ok(
+            r#"{"version":1,"providers":{"openai":{"adapter":"openai-chat","apiKeyEnv":"OPENAI_API_KEY"},"anthropic":{"adapter":"anthropic","apiKeyEnv":"ANTHROPIC_API_KEY"}},"routing":{"discovery":{"provider":"openaai","model":"m1"},"specification":{"provider":"anthropic","model":"m1"},"technical-design":{"provider":"anthropic","model":"m1"},"planning":{"provider":"anthropic","model":"m1"},"implementation":{"provider":"anthropic","model":"m1"},"verification":{"provider":"openai","model":"m2"},"delivery":{"provider":"anthropic","model":"m1"}},"budgets":{"maxTurns":24,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":1800000,"maxRepeatedActions":3},"autonomy":"next-checkpoint","tools":{"commandTimeoutMs":120000,"maxSearchResults":200,"maxFileBytes":2000000}}"#,
         ),
     ),
     (
@@ -278,11 +371,11 @@ routing:
         ]),
     ),
     (
-        "bad_provider_typo",
+        "bad_provider_syntax",
         r#"version: 1
 budgets: {}
 routing:
-  discovery: { provider: openaai, model: m1 }
+  discovery: { provider: OpenAI, model: m1 }
   specification: { provider: anthropic, model: m1 }
   technical-design: { provider: anthropic, model: m1 }
   planning: { provider: anthropic, model: m1 }
@@ -290,7 +383,7 @@ routing:
   verification: { provider: openai, model: m2 }
   delivery: { provider: anthropic, model: m1 }"#,
         TsOutcome::Invalid(&[
-            "routing.discovery: routing values must be a model-role name (a lowercase kebab-case string referencing a models entry) or an inline route object with provider and model",
+            "routing.discovery.provider: provider must be a provider connection name (lowercase kebab-case, e.g. openai, glm)",
         ]),
     ),
     (
@@ -346,7 +439,7 @@ routing:
         r#"version: 1
 budgets: {}
 routing:
-  discovery: { provider: anthropic, model: m1, fallbacks: [{ provider: openaai, model: a }] }
+  discovery: { provider: anthropic, model: m1, fallbacks: [{ provider: OpenAI, model: a }] }
   specification: { provider: anthropic, model: m1 }
   technical-design: { provider: anthropic, model: m1 }
   planning: { provider: anthropic, model: m1 }
@@ -354,11 +447,13 @@ routing:
   verification: { provider: openai, model: m2 }
   delivery: { provider: anthropic, model: m1 }"#,
         TsOutcome::Invalid(&[
-            "routing.discovery: routing values must be a model-role name (a lowercase kebab-case string referencing a models entry) or an inline route object with provider and model",
+            "routing.discovery.fallbacks.0.provider: provider must be a provider connection name (lowercase kebab-case, e.g. openai, glm)",
         ]),
     ),
     (
         "soft_plus_hard_route",
+        // A syntactically valid (if unknown) provider no longer aborts the
+        // routing union, so the soft issues surface with their own paths.
         r#"version: 1
 budgets: {}
 routing:
@@ -370,7 +465,8 @@ routing:
   verification: { provider: openai, model: m2 }
   delivery: { provider: anthropic, model: m1 }"#,
         TsOutcome::Invalid(&[
-            "routing.discovery: routing values must be a model-role name (a lowercase kebab-case string referencing a models entry) or an inline route object with provider and model",
+            "routing.discovery.model: Too small: expected string to have >=1 characters",
+            "routing.discovery.limits.temperature: Too big: expected number to be <=2",
         ]),
     ),
     (
@@ -389,6 +485,101 @@ routing:
             "routing.discovery.model: Too small: expected string to have >=1 characters",
             "routing.discovery.limits.maxOutputTokens: Too small: expected number to be >=256",
             "routing.discovery.limits.temperature: Too big: expected number to be <=2",
+        ]),
+    ),
+    (
+        "adapter_unknown",
+        r#"version: 1
+budgets: {}
+providers:
+  glm:
+    adapter: bedrock
+routing:
+  discovery: { provider: anthropic, model: m1 }
+  specification: { provider: anthropic, model: m1 }
+  technical-design: { provider: anthropic, model: m1 }
+  planning: { provider: anthropic, model: m1 }
+  implementation: { provider: anthropic, model: m1 }
+  verification: { provider: openai, model: m2 }
+  delivery: { provider: anthropic, model: m1 }"#,
+        TsOutcome::Invalid(&[
+            "providers.glm.adapter: Invalid option: expected one of \"openai-chat\"|\"anthropic\"|\"fake\"",
+        ]),
+    ),
+    (
+        "adapter_missing_new_name",
+        r#"version: 1
+budgets: {}
+providers:
+  glm: { apiKeyEnv: GLM_API_KEY }
+routing:
+  discovery: { provider: anthropic, model: m1 }
+  specification: { provider: anthropic, model: m1 }
+  technical-design: { provider: anthropic, model: m1 }
+  planning: { provider: anthropic, model: m1 }
+  implementation: { provider: anthropic, model: m1 }
+  verification: { provider: openai, model: m2 }
+  delivery: { provider: anthropic, model: m1 }"#,
+        TsOutcome::Invalid(&[
+            "providers.glm.adapter: provider connections require an adapter (\"openai-chat\"|\"anthropic\"|\"fake\"); only the legacy keys openai, anthropic, and fake may omit it",
+        ]),
+    ),
+    (
+        "connection_name_upper",
+        r#"version: 1
+budgets: {}
+providers:
+  GLM: { adapter: openai-chat }
+routing:
+  discovery: { provider: anthropic, model: m1 }
+  specification: { provider: anthropic, model: m1 }
+  technical-design: { provider: anthropic, model: m1 }
+  planning: { provider: anthropic, model: m1 }
+  implementation: { provider: anthropic, model: m1 }
+  verification: { provider: openai, model: m2 }
+  delivery: { provider: anthropic, model: m1 }"#,
+        TsOutcome::Invalid(&[
+            "providers.GLM: provider connection names are lowercase kebab-case, 1-64 characters, e.g. openai, glm, local-gateway",
+        ]),
+    ),
+    (
+        "api_key_env_secret",
+        r#"version: 1
+budgets: {}
+providers:
+  glm:
+    adapter: openai-chat
+    apiKeyEnv: sk-abcdef123456
+routing:
+  discovery: { provider: anthropic, model: m1 }
+  specification: { provider: anthropic, model: m1 }
+  technical-design: { provider: anthropic, model: m1 }
+  planning: { provider: anthropic, model: m1 }
+  implementation: { provider: anthropic, model: m1 }
+  verification: { provider: openai, model: m2 }
+  delivery: { provider: anthropic, model: m1 }"#,
+        TsOutcome::Invalid(&[
+            "providers.glm.apiKeyEnv: apiKeyEnv must name an environment variable (letters, digits, underscores; e.g. GLM_API_KEY), never hold a credential value",
+        ]),
+    ),
+    (
+        "capability_bad_value",
+        r#"version: 1
+budgets: {}
+providers:
+  glm:
+    adapter: openai-chat
+    capabilities: { instructions: system }
+routing:
+  discovery: { provider: anthropic, model: m1 }
+  specification: { provider: anthropic, model: m1 }
+  technical-design: { provider: anthropic, model: m1 }
+  planning: { provider: anthropic, model: m1 }
+  implementation: { provider: anthropic, model: m1 }
+  verification: { provider: openai, model: m2 }
+  delivery: { provider: anthropic, model: m1 }"#,
+        TsOutcome::Invalid(&[
+            "providers.glm.capabilities.instructions: Invalid option: expected one of \"developer\"|\"system-instruction\"",
         ]),
     ),
     (
@@ -748,7 +939,7 @@ routing:
   verification: { provider: openai, model: m2 }
   delivery: { provider: anthropic, model: m1 }"#,
         TsOutcome::Ok(
-            r#"{"version":1,"providers":{"openai":{"apiKeyEnv":"OPENAI_API_KEY"},"anthropic":{"apiKeyEnv":"ANTHROPIC_API_KEY"}},"routing":{"discovery":{"provider":"anthropic","model":"m1"},"specification":{"provider":"anthropic","model":"m1"},"technical-design":{"provider":"anthropic","model":"m1"},"planning":{"provider":"anthropic","model":"m1"},"implementation":{"provider":"anthropic","model":"m1"},"verification":{"provider":"openai","model":"m2"},"delivery":{"provider":"anthropic","model":"m1"}},"budgets":{"maxTurns":24,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":1800000,"maxRepeatedActions":3},"autonomy":"next-checkpoint","tools":{"commandTimeoutMs":120000,"maxSearchResults":200,"maxFileBytes":2000000}}"#,
+            r#"{"version":1,"providers":{"openai":{"adapter":"openai-chat","apiKeyEnv":"OPENAI_API_KEY"},"anthropic":{"adapter":"anthropic","apiKeyEnv":"ANTHROPIC_API_KEY"}},"routing":{"discovery":{"provider":"anthropic","model":"m1"},"specification":{"provider":"anthropic","model":"m1"},"technical-design":{"provider":"anthropic","model":"m1"},"planning":{"provider":"anthropic","model":"m1"},"implementation":{"provider":"anthropic","model":"m1"},"verification":{"provider":"openai","model":"m2"},"delivery":{"provider":"anthropic","model":"m1"}},"budgets":{"maxTurns":24,"maxModelCalls":48,"maxToolCalls":96,"maxOutputTokens":400000,"wallClockMs":1800000,"maxRepeatedActions":3},"autonomy":"next-checkpoint","tools":{"commandTimeoutMs":120000,"maxSearchResults":200,"maxFileBytes":2000000}}"#,
         ),
     ),
     (
@@ -848,8 +1039,8 @@ budgets: {}"#,
     ),
 ];
 
-/// (name, merged-configuration YAML, TypeScript validation issues). `None`
-/// means the TypeScript reference accepted the configuration.
+/// (name, merged-configuration YAML, expected validation issues). `None`
+/// means the effective configuration is valid.
 const EFFECTIVE_CASES: &[(&str, &str, Option<&'static [&'static str]>)] = &[
     (
         "unknown_role",
@@ -859,6 +1050,7 @@ providers:
     apiKeyEnv: OPENAI_API_KEY
   anthropic:
     apiKeyEnv: ANTHROPIC_API_KEY
+  fake: {}
 routing:
   discovery: ghost
   specification: a
@@ -896,6 +1088,7 @@ providers:
     apiKeyEnv: OPENAI_API_KEY
   anthropic:
     apiKeyEnv: ANTHROPIC_API_KEY
+  fake: {}
 routing:
   discovery: a
   specification: a
@@ -935,6 +1128,7 @@ providers:
     apiKeyEnv: OPENAI_API_KEY
   anthropic:
     apiKeyEnv: ANTHROPIC_API_KEY
+  fake: {}
 routing:
   discovery: a
   specification: a
@@ -972,6 +1166,7 @@ providers:
     apiKeyEnv: OPENAI_API_KEY
   anthropic:
     apiKeyEnv: ANTHROPIC_API_KEY
+  fake: {}
 routing:
   discovery: a
   specification: b
@@ -1021,6 +1216,7 @@ providers:
     apiKeyEnv: OPENAI_API_KEY
   anthropic:
     apiKeyEnv: ANTHROPIC_API_KEY
+  fake: {}
 routing:
   discovery: a
   specification: z
@@ -1163,6 +1359,7 @@ providers:
     apiKeyEnv: OPENAI_API_KEY
   anthropic:
     apiKeyEnv: ANTHROPIC_API_KEY
+  fake: {}
 models:
   reasoning:
     provider: anthropic
@@ -1236,6 +1433,7 @@ providers:
     apiKeyEnv: OPENAI_API_KEY
   anthropic:
     apiKeyEnv: ANTHROPIC_API_KEY
+  fake: {}
 routing:
   discovery: a
   specification: a
@@ -1264,6 +1462,197 @@ models:
   d:
     provider: fake
     model: w
+budgets:
+  maxTurns: 24
+  maxModelCalls: 48
+  maxToolCalls: 96
+  maxOutputTokens: 400000
+  wallClockMs: 1800000
+  maxRepeatedActions: 3
+autonomy: next-checkpoint
+tools:
+  commandTimeoutMs: 120000
+  maxSearchResults: 200
+  maxFileBytes: 2000000
+"#,
+        None,
+    ),
+    (
+        "unknown_model_connection",
+        r#"version: 1
+providers:
+  openai:
+    apiKeyEnv: OPENAI_API_KEY
+  anthropic:
+    apiKeyEnv: ANTHROPIC_API_KEY
+  fake: {}
+models:
+  a:
+    provider: fake
+    model: x
+  review:
+    provider: glm
+    model: glm-4.7
+routing:
+  discovery: a
+  specification: a
+  technical-design: a
+  planning: a
+  implementation: a
+  verification: review
+  delivery: a
+budgets:
+  maxTurns: 24
+  maxModelCalls: 48
+  maxToolCalls: 96
+  maxOutputTokens: 400000
+  wallClockMs: 1800000
+  maxRepeatedActions: 3
+autonomy: next-checkpoint
+tools:
+  commandTimeoutMs: 120000
+  maxSearchResults: 200
+  maxFileBytes: 2000000
+"#,
+        Some(&[
+            "models.review.provider: references unknown provider connection \"glm\"; available connections: openai, anthropic, fake. Define a providers.glm entry.",
+        ]),
+    ),
+    (
+        "unknown_inline_connection",
+        r#"version: 1
+providers:
+  openai:
+    apiKeyEnv: OPENAI_API_KEY
+  anthropic:
+    apiKeyEnv: ANTHROPIC_API_KEY
+  fake: {}
+routing:
+  discovery: { provider: ghost-conn, model: m1 }
+  specification: { provider: anthropic, model: m1 }
+  technical-design: { provider: anthropic, model: m1 }
+  planning: { provider: anthropic, model: m1, fallbacks: [{ provider: also-ghost, model: m2 }] }
+  implementation: { provider: anthropic, model: m1 }
+  verification: { provider: openai, model: m2 }
+  delivery: { provider: anthropic, model: m1 }
+budgets:
+  maxTurns: 24
+  maxModelCalls: 48
+  maxToolCalls: 96
+  maxOutputTokens: 400000
+  wallClockMs: 1800000
+  maxRepeatedActions: 3
+autonomy: next-checkpoint
+tools:
+  commandTimeoutMs: 120000
+  maxSearchResults: 200
+  maxFileBytes: 2000000
+"#,
+        Some(&[
+            "routing.discovery.provider: references unknown provider connection \"ghost-conn\"; available connections: openai, anthropic, fake. Define a providers.ghost-conn entry.",
+        ]),
+    ),
+    (
+        "unknown_preset",
+        r#"version: 1
+providers:
+  openai:
+    apiKeyEnv: OPENAI_API_KEY
+  anthropic:
+    apiKeyEnv: ANTHROPIC_API_KEY
+  fake: {}
+  glm:
+    adapter: openai-chat
+    apiKeyEnv: GLM_API_KEY
+    preset: grok
+routing:
+  discovery: { provider: anthropic, model: m1 }
+  specification: { provider: anthropic, model: m1 }
+  technical-design: { provider: anthropic, model: m1 }
+  planning: { provider: anthropic, model: m1 }
+  implementation: { provider: anthropic, model: m1 }
+  verification: { provider: openai, model: m2 }
+  delivery: { provider: anthropic, model: m1 }
+budgets:
+  maxTurns: 24
+  maxModelCalls: 48
+  maxToolCalls: 96
+  maxOutputTokens: 400000
+  wallClockMs: 1800000
+  maxRepeatedActions: 3
+autonomy: next-checkpoint
+tools:
+  commandTimeoutMs: 120000
+  maxSearchResults: 200
+  maxFileBytes: 2000000
+"#,
+        Some(&["providers.glm: unknown capability preset \"grok\" (available presets: glm)"]),
+    ),
+    (
+        "preset_adapter_mismatch",
+        r#"version: 1
+providers:
+  openai:
+    apiKeyEnv: OPENAI_API_KEY
+  anthropic:
+    apiKeyEnv: ANTHROPIC_API_KEY
+  fake: {}
+  glm:
+    adapter: anthropic
+    apiKeyEnv: GLM_API_KEY
+    preset: glm
+routing:
+  discovery: { provider: anthropic, model: m1 }
+  specification: { provider: anthropic, model: m1 }
+  technical-design: { provider: anthropic, model: m1 }
+  planning: { provider: anthropic, model: m1 }
+  implementation: { provider: anthropic, model: m1 }
+  verification: { provider: openai, model: m2 }
+  delivery: { provider: anthropic, model: m1 }
+budgets:
+  maxTurns: 24
+  maxModelCalls: 48
+  maxToolCalls: 96
+  maxOutputTokens: 400000
+  wallClockMs: 1800000
+  maxRepeatedActions: 3
+autonomy: next-checkpoint
+tools:
+  commandTimeoutMs: 120000
+  maxSearchResults: 200
+  maxFileBytes: 2000000
+"#,
+        Some(&[
+            "providers.glm: capability preset \"glm\" applies to the openai-chat adapter, not anthropic",
+        ]),
+    ),
+    (
+        "named_connections_ok",
+        r#"version: 1
+providers:
+  glm:
+    adapter: openai-chat
+    baseUrl: https://api.z.ai/api/paas/v4
+    apiKeyEnv: GLM_API_KEY
+    preset: glm
+  local:
+    adapter: openai-chat
+    baseUrl: http://localhost:8080/v1
+models:
+  reasoning:
+    provider: glm
+    model: glm-4.7
+  coding:
+    provider: local
+    model: qwen3-coder
+routing:
+  discovery: reasoning
+  specification: reasoning
+  technical-design: reasoning
+  planning: reasoning
+  implementation: coding
+  verification: reasoning
+  delivery: reasoning
 budgets:
   maxTurns: 24
   maxModelCalls: 48

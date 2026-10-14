@@ -8,21 +8,17 @@ mod common;
 
 use common::{config_with, defaults, inline, inline_routes, limits, model_role, role};
 use relay_config::normalized::{INTENT_PURPOSE, MAX_FALLBACKS, NormalizedRoute, normalize_routing};
-use relay_config::schema::{ModelRoleConfig, ProviderName, RelayConfig, RouteConfig, RoutingValue};
+use relay_config::schema::{ModelRoleConfig, RelayConfig, RouteConfig, RoutingValue};
 
-fn inline_route(
-    provider: ProviderName,
-    model: &str,
-    fallbacks: Vec<(ProviderName, &str)>,
-) -> RoutingValue {
+fn inline_route(provider: &str, model: &str, fallbacks: Vec<(&str, &str)>) -> RoutingValue {
     RoutingValue::Inline(RouteConfig {
-        provider,
+        provider: provider.to_string(),
         model: model.to_string(),
         fallbacks: Some(
             fallbacks
                 .into_iter()
                 .map(|(provider, model)| relay_config::schema::InlineFallback {
-                    provider,
+                    provider: provider.to_string(),
                     model: model.to_string(),
                 })
                 .collect(),
@@ -38,7 +34,7 @@ fn with_limits(
 ) -> RoutingValue {
     match route {
         RoutingValue::Inline(inner) => RoutingValue::Inline(RouteConfig {
-            provider: inner.provider,
+            provider: inner.provider.clone(),
             model: inner.model.clone(),
             fallbacks: inner.fallbacks.clone(),
             limits: limits(max_output_tokens, temperature),
@@ -55,75 +51,60 @@ fn chain_of(config: &RelayConfig, key: &str) -> Vec<NormalizedRoute> {
         .unwrap_or_default()
 }
 
+fn route(role: Option<&str>, provider: &str, model: &str) -> NormalizedRoute {
+    NormalizedRoute {
+        role: role.map(str::to_string),
+        provider: provider.to_string(),
+        model: model.to_string(),
+        limits: None,
+    }
+}
+
 #[test]
-fn routes_intent_to_the_lightweight_fast_role() {
+fn routes_intent_through_the_fast_role_on_the_offline_default() {
     let routing = normalize_routing(&defaults());
     assert_eq!(
         routing.purpose_chains.get(INTENT_PURPOSE).unwrap(),
-        &vec![NormalizedRoute {
-            role: Some("fast".to_string()),
-            provider: ProviderName::Anthropic,
-            model: "claude-haiku-4-5".to_string(),
-            limits: None,
-        }]
+        &vec![route(Some("fast"), "fake", "fake-standard")]
     );
 }
 
 #[test]
-fn resolves_every_workflow_mode_to_todays_provider_and_model_with_role_names() {
+fn resolves_every_workflow_mode_to_the_offline_fake_connection() {
     let routing = normalize_routing(&defaults());
-    let reasoning = NormalizedRoute {
-        role: Some("reasoning".to_string()),
-        provider: ProviderName::Anthropic,
-        model: "claude-sonnet-5-5".to_string(),
-        limits: None,
-    };
-    let expected: Vec<(&str, Vec<NormalizedRoute>)> = vec![
-        ("discovery", vec![reasoning.clone()]),
-        ("specification", vec![reasoning.clone()]),
-        ("planning", vec![reasoning.clone()]),
+    let expected: Vec<(&str, NormalizedRoute)> = vec![
+        (
+            "discovery",
+            route(Some("reasoning"), "fake", "fake-standard"),
+        ),
+        (
+            "specification",
+            route(Some("reasoning"), "fake", "fake-standard"),
+        ),
+        (
+            "planning",
+            route(Some("reasoning"), "fake", "fake-standard"),
+        ),
         (
             "technical-design",
-            vec![NormalizedRoute {
-                role: Some("architect".to_string()),
-                provider: ProviderName::Anthropic,
-                model: "claude-opus-5-5".to_string(),
-                limits: None,
-            }],
+            route(Some("architect"), "fake", "fake-standard"),
         ),
         (
             "implementation",
-            vec![NormalizedRoute {
-                role: Some("coding".to_string()),
-                provider: ProviderName::Anthropic,
-                model: "claude-sonnet-5-5".to_string(),
-                limits: None,
-            }],
+            route(Some("coding"), "fake", "fake-standard"),
         ),
         (
             "verification",
-            vec![
-                NormalizedRoute {
-                    role: Some("review".to_string()),
-                    provider: ProviderName::OpenAi,
-                    model: "gpt-5.2".to_string(),
-                    limits: None,
-                },
-                reasoning,
-            ],
+            route(Some("review"), "fake", "fake-standard"),
         ),
-        (
-            "delivery",
-            vec![NormalizedRoute {
-                role: Some("fast".to_string()),
-                provider: ProviderName::Anthropic,
-                model: "claude-haiku-4-5".to_string(),
-                limits: None,
-            }],
-        ),
+        ("delivery", route(Some("fast"), "fake", "fake-standard")),
     ];
-    for (mode, chain) in expected {
-        assert_eq!(routing.purpose_chains.get(mode), Some(&chain), "{mode}");
+    for (mode, first_route) in expected {
+        assert_eq!(
+            routing.purpose_chains.get(mode),
+            Some(&vec![first_route]),
+            "{mode}"
+        );
     }
 }
 
@@ -161,7 +142,7 @@ fn carries_per_role_limits_through_the_chain() {
             (
                 "a",
                 ModelRoleConfig {
-                    provider: ProviderName::Anthropic,
+                    provider: "anthropic".to_string(),
                     model: "claude-sonnet-5-5".to_string(),
                     fallbacks: Some(vec!["b".to_string()]),
                     limits: limits(Some(4096), Some(0.2)),
@@ -170,7 +151,7 @@ fn carries_per_role_limits_through_the_chain() {
             (
                 "b",
                 ModelRoleConfig {
-                    provider: ProviderName::OpenAi,
+                    provider: "openai".to_string(),
                     model: "gpt-5.2".to_string(),
                     fallbacks: None,
                     limits: limits(Some(2048), None),
@@ -184,13 +165,13 @@ fn carries_per_role_limits_through_the_chain() {
         &vec![
             NormalizedRoute {
                 role: Some("a".to_string()),
-                provider: ProviderName::Anthropic,
+                provider: "anthropic".to_string(),
                 model: "claude-sonnet-5-5".to_string(),
                 limits: limits(Some(4096), Some(0.2)),
             },
             NormalizedRoute {
                 role: Some("b".to_string()),
-                provider: ProviderName::OpenAi,
+                provider: "openai".to_string(),
                 model: "gpt-5.2".to_string(),
                 limits: limits(Some(2048), None),
             },
@@ -212,7 +193,7 @@ fn expands_fallbacks_breadth_first_deduplicating_without_reordering() {
             (
                 "a",
                 ModelRoleConfig {
-                    provider: ProviderName::Fake,
+                    provider: "fake".to_string(),
                     model: "echo-a".to_string(),
                     fallbacks: Some(vec!["b".to_string(), "c".to_string()]),
                     limits: None,
@@ -221,14 +202,14 @@ fn expands_fallbacks_breadth_first_deduplicating_without_reordering() {
             (
                 "b",
                 ModelRoleConfig {
-                    provider: ProviderName::Fake,
+                    provider: "fake".to_string(),
                     model: "echo-b".to_string(),
                     fallbacks: Some(vec!["c".to_string(), "d".to_string()]),
                     limits: None,
                 },
             ),
-            ("c", model_role(ProviderName::Fake, "echo-c")),
-            ("d", model_role(ProviderName::Fake, "echo-d")),
+            ("c", model_role("fake", "echo-c")),
+            ("d", model_role("fake", "echo-d")),
         ]),
     );
     let roles: Vec<Option<String>> = chain_of(&config, "discovery")
@@ -256,7 +237,7 @@ fn hard_caps_expanded_chains_at_one_primary_plus_max_fallbacks() {
             (
                 "a",
                 ModelRoleConfig {
-                    provider: ProviderName::Fake,
+                    provider: "fake".to_string(),
                     model: "echo-a".to_string(),
                     fallbacks: Some(vec!["b".to_string(), "c".to_string()]),
                     limits: None,
@@ -265,7 +246,7 @@ fn hard_caps_expanded_chains_at_one_primary_plus_max_fallbacks() {
             (
                 "b",
                 ModelRoleConfig {
-                    provider: ProviderName::Fake,
+                    provider: "fake".to_string(),
                     model: "echo-b".to_string(),
                     fallbacks: Some(vec!["d".to_string()]),
                     limits: None,
@@ -274,14 +255,14 @@ fn hard_caps_expanded_chains_at_one_primary_plus_max_fallbacks() {
             (
                 "c",
                 ModelRoleConfig {
-                    provider: ProviderName::Fake,
+                    provider: "fake".to_string(),
                     model: "echo-c".to_string(),
                     fallbacks: Some(vec!["e".to_string()]),
                     limits: None,
                 },
             ),
-            ("d", model_role(ProviderName::Fake, "echo-d")),
-            ("e", model_role(ProviderName::Fake, "echo-e")),
+            ("d", model_role("fake", "echo-d")),
+            ("e", model_role("fake", "echo-e")),
         ]),
     );
     // This catalog would fail effective validation; normalization still
@@ -308,19 +289,11 @@ fn resolves_a_role_reference_with_no_fallbacks_to_a_single_route_chain() {
     routing_table.push(("verification", role("review")));
     let config = config_with(
         routing_table,
-        Some(vec![(
-            "review",
-            model_role(ProviderName::OpenAi, "gpt-5.2"),
-        )]),
+        Some(vec![("review", model_role("openai", "gpt-5.2"))]),
     );
     assert_eq!(
         chain_of(&config, "verification"),
-        vec![NormalizedRoute {
-            role: Some("review".to_string()),
-            provider: ProviderName::OpenAi,
-            model: "gpt-5.2".to_string(),
-            limits: None,
-        }]
+        vec![route(Some("review"), "openai", "gpt-5.2")]
     );
 }
 
@@ -328,9 +301,9 @@ fn resolves_a_role_reference_with_no_fallbacks_to_a_single_route_chain() {
 fn marks_inline_routes_and_their_fallbacks_with_role_null_keeping_limits() {
     let mut routing_table = inline_routes();
     let discovery = inline_route(
-        ProviderName::OpenAi,
+        "openai",
         "gpt-5.2",
-        vec![(ProviderName::Anthropic, "claude-sonnet-5-5")],
+        vec![("anthropic", "claude-sonnet-5-5")],
     );
     let discovery = with_limits(&discovery, None, Some(0.1));
     routing_table.push(("discovery", discovery));
@@ -340,16 +313,106 @@ fn marks_inline_routes_and_their_fallbacks_with_role_null_keeping_limits() {
         vec![
             NormalizedRoute {
                 role: None,
-                provider: ProviderName::OpenAi,
+                provider: "openai".to_string(),
                 model: "gpt-5.2".to_string(),
                 limits: limits(None, Some(0.1)),
             },
-            NormalizedRoute {
-                role: None,
-                provider: ProviderName::Anthropic,
-                model: "claude-sonnet-5-5".to_string(),
-                limits: None,
-            },
+            route(None, "anthropic", "claude-sonnet-5-5"),
+        ]
+    );
+}
+
+#[test]
+fn deduplicates_identical_provider_model_pairs_keeping_first_occurrence() {
+    // Role chains: two roles with the same (connection, model) pair collapse
+    // to the first occurrence (the primary, with its limits).
+    let mut routing_table = inline_routes();
+    routing_table.push(("discovery", role("a")));
+    let config = config_with(
+        routing_table,
+        Some(vec![
+            (
+                "a",
+                ModelRoleConfig {
+                    provider: "fake".to_string(),
+                    model: "echo".to_string(),
+                    fallbacks: Some(vec!["b".to_string()]),
+                    limits: limits(Some(4096), None),
+                },
+            ),
+            (
+                "b",
+                ModelRoleConfig {
+                    provider: "fake".to_string(),
+                    model: "echo".to_string(),
+                    fallbacks: None,
+                    limits: limits(Some(2048), None),
+                },
+            ),
+        ]),
+    );
+    assert_eq!(
+        chain_of(&config, "discovery"),
+        vec![NormalizedRoute {
+            role: Some("a".to_string()),
+            provider: "fake".to_string(),
+            model: "echo".to_string(),
+            limits: limits(Some(4096), None),
+        }]
+    );
+
+    // Inline chains: a fallback identical to the primary (or an earlier
+    // fallback) is dropped; distinct pairs keep their order.
+    let mut routing_table = inline_routes();
+    routing_table.push((
+        "discovery",
+        inline_route(
+            "openai",
+            "m1",
+            vec![("openai", "m1"), ("anthropic", "m2"), ("anthropic", "m2")],
+        ),
+    ));
+    let config = config_with(routing_table, None);
+    assert_eq!(
+        chain_of(&config, "discovery"),
+        vec![route(None, "openai", "m1"), route(None, "anthropic", "m2")]
+    );
+}
+
+#[test]
+fn dedup_across_two_connections_sharing_one_adapter_keeps_both_routes() {
+    // `glm` and `local` are different connections on the same adapter: their
+    // routes are distinct even with the same model id.
+    let mut routing_table = inline_routes();
+    routing_table.push(("discovery", role("a")));
+    let config = config_with(
+        routing_table,
+        Some(vec![
+            (
+                "a",
+                ModelRoleConfig {
+                    provider: "glm".to_string(),
+                    model: "shared-model".to_string(),
+                    fallbacks: Some(vec!["b".to_string()]),
+                    limits: None,
+                },
+            ),
+            (
+                "b",
+                ModelRoleConfig {
+                    provider: "local".to_string(),
+                    model: "shared-model".to_string(),
+                    fallbacks: None,
+                    limits: None,
+                },
+            ),
+        ]),
+    );
+    assert_eq!(
+        chain_of(&config, "discovery"),
+        vec![
+            route(Some("a"), "glm", "shared-model"),
+            route(Some("b"), "local", "shared-model"),
         ]
     );
 }
@@ -363,12 +426,7 @@ fn produces_an_empty_role_catalog_and_the_first_route_as_legacy_fallback() {
     assert!(!routing.purpose_chains.contains_key(INTENT_PURPOSE));
     assert_eq!(
         routing.legacy_fallback,
-        Some(vec![NormalizedRoute {
-            role: None,
-            provider: ProviderName::Anthropic,
-            model: "claude-sonnet-5-5".to_string(),
-            limits: None,
-        }])
+        Some(vec![route(None, "anthropic", "claude-sonnet-5-5")])
     );
 }
 
@@ -383,13 +441,13 @@ fn is_deterministic_and_does_not_mutate_the_configuration() {
             (
                 "a",
                 ModelRoleConfig {
-                    provider: ProviderName::Fake,
+                    provider: "fake".to_string(),
                     model: "echo-a".to_string(),
                     fallbacks: Some(vec!["b".to_string()]),
                     limits: None,
                 },
             ),
-            ("b", model_role(ProviderName::Fake, "echo-b")),
+            ("b", model_role("fake", "echo-b")),
         ]),
     );
     let before = config.clone();
@@ -413,7 +471,7 @@ fn yields_an_empty_chain_for_references_to_unknown_roles() {
     routing_table.push(("discovery", role("ghost")));
     let config = config_with(
         routing_table,
-        Some(vec![("a", model_role(ProviderName::Fake, "echo-a"))]),
+        Some(vec![("a", model_role("fake", "echo-a"))]),
     );
     assert_eq!(
         chain_of(&config, "discovery"),
@@ -423,5 +481,94 @@ fn yields_an_empty_chain_for_references_to_unknown_roles() {
     // reference's `purposeChains.get(firstKey) ?? null` — an empty (but
     // present) first chain yields an empty legacy fallback, not null.
     assert_eq!(normalize_routing(&config).legacy_fallback, Some(Vec::new()));
-    let _ = inline(ProviderName::Fake, "unused");
+    let _ = inline("fake", "unused");
+}
+
+#[test]
+fn invocation_provider_override_filters_the_chain_by_connection_name() {
+    let mut routing_table = inline_routes();
+    routing_table.push(("verification", role("review")));
+    let config = config_with(
+        routing_table,
+        Some(vec![
+            (
+                "review",
+                ModelRoleConfig {
+                    provider: "openai".to_string(),
+                    model: "gpt-5.2".to_string(),
+                    fallbacks: Some(vec!["backup".to_string()]),
+                    limits: None,
+                },
+            ),
+            ("backup", model_role("anthropic", "claude-sonnet-5-5")),
+        ]),
+    );
+    let routing = normalize_routing(&config);
+
+    // A configured connection name keeps only routes on that connection.
+    let chain = relay_config::apply_invocation_overrides(
+        &routing,
+        "verification",
+        None,
+        &relay_config::InvocationOverrides {
+            role: None,
+            provider: Some("anthropic".to_string()),
+            model: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        chain,
+        vec![route(Some("backup"), "anthropic", "claude-sonnet-5-5")]
+    );
+
+    // The legacy spellings work because they are the default connection
+    // names; user-defined names work identically.
+    let config = config_with(
+        vec![
+            ("discovery", role("a")),
+            ("specification", inline("anthropic", "m")),
+            ("technical-design", inline("anthropic", "m")),
+            ("planning", inline("anthropic", "m")),
+            ("implementation", inline("anthropic", "m")),
+            ("verification", inline("openai", "gpt-5.2")),
+            ("delivery", inline("anthropic", "m")),
+        ],
+        Some(vec![("a", model_role("glm", "glm-4.7"))]),
+    );
+    let routing = normalize_routing(&config);
+    let chain = relay_config::apply_invocation_overrides(
+        &routing,
+        "discovery",
+        None,
+        &relay_config::InvocationOverrides {
+            role: None,
+            provider: Some("glm".to_string()),
+            model: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(chain, vec![route(Some("a"), "glm", "glm-4.7")]);
+}
+
+#[test]
+fn invocation_provider_override_names_the_connection_in_its_error() {
+    let workspace_config = config_with(inline_routes(), None);
+    let routing = normalize_routing(&workspace_config);
+    let error = relay_config::apply_invocation_overrides(
+        &routing,
+        "discovery",
+        None,
+        &relay_config::InvocationOverrides {
+            role: None,
+            provider: Some("grok".to_string()),
+            model: None,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "No usable model route: provider connection override \"grok\" matched no route in the \
+         chain for purpose \"discovery\""
+    );
 }

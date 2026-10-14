@@ -17,8 +17,10 @@ use common::{CannedResponse, MockServer};
 use relay_providers::anthropic::AnthropicProvider;
 use relay_providers::collect_turn;
 use relay_providers::contract::{
-    AssistantContent, CancelToken, FinishReason, ModelMessage, ModelProvider, ModelRequest,
-    ProviderErrorKind, ProviderStreamEvent, StructuredOutputRequest, ToolCall, ToolSpec,
+    AdapterCapabilities, AdapterKind, AssistantContent, CancelToken, CapabilityOverrides,
+    FeatureSupport, FinishReason, ModelMessage, ModelProvider, ModelRequest, ProviderErrorKind,
+    ProviderStreamEvent, StructuredOutputMode, StructuredOutputRequest, ToolCall, ToolSpec,
+    resolve_capabilities,
 };
 use serde_json::{Value, json};
 
@@ -27,9 +29,32 @@ const API_KEY: &str = "test-key-not-a-real-credential";
 fn provider(base_url: &str) -> AnthropicProvider {
     AnthropicProvider::new(relay_providers::anthropic::AnthropicProviderOptions {
         api_key: Some(API_KEY.into()),
+        api_key_env: None,
         base_url: Some(base_url.into()),
+        capabilities: None,
     })
     .expect("provider with a key constructs")
+}
+
+/// A provider carrying an explicit capability profile (the way a configured
+/// connection would).
+fn provider_with(base_url: &str, capabilities: AdapterCapabilities) -> AnthropicProvider {
+    AnthropicProvider::new(relay_providers::anthropic::AnthropicProviderOptions {
+        api_key: Some(API_KEY.into()),
+        api_key_env: None,
+        base_url: Some(base_url.into()),
+        capabilities: Some(capabilities),
+    })
+    .expect("provider with a key constructs")
+}
+
+/// Override one field of the `anthropic` adapter defaults.
+fn with_override(
+    mutate: impl FnOnce(&mut CapabilityOverrides),
+) -> Result<AdapterCapabilities, relay_providers::contract::CapabilityError> {
+    let mut overrides = CapabilityOverrides::default();
+    mutate(&mut overrides);
+    resolve_capabilities(AdapterKind::Anthropic, None, &overrides)
 }
 
 fn sse_body(events: &[Value]) -> String {
@@ -434,6 +459,35 @@ fn fails_fast_when_the_signal_is_already_aborted() {
 }
 
 #[test]
+fn malformed_stream_events_fail_with_invalid_response_and_no_completion() {
+    let body = "event: message_start\ndata: {not a json event}\n\n";
+    let server = MockServer::start(CannedResponse::sse(200, body));
+    let provider = provider(&server.base_url);
+
+    let events: Vec<ProviderStreamEvent> = provider.stream(&base_request()).collect();
+    let error = events
+        .iter()
+        .find_map(|event| match event {
+            ProviderStreamEvent::Error { error } => Some(error.clone()),
+            _ => None,
+        })
+        .expect("malformed event surfaces as an error event");
+    assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
+    assert!(!error.retryable);
+    assert!(
+        error.message.contains("malformed stream event"),
+        "{}",
+        error.message
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ProviderStreamEvent::Completed { .. })),
+        "no completed event after a malformed event"
+    );
+}
+
+#[test]
 fn reports_an_error_event_from_mid_stream_without_completing() {
     let events = vec![
         json!({ "type": "message_start", "message": { "id": "m", "usage": { "input_tokens": 2, "output_tokens": 1 } } }),
@@ -490,4 +544,167 @@ fn ignores_unknown_stream_event_types_like_the_reference_default_branch() {
     assert_eq!(result.finish_reason, FinishReason::Stop);
     assert_eq!(result.usage.input_tokens, 6);
     assert_eq!(result.usage.output_tokens, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Capability enforcement (offline, loopback-only)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reports_the_anthropic_adapter_default_capabilities() {
+    let server = MockServer::start(CannedResponse::sse(
+        200,
+        &sse_body(&plain_end_turn_events("end_turn")),
+    ));
+    let provider = provider(&server.base_url);
+    assert_eq!(
+        provider.capabilities(),
+        &AdapterCapabilities::defaults_for(AdapterKind::Anthropic)
+    );
+    assert_eq!(
+        provider.capabilities().structured_output,
+        StructuredOutputMode::JsonObject
+    );
+}
+
+#[test]
+fn api_key_env_names_the_variable_and_missing_named_variables_fail_closed() {
+    // A named variable that is not set fails construction with the redacted
+    // missing-variable auth error naming the configured variable (unique,
+    // test-only name; never set anywhere). Matched by hand: the provider
+    // deliberately does not implement Debug (it holds the resolved key).
+    let error = match AnthropicProvider::new(relay_providers::anthropic::AnthropicProviderOptions {
+        api_key: None,
+        api_key_env: Some("RELAY_PROVIDERS_TEST_ABSENT_ANTHROPIC_KEY_2026_10".into()),
+        base_url: None,
+        capabilities: None,
+    }) {
+        Err(error) => error,
+        Ok(_) => panic!("missing named variable must fail construction"),
+    };
+    assert_eq!(error.kind, ProviderErrorKind::Auth);
+    assert!(!error.retryable);
+    assert!(
+        error.message.contains(
+            "The RELAY_PROVIDERS_TEST_ABSENT_ANTHROPIC_KEY_2026_10 environment variable is missing"
+        ),
+        "{}",
+        error.message
+    );
+
+    // An explicit key wins over the named variable.
+    let provider = AnthropicProvider::new(relay_providers::anthropic::AnthropicProviderOptions {
+        api_key: Some(API_KEY.into()),
+        api_key_env: Some("RELAY_PROVIDERS_TEST_ABSENT_ANTHROPIC_KEY_2026_10".into()),
+        base_url: None,
+        capabilities: None,
+    })
+    .expect("explicit key wins over the named variable");
+    assert_eq!(
+        provider.capabilities(),
+        &AdapterCapabilities::defaults_for(AdapterKind::Anthropic)
+    );
+}
+
+#[test]
+fn unsupported_structured_output_fails_before_any_http_request() {
+    let server = MockServer::start(CannedResponse::sse(
+        200,
+        &sse_body(&plain_end_turn_events("end_turn")),
+    ));
+    let capabilities = with_override(|overrides| {
+        overrides.structured_output = Some(StructuredOutputMode::Unsupported);
+    })
+    .expect("unsupported override resolves");
+    let provider = provider_with(&server.base_url, capabilities);
+
+    let mut request = base_request();
+    request.structured_output = Some(StructuredOutputRequest {
+        name: "intent-proposal".into(),
+        schema: serde_json::Map::from_iter([("type".to_owned(), json!("object"))]),
+    });
+
+    let error = collect_turn(provider.stream(&request)).expect_err("preflight fails");
+    assert_eq!(error.kind, ProviderErrorKind::UnsupportedCapability);
+    assert!(!error.retryable);
+    assert!(
+        error.message.contains("structured_output")
+            && error.message.contains("anthropic")
+            && error.message.contains("capability configuration"),
+        "{}",
+        error.message
+    );
+    assert!(
+        server.recorded().is_empty(),
+        "no HTTP request may reach the server on an unsupported capability"
+    );
+}
+
+#[test]
+fn json_schema_structured_output_mode_is_rejected_as_unimplemented() {
+    let server = MockServer::start(CannedResponse::sse(
+        200,
+        &sse_body(&plain_end_turn_events("end_turn")),
+    ));
+    let capabilities = with_override(|overrides| {
+        overrides.structured_output = Some(StructuredOutputMode::JsonSchema);
+    })
+    .expect("json-schema override resolves");
+    let provider = provider_with(&server.base_url, capabilities);
+
+    let mut request = base_request();
+    request.structured_output = Some(StructuredOutputRequest {
+        name: "intent-proposal".into(),
+        schema: serde_json::Map::from_iter([("type".to_owned(), json!("object"))]),
+    });
+
+    let error = collect_turn(provider.stream(&request)).expect_err("preflight fails");
+    assert_eq!(error.kind, ProviderErrorKind::UnsupportedCapability);
+    assert!(!error.retryable);
+    assert!(
+        error.message.contains("json-schema")
+            && error.message.contains("json-object")
+            && error.message.contains("anthropic"),
+        "{}",
+        error.message
+    );
+    assert!(
+        server.recorded().is_empty(),
+        "no HTTP request may reach the server for an unimplemented mode"
+    );
+}
+
+#[test]
+fn unsupported_tool_calls_fail_before_any_http_request() {
+    let server = MockServer::start(CannedResponse::sse(
+        200,
+        &sse_body(&plain_end_turn_events("end_turn")),
+    ));
+    let capabilities = with_override(|overrides| {
+        overrides.tool_calls = Some(FeatureSupport::Unsupported);
+    })
+    .expect("unsupported override resolves");
+    let provider = provider_with(&server.base_url, capabilities);
+
+    let mut request = base_request();
+    request.tools = Some(vec![ToolSpec {
+        name: "read-file".into(),
+        description: "Reads a file".into(),
+        parameters: serde_json::Map::from_iter([("type".to_owned(), json!("object"))]),
+    }]);
+
+    let error = collect_turn(provider.stream(&request)).expect_err("preflight fails");
+    assert_eq!(error.kind, ProviderErrorKind::UnsupportedCapability);
+    assert!(!error.retryable);
+    assert!(
+        error.message.contains("tool_calls")
+            && error.message.contains("anthropic")
+            && error.message.contains("capability configuration"),
+        "{}",
+        error.message
+    );
+    assert!(
+        server.recorded().is_empty(),
+        "no HTTP request may reach the server on an unsupported capability"
+    );
 }

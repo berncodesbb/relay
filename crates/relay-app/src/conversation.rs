@@ -21,7 +21,6 @@
 //! recorded.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
 use relay_domain::Speaker;
@@ -36,7 +35,6 @@ use relay_providers::contract::CancelToken;
 use relay_providers::contract::FinishReason;
 use relay_providers::contract::JsonSchemaObject;
 use relay_providers::contract::ModelMessage;
-use relay_providers::contract::ModelProvider;
 use relay_providers::contract::ModelRequest;
 use relay_providers::contract::ProviderErrorKind;
 use relay_providers::contract::ProviderStreamEvent;
@@ -47,6 +45,7 @@ use serde_json::Value;
 use serde_json::json;
 
 use crate::error::AppError;
+use crate::runtime_routing::TurnRouting;
 use crate::session::ProjectSession;
 
 /// The provider purpose marker for conversational turns (routing logs and
@@ -876,8 +875,7 @@ fn select_transcript(
 #[allow(clippy::too_many_arguments)]
 pub fn start_turn(
     session: &ProjectSession,
-    provider: Arc<dyn ModelProvider>,
-    model: &str,
+    routing: TurnRouting,
     prompt: &str,
     limits: &ConversationLimits,
     cancel: CancelToken,
@@ -971,9 +969,11 @@ pub fn start_turn(
     let built = build_context(&inputs, limits);
 
     // 3. Call the provider with the writer lock released, forwarding redacted
-    //    delta fragments to the live interface as they arrive.
+    //    delta fragments to the live interface as they arrive. The request
+    //    carries the intent route's model; the provider is the route's
+    //    connection adapter.
     let request = ModelRequest {
-        model: model.to_string(),
+        model: routing.route.model.clone(),
         system: Some(conversation_system_prompt(limits)),
         messages: built.messages,
         tools: None,
@@ -987,7 +987,7 @@ pub fn start_turn(
         signal: Some(cancel.clone()),
     };
     let forwarder = std::cell::RefCell::new(StreamForwarder::default());
-    let observed = provider.stream(&request).inspect(|event| {
+    let observed = routing.provider.stream(&request).inspect(|event| {
         if let ProviderStreamEvent::TextDelta { text } = event {
             forwarder.borrow_mut().push(text, &events);
         }
@@ -1081,7 +1081,7 @@ pub fn start_turn(
 
     // 6. Apply every proposal independently; at most one mutating proposal
     //    per turn is accepted, the rest are safely rejected.
-    let applied = apply_proposals(session, &provider, model, proposals, &events);
+    let applied = apply_proposals(session, &routing, proposals, &events);
 
     // 7. Persist the final assistant message with the ids of what was
     //    actually accepted, then report the completed turn.
@@ -1397,8 +1397,7 @@ fn is_mutating(proposal: &ConversationProposal) -> bool {
 /// Every rejection is recorded with a safe reason — never coerced.
 fn apply_proposals(
     session: &ProjectSession,
-    provider: &Arc<dyn ModelProvider>,
-    model: &str,
+    routing: &TurnRouting,
     proposals: Vec<ConversationProposal>,
     events: &Sender<ConversationEvent>,
 ) -> AppliedTurn {
@@ -1408,7 +1407,7 @@ fn apply_proposals(
         let outcome = if is_mutating(&proposal) && mutation_used {
             rejected_outcome(proposal, "only one mutating proposal per turn is applied")
         } else {
-            let outcome = apply_one(session, provider, model, &proposal, events, &mut applied);
+            let outcome = apply_one(session, routing, &proposal, events, &mut applied);
             if outcome.accepted && is_mutating(&proposal) {
                 mutation_used = true;
             }
@@ -1427,8 +1426,7 @@ fn apply_proposals(
 /// Apply one proposal, extending `applied` with what it touched.
 fn apply_one(
     session: &ProjectSession,
-    provider: &Arc<dyn ModelProvider>,
-    model: &str,
+    routing: &TurnRouting,
     proposal: &ConversationProposal,
     events: &Sender<ConversationEvent>,
     applied: &mut AppliedTurn,
@@ -1545,12 +1543,12 @@ fn apply_one(
                     DETAIL_CAP_CHARS,
                 ),
             });
-            let route = relay_domain::ModelRoute {
-                provider: provider.name().as_str().to_string(),
-                model: model.to_string(),
-                role: None,
-            };
-            let wiring = crate::runner::RuntimeWiring::production(Arc::clone(provider), route);
+            // Proposal-driven runs use the same production wiring `relay
+            // run` uses: the routed model client and the purpose-resolved
+            // plan carried by this turn's routing. Grants therefore record
+            // the connection name (and role) each work item's purpose
+            // resolves to — never the adapter kind.
+            let wiring = routing.run_wiring.clone();
             let run = match crate::runner::run_ticks(
                 session,
                 &wiring,

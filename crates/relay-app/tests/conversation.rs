@@ -22,11 +22,12 @@ use relay_app::conversation::{
     ProposalOutcome, TurnStatus, start_turn,
 };
 use relay_app::conversation_views::{ChatEntryKind, chat_view};
+use relay_app::runtime_routing::TurnRouting;
 use relay_app::session::{ProjectSession, SessionOptions};
 use relay_domain::DomainFact;
 use relay_providers::contract::{
-    CancelToken, FinishReason, ModelProvider, ModelRequest, ProviderErrorKind, ProviderEventStream,
-    ProviderName, ProviderStreamEvent, TokenUsage,
+    AdapterKind, CancelToken, FinishReason, ModelProvider, ModelRequest, ProviderErrorKind,
+    ProviderEventStream, ProviderStreamEvent, TokenUsage,
 };
 use relay_providers::fake::{
     FakeErrorPlan, FakeMatch, FakeProvider, FakeResponse, FakeStep, PurposeMatch,
@@ -65,7 +66,9 @@ fn answer_only(text: &str) -> Arc<dyn ModelProvider> {
 }
 
 /// Run one turn synchronously and collect its events (the sender is dropped
-/// when the turn returns, ending the iterator).
+/// when the turn returns, ending the iterator). The scripted provider
+/// serves both the turn's own streaming call and any proposal-driven run
+/// under the `fake` connection of the offline default plan.
 fn run_turn(
     session: &ProjectSession,
     provider: Arc<dyn ModelProvider>,
@@ -77,8 +80,7 @@ fn run_turn(
     let (sender, receiver) = mpsc::channel();
     let result = start_turn(
         session,
-        provider,
-        "fake-standard",
+        TurnRouting::with_provider(provider),
         prompt,
         &limits(),
         CancelToken::new(),
@@ -638,8 +640,7 @@ fn a_pre_cancelled_token_records_a_cancelled_turn() {
     cancel.cancel("user pressed ctrl-c");
     let result = start_turn(
         &session,
-        answer_only("too late"),
-        "fake-standard",
+        TurnRouting::with_provider(answer_only("too late")),
         "long question",
         &limits(),
         cancel,
@@ -805,8 +806,8 @@ fn no_writer_lock_is_held_across_the_model_call() {
         observed: Arc<Mutex<Option<String>>>,
     }
     impl ModelProvider for LockProbingProvider {
-        fn name(&self) -> ProviderName {
-            ProviderName::Fake
+        fn name(&self) -> AdapterKind {
+            AdapterKind::Fake
         }
         fn models(&self) -> Vec<String> {
             vec!["fake-standard".to_string()]
@@ -870,8 +871,8 @@ fn the_context_respects_every_configured_budget() {
         requests: Mutex<Vec<ModelRequest>>,
     }
     impl ModelProvider for RecordingProvider {
-        fn name(&self) -> ProviderName {
-            ProviderName::Fake
+        fn name(&self) -> AdapterKind {
+            AdapterKind::Fake
         }
         fn models(&self) -> Vec<String> {
             vec!["fake-standard".to_string()]
@@ -916,8 +917,7 @@ fn the_context_respects_every_configured_budget() {
     let (sender, receiver) = mpsc::channel();
     let result = start_turn(
         &session,
-        Arc::clone(&recorder) as Arc<dyn ModelProvider>,
-        "fake-standard",
+        TurnRouting::with_provider(Arc::clone(&recorder) as Arc<dyn ModelProvider>),
         "summarize",
         &tiny,
         CancelToken::new(),

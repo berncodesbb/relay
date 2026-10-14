@@ -16,7 +16,7 @@ use relay_config::load::{
     validate_effective_config,
 };
 use relay_config::normalized::{expand_role_names, normalize_routing};
-use relay_config::schema::{ModelRoleConfig, ProviderName, RelayConfig, RoutingValue};
+use relay_config::schema::{ModelRoleConfig, RelayConfig, RoutingValue};
 use std::collections::HashSet;
 
 /// A tiny deterministic LCG so the sweeps never depend on external state.
@@ -54,10 +54,12 @@ fn build_config(catalog: &[(&str, ModelRoleConfig)], primary: Option<&str>) -> R
     config
 }
 
-fn role_def(fallbacks: Vec<&str>) -> ModelRoleConfig {
+fn role_def(name: &str, fallbacks: Vec<&str>) -> ModelRoleConfig {
+    // Distinct model ids keep the sweep's chain-length assertions about
+    // (provider, model) deduplication independent of role-name deduplication.
     ModelRoleConfig {
-        provider: ProviderName::Fake,
-        model: "echo".to_string(),
+        provider: "fake".to_string(),
+        model: format!("echo-{name}"),
         fallbacks: if fallbacks.is_empty() {
             None
         } else {
@@ -94,7 +96,7 @@ fn loading_twice_from_disk_is_deterministic() {
         user_config_path: None,
         overrides: Some(ConfigOverrides {
             autonomy: Some("until:implementation".to_string()),
-            force_provider: Some(ProviderName::Fake),
+            force_provider: Some("fake".to_string()),
         }),
     };
     let first = load_config(options.clone()).unwrap();
@@ -132,7 +134,7 @@ fn sweeps_over_random_fallback_graphs() {
                 let _ = index;
             }
             let refs: Vec<&str> = fallbacks.iter().map(String::as_str).collect();
-            catalog.push((name.clone(), role_def(refs)));
+            catalog.push((name.clone(), role_def(name, refs)));
         }
         let borrowed: Vec<(&str, ModelRoleConfig)> = catalog
             .iter()
@@ -201,7 +203,7 @@ fn sweep_configs_always_normalize_to_bounded_deduplicated_chains() {
                 }
             }
             let refs: Vec<&str> = fallbacks.iter().map(String::as_str).collect();
-            catalog.push((name.clone(), role_def(refs)));
+            catalog.push((name.clone(), role_def(name, refs)));
         }
         let owned: Vec<(&str, ModelRoleConfig)> = catalog
             .iter()
@@ -235,7 +237,7 @@ fn chain_expansion_is_breadth_first_discovery_order_with_dedup() {
         ("c", vec!["d"]),
         ("d", vec![] as Vec<&str>),
     ] {
-        catalog.insert(name.to_string(), role_def(fallbacks));
+        catalog.insert(name.to_string(), role_def(name, fallbacks));
     }
     config.models = Some(catalog);
     assert_eq!(
@@ -249,12 +251,12 @@ fn chain_expansion_is_breadth_first_discovery_order_with_dedup() {
     );
     // The cap stops before exceeding one primary plus three fallbacks.
     let wide: Vec<(&str, ModelRoleConfig)> = vec![
-        ("w", role_def(vec!["x", "y"])),
-        ("x", role_def(vec!["z1", "z2"])),
-        ("y", role_def(vec!["z3"])),
-        ("z1", model_role(ProviderName::Fake, "z1")),
-        ("z2", model_role(ProviderName::Fake, "z2")),
-        ("z3", model_role(ProviderName::Fake, "z3")),
+        ("w", role_def("w", vec!["x", "y"])),
+        ("x", role_def("x", vec!["z1", "z2"])),
+        ("y", role_def("y", vec!["z3"])),
+        ("z1", model_role("fake", "z1")),
+        ("z2", model_role("fake", "z2")),
+        ("z3", model_role("fake", "z3")),
     ];
     let wide_catalog: std::collections::HashMap<String, ModelRoleConfig> = wide
         .into_iter()

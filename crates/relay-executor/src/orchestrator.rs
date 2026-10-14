@@ -606,7 +606,7 @@ impl ModelClient for NoModel {
         _signal: &CancelToken,
     ) -> Result<crate::model::ModelTurnResponse, crate::model::ModelClientError> {
         Err(crate::model::ModelClientError::Provider(
-            "no model client configured".to_owned(),
+            crate::model::ModelCallFailure::from_message("no model client configured"),
         ))
     }
 }

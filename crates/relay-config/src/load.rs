@@ -4,20 +4,28 @@
 //! (relay.config.yaml in the workspace root) < programmatic overrides`.
 //! Routing entries merge by key; the `models` role catalog merges by role name
 //! so a later layer replaces one complete role definition while unrelated
-//! roles from lower layers survive. After merging, the effective configuration
-//! is cross-referenced (every role reference and fallback role must resolve,
-//! no self-references or cycles, expanded chains within one primary plus
-//! [`MAX_FALLBACKS`]) before it is returned, and can be normalized into the
-//! runtime-facing routing contract with [`crate::normalize_routing`].
+//! roles from lower layers survive; `providers` connections merge by
+//! connection name the same way — a later definition of a name replaces the
+//! complete connection (adapter, endpoint, credential-variable name, preset,
+//! and capabilities together) while unrelated names survive. Replacement is
+//! complete rather than field-wise to match role semantics, so overriding one
+//! field of a connection means restating the whole connection. After merging,
+//! the effective configuration is cross-referenced (every role reference,
+//! fallback role, and provider connection reference must resolve; presets
+//! must match their adapter; no self-references or cycles; expanded chains
+//! within one primary plus [`MAX_FALLBACKS`]) before it is returned, and can
+//! be normalized into the runtime-facing routing contract with
+//! [`crate::normalize_routing`].
 
 use crate::defaults::default_config;
 use crate::normalized::{MAX_FALLBACKS, expand_role_names};
 use crate::raw::RawValue;
 use crate::schema::{
-    ConfigValidationError, ModelRoleConfig, ProviderName, RelayConfig, RouteConfig, RoutingValue,
+    ConfigValidationError, ModelRoleConfig, RelayConfig, RouteConfig, RoutingValue,
     parse_relay_config,
 };
 use indexmap::IndexMap;
+use relay_providers::contract::resolve_capabilities;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -107,9 +115,11 @@ pub struct LoadedConfig {
 pub struct ConfigOverrides {
     /// Replacement autonomy bound (`--auto` / `--autonomy`).
     pub autonomy: Option<String>,
-    /// Force one provider everywhere (`--provider` and `RELAY_FAKE`); model
-    /// ids, limits, and role-name references stay untouched.
-    pub force_provider: Option<ProviderName>,
+    /// Force one provider connection everywhere (`--provider` and
+    /// `RELAY_FAKE`); the value is a connection name that must be defined in
+    /// the effective `providers` map. Model ids, limits, and role-name
+    /// references stay untouched.
+    pub force_provider: Option<String>,
 }
 
 /// Options for [`load_config`].
@@ -126,15 +136,18 @@ pub struct LoadOptions {
 }
 
 /// Provenance for the effective configuration: which layer label (usually a
-/// file path) last defined each routing entry and each model role. Used to
-/// attribute cross-reference errors to the layer that introduced the offending
-/// piece instead of blaming the whole effective configuration.
+/// file path) last defined each routing entry, model role, and provider
+/// connection. Used to attribute cross-reference errors to the layer that
+/// introduced the offending piece instead of blaming the whole effective
+/// configuration.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct EffectiveConfigOrigins {
     /// Routing key to the layer label that last defined it.
     pub routing: IndexMap<String, String>,
     /// Model role to the layer label that last defined it.
     pub models: IndexMap<String, String>,
+    /// Provider connection name to the layer label that last defined it.
+    pub providers: IndexMap<String, String>,
 }
 
 /// The user-level configuration path (`~/.config/relay/config.yaml`), or
@@ -160,12 +173,13 @@ pub fn parse_yaml_layer(source: &str, text: &str) -> Result<RelayConfig, ConfigE
     Ok(parse_relay_config(source, &parsed)?)
 }
 
-/// Merges `layer` over `merged` and records which routing keys and model roles
-/// the layer introduced. Later layers replace whole sections except routing
-/// (merged by key) and the `models` catalog (merged by role name, so a later
-/// layer replaces one complete role definition while unrelated roles
-/// survive). `layer_label` (usually the file path) becomes the origin for
-/// everything the layer defines.
+/// Merges `layer` over `merged` and records which routing keys, model roles,
+/// and provider connections the layer introduced. Later layers replace whole
+/// sections except routing (merged by key), the `models` catalog (merged by
+/// role name, so a later layer replaces one complete role definition while
+/// unrelated roles survive), and `providers` (merged by connection name with
+/// the same complete-replacement semantics). `layer_label` (usually the file
+/// path) becomes the origin for everything the layer defines.
 pub fn merge_config_layers(
     merged: RelayConfig,
     layer: &RelayConfig,
@@ -185,6 +199,13 @@ pub fn merge_config_layers(
         }
         None => merged.models.clone(),
     };
+    let mut providers = merged.providers.clone();
+    for (name, connection) in &layer.providers.0 {
+        if let Some(label) = layer_label {
+            origins.providers.insert(name.clone(), label.to_string());
+        }
+        providers.0.insert(name.clone(), connection.clone());
+    }
     let mut routing = merged.routing.clone();
     for (key, value) in &layer.routing {
         if let Some(label) = layer_label {
@@ -194,12 +215,12 @@ pub fn merge_config_layers(
     }
     RelayConfig {
         version: merged.version,
-        // Every parsed layer carries complete provider/budget/tool sections
-        // (schema defaults fill omitted entries), so the field-wise merge of
-        // the reference always resolves to the layer's values.
-        providers: layer.providers.clone(),
+        providers,
         models,
         routing,
+        // Every parsed layer carries complete budget/tool sections (schema
+        // defaults fill omitted entries), so the field-wise merge of the
+        // reference always resolves to the layer's values.
         budgets: layer.budgets,
         autonomy: layer.autonomy.clone(),
         tools: layer.tools,
@@ -271,12 +292,26 @@ pub fn load_config(options: LoadOptions) -> Result<LoadedConfig, ConfigError> {
                 path: None,
             });
         }
-        if let Some(provider) = overrides.force_provider {
+        if let Some(provider) = overrides.force_provider.as_deref() {
             config = apply_forced_provider(&config, provider);
             layers.push(ConfigLayer {
                 source: ConfigLayerSource::Overrides,
                 path: None,
             });
+            // Effective validation ran before overrides; a forced connection
+            // name must still resolve, or the override would silently produce
+            // routes with no backing connection.
+            if !config.providers.contains(provider) {
+                return Err(ConfigValidationError::new(
+                    EFFECTIVE_CONFIG_SOURCE,
+                    vec![format!(
+                        "provider override \"{provider}\" is not a configured provider connection; \
+                         available connections: {}",
+                        connection_listing(&config)
+                    )],
+                )
+                .into());
+            }
         }
     }
 
@@ -284,10 +319,13 @@ pub fn load_config(options: LoadOptions) -> Result<LoadedConfig, ConfigError> {
 }
 
 /// Validates the effective (merged) configuration's cross-references. Layer
-/// parsing already validated each layer's own shape (providers, limits,
-/// inline fallback objects); this catches problems that only exist once layers
-/// combine: unknown role references, unknown fallback roles, self-references,
-/// cycles, and expanded chains longer than one primary plus [`MAX_FALLBACKS`].
+/// parsing already validated each layer's own shape (connection fields,
+/// limits, inline fallback objects, provider name syntax); this catches
+/// problems that only exist once layers combine: provider references to
+/// undefined connections, presets that do not resolve against their
+/// connection's adapter and capabilities, unknown role references, unknown
+/// fallback roles, self-references, cycles, and expanded chains longer than
+/// one primary plus [`MAX_FALLBACKS`].
 ///
 /// Returns a [`ConfigValidationError`] naming the offending dotted path; when
 /// `origins` names the layer file that introduced the piece, that file is used
@@ -306,6 +344,7 @@ pub fn validate_effective_config(
     } else {
         role_names.join(", ")
     };
+    let available_connections = connection_listing(config);
     let routing_source = |key: &str| -> String {
         origins
             .and_then(|origins| origins.routing.get(key))
@@ -318,6 +357,62 @@ pub fn validate_effective_config(
             .map_or(source, |label| label.as_str())
             .to_string()
     };
+    let provider_source = |name: &str| -> String {
+        origins
+            .and_then(|origins| origins.providers.get(name))
+            .map_or(source, |label| label.as_str())
+            .to_string()
+    };
+
+    // Provider references: every connection named by an inline routing
+    // object (including inline fallbacks) or a model role must be defined.
+    for (key, value) in &config.routing {
+        let RoutingValue::Inline(route) = value else {
+            continue;
+        };
+        let source_label = routing_source(key);
+        check_provider_reference(
+            config,
+            &route.provider,
+            &format!("routing.{key}.provider"),
+            &source_label,
+            &available_connections,
+        )?;
+        for (index, fallback) in route.fallbacks.iter().flatten().enumerate() {
+            check_provider_reference(
+                config,
+                &fallback.provider,
+                &format!("routing.{key}.fallbacks[{index}].provider"),
+                &source_label,
+                &available_connections,
+            )?;
+        }
+    }
+    for (role, definition) in catalog {
+        let source_label = role_source(role);
+        check_provider_reference(
+            config,
+            &definition.provider,
+            &format!("models.{role}.provider"),
+            &source_label,
+            &available_connections,
+        )?;
+    }
+
+    // Capability/preset combinations must resolve on every connection:
+    // adapter defaults, then the named preset, then explicit overrides.
+    for (name, connection) in config.providers.iter() {
+        if let Err(error) = resolve_capabilities(
+            connection.adapter,
+            connection.preset.as_deref(),
+            &connection.capabilities,
+        ) {
+            return Err(ConfigValidationError::new(
+                provider_source(name),
+                vec![format!("providers.{name}: {error}")],
+            ));
+        }
+    }
 
     for (key, value) in &config.routing {
         let RoutingValue::Role(role) = value else {
@@ -402,6 +497,39 @@ pub fn validate_effective_config(
     Ok(())
 }
 
+/// The defined connection names joined for diagnostics (in configuration
+/// order), or a placeholder when no connections are defined.
+fn connection_listing(config: &RelayConfig) -> String {
+    let names: Vec<&str> = config.providers.names().collect();
+    if names.is_empty() {
+        "(no provider connections are defined)".to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
+/// One provider-reference check: `provider` must name a defined connection.
+/// The error names the dotted path, the offending name, and the available
+/// connections, and is attributed to the layer that introduced the reference.
+fn check_provider_reference(
+    config: &RelayConfig,
+    provider: &str,
+    path: &str,
+    issue_source: &str,
+    available_connections: &str,
+) -> Result<(), ConfigValidationError> {
+    if config.providers.contains(provider) {
+        return Ok(());
+    }
+    Err(ConfigValidationError::new(
+        issue_source,
+        vec![format!(
+            "{path}: references unknown provider connection \"{provider}\"; \
+             available connections: {available_connections}. Define a providers.{provider} entry."
+        )],
+    ))
+}
+
 /// Depth-first cycle detection over the role fallback graph, reported exactly
 /// like the TypeScript reference: the cycle path is printed in visit order and
 /// attributed to the layer that introduced the cycle's origin role.
@@ -466,9 +594,11 @@ fn detect_fallback_cycles(
 
 /// Rewrites `--provider`/`RELAY_FAKE` across both routing syntaxes: every
 /// models catalog entry and every inline routing object (including inline
-/// fallback objects) moves to the forced provider while model ids, limits,
-/// and role-name fallback references stay untouched.
-pub fn apply_forced_provider(config: &RelayConfig, provider: ProviderName) -> RelayConfig {
+/// fallback objects) moves to the forced provider connection name while
+/// model ids, limits, and role-name fallback references stay untouched.
+/// `provider` must name a connection in the effective `providers` map (the
+/// caller validates it; [`load_config`] does after applying overrides).
+pub fn apply_forced_provider(config: &RelayConfig, provider: &str) -> RelayConfig {
     let models: IndexMap<String, ModelRoleConfig> = config
         .models
         .as_ref()
@@ -479,7 +609,7 @@ pub fn apply_forced_provider(config: &RelayConfig, provider: ProviderName) -> Re
                     (
                         role.clone(),
                         ModelRoleConfig {
-                            provider,
+                            provider: provider.to_string(),
                             model: definition.model.clone(),
                             fallbacks: definition.fallbacks.clone(),
                             limits: definition.limits.clone(),
@@ -496,13 +626,13 @@ pub fn apply_forced_provider(config: &RelayConfig, provider: ProviderName) -> Re
             let forced = match value {
                 RoutingValue::Role(role) => RoutingValue::Role(role.clone()),
                 RoutingValue::Inline(route) => RoutingValue::Inline(RouteConfig {
-                    provider,
+                    provider: provider.to_string(),
                     model: route.model.clone(),
                     fallbacks: route.fallbacks.as_ref().map(|fallbacks| {
                         fallbacks
                             .iter()
                             .map(|fallback| crate::schema::InlineFallback {
-                                provider,
+                                provider: provider.to_string(),
                                 model: fallback.model.clone(),
                             })
                             .collect()

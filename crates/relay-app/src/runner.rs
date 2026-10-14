@@ -14,19 +14,22 @@
 use std::sync::Arc;
 
 use relay_domain::ModelRoute;
+use relay_domain::WorkNode;
 use relay_engine::SchedulingPolicy;
 use relay_executor::spec::Spawn;
 use relay_executor::{
-    ExecutorSet, ModelClient, ModelExecutor, ModelGuidedVerifierPlanner,
-    ModelGuidedWorkspacePlanner, Orchestrator, SystemExecutor, VerifierExecutor, WorkspaceExecutor,
-    grant_from_work, inline_spawn, thread_spawn,
+    ExecutorSet, GrantSource, ModelClient, ModelExecutor, ModelGuidedVerifierPlanner,
+    ModelGuidedWorkspacePlanner, Orchestrator, ResolvedRoutePlan, RoutedModelClient,
+    SystemExecutor, VerifierExecutor, WorkspaceExecutor, grant_from_work, inline_spawn,
+    thread_spawn,
 };
-use relay_providers::contract::ModelProvider;
 use relay_tools::ToolRegistry;
 use relay_workflows::WorkflowCatalog;
 
 use crate::error::AppError;
 use crate::jobs::DeliveryPrepJob;
+use crate::routing;
+use crate::runtime_routing::offline_plan;
 use crate::session::ProjectSession;
 use crate::sink::StoreFactSink;
 use crate::views::{self, RunView, TickView};
@@ -45,52 +48,73 @@ pub struct RuntimeWiring {
     pub spawn: Spawn,
     /// Whether duration watchdogs run (requires the threaded spawner).
     pub watchdogs: bool,
-    /// The model route granted to model-attempt work.
-    pub route: ModelRoute,
+    /// The resolved route plan grants select from: each executable work
+    /// item's routing purpose resolves to the primary route of its chain
+    /// (connection name, model, role) recorded in the attempt's immutable
+    /// grant.
+    pub routes: Arc<ResolvedRoutePlan>,
 }
 
 impl RuntimeWiring {
-    /// Production wiring over a provider adapter. Registers the system
+    /// Production wiring over the routed model client. Registers the system
     /// executor (always), the model executor, and the runtime owner's
     /// model-guided workspace/verifier planners. The human executor is
     /// deliberately absent: awaiting-human work is never scheduled by the
     /// engine, and a non-interactive tick must never answer for a person.
-    pub fn production(provider: Arc<dyn ModelProvider>, route: ModelRoute) -> Self {
-        let executors = ExecutorSet::new()
-            .with(Arc::new(SystemExecutor::new(Arc::new(DeliveryPrepJob))))
-            .with(Arc::new(ModelExecutor))
-            .with(Arc::new(WorkspaceExecutor::new(Arc::new(
-                ModelGuidedWorkspacePlanner::new(),
-            ))))
-            .with(Arc::new(VerifierExecutor::new(Arc::new(
-                ModelGuidedVerifierPlanner::new(),
-            ))));
+    ///
+    /// [`RuntimeRouting::into_wiring`](crate::runtime_routing::RuntimeRouting::into_wiring)
+    /// is the constructor that guarantees the client's plan and the shared
+    /// grant plan derive from one effective configuration.
+    pub fn routed(model: RoutedModelClient, routes: Arc<ResolvedRoutePlan>) -> Self {
         RuntimeWiring {
-            executors,
-            model: Arc::new(relay_executor::ProviderModelClient::new(provider)),
+            executors: production_executors(),
+            model: Arc::new(model),
             tools: default_tools(),
             spawn: thread_spawn(),
             watchdogs: true,
-            route,
+            routes,
         }
     }
 
     /// Deterministic wiring for tests: caller-supplied executors and model
-    /// client, inline spawning, no watchdogs.
+    /// client, inline spawning, no watchdogs, and the offline default route
+    /// plan (every purpose on `fake`/`fake-standard`) so injected wirings
+    /// keep working without live configuration.
     pub fn scripted(executors: ExecutorSet, model: Arc<dyn ModelClient>) -> Self {
+        RuntimeWiring::scripted_with_routes(executors, model, offline_plan())
+    }
+
+    /// [`Self::scripted`] with an explicit route plan, for tests that pin
+    /// per-purpose routes while keeping injected executors and model
+    /// clients.
+    pub fn scripted_with_routes(
+        executors: ExecutorSet,
+        model: Arc<dyn ModelClient>,
+        routes: Arc<ResolvedRoutePlan>,
+    ) -> Self {
         RuntimeWiring {
             executors,
             model,
             tools: default_tools(),
             spawn: inline_spawn(),
             watchdogs: false,
-            route: ModelRoute {
-                provider: "fake".to_string(),
-                model: "fake-standard".to_string(),
-                role: None,
-            },
+            routes,
         }
     }
+}
+
+/// The production executor set: system (delivery prep) plus the model,
+/// workspace, and verifier executors with the model-guided planners.
+pub(crate) fn production_executors() -> ExecutorSet {
+    ExecutorSet::new()
+        .with(Arc::new(SystemExecutor::new(Arc::new(DeliveryPrepJob))))
+        .with(Arc::new(ModelExecutor))
+        .with(Arc::new(WorkspaceExecutor::new(Arc::new(
+            ModelGuidedWorkspacePlanner::new(),
+        ))))
+        .with(Arc::new(VerifierExecutor::new(Arc::new(
+            ModelGuidedVerifierPlanner::new(),
+        ))))
 }
 
 /// The shared tool registry. Registration is compile-time fixed; if it ever
@@ -122,15 +146,16 @@ pub fn run_ticks(
     max_ticks: usize,
 ) -> Result<RunView, AppError> {
     session.require_initialized()?;
+    precheck_ready_work_routes(session, &wiring.routes)?;
     let versions_before = published_version_set(&session.graph());
     let sink = Arc::new(StoreFactSink::new(session.store()));
-    let route = wiring.route.clone();
+    let routes = Arc::clone(&wiring.routes);
     let grant_ids = Arc::new(relay_executor::IdSource::new());
-    let grants: relay_executor::GrantSource = Arc::new(move |work| {
+    let grants: GrantSource = Arc::new(move |work| {
         grant_from_work(
             grant_ids.next_grant_id(),
             work,
-            Some(route.clone()),
+            granted_route(&routes, work),
             relay_domain::Budget::default(),
         )
     });
@@ -219,6 +244,67 @@ pub fn run_ticks(
 /// unreasonable number of versions publishes the first
 /// [`AUTO_PUBLISH_LIMIT`] and reports the rest instead of looping.
 pub const AUTO_PUBLISH_LIMIT: usize = 64;
+
+/// Resolve the model route granted to one work item: the primary route of
+/// its routing purpose (connection name, model, and role all from the
+/// plan), or `None` for work that gets no model route — human work
+/// (decision-completed) and, defensively, unmapped custom kinds. The
+/// pre-check below guarantees ready executable work is never unmapped when
+/// a tick starts; work an attempt declared mid-run is bounded the same way
+/// by the routed client's unknown-route failure.
+fn granted_route(plan: &ResolvedRoutePlan, work: &WorkNode) -> Option<ModelRoute> {
+    if !routing::is_executable_work(&work.work.completion) {
+        return None;
+    }
+    let purpose = routing::routing_purpose(work.work.kind.as_str())?;
+    plan.primary(purpose)
+        .ok()
+        .map(|planned| planned.route.clone())
+}
+
+/// Verify, before the first orchestrator tick (and therefore before any
+/// state mutation), that every ready executable work item resolves to a
+/// routing purpose with a usable primary route. A custom executable kind
+/// absent from the built-in catalog fails here with an actionable
+/// diagnostic naming the work and its kind — custom executable work needs
+/// an explicit routing purpose and is never silently routed through
+/// another purpose. Human (decision-completed) work needs no route: the
+/// engine never schedules it for execution.
+fn precheck_ready_work_routes(
+    session: &ProjectSession,
+    plan: &ResolvedRoutePlan,
+) -> Result<(), AppError> {
+    let graph = session.graph();
+    for entry in &session.evaluation().ready {
+        let Some(node) = graph.work(&entry.work) else {
+            continue;
+        };
+        if !routing::is_executable_work(&node.work.completion) {
+            continue;
+        }
+        let kind = node.work.kind.as_str();
+        match routing::routing_purpose(kind) {
+            Some(purpose) => {
+                plan.primary(purpose).map_err(|error| {
+                    AppError::Configuration(format!(
+                        "work {} (kind \"{kind}\") routes through purpose \"{purpose}\", but \
+                         {error}",
+                        entry.work
+                    ))
+                })?;
+            }
+            None => {
+                return Err(AppError::Configuration(format!(
+                    "work {} has kind \"{kind}\", which the built-in workflow catalog does not \
+                     define, so it has no routing purpose; custom executable work needs an \
+                     explicit routing purpose before it can run",
+                    entry.work
+                )));
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Every published artifact version of a graph, keyed by
 /// `"<artifact>@<version>"`.

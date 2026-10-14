@@ -8,6 +8,31 @@
 //! output is requested via a system instruction), and requires alternating
 //! roles, so consecutive tool results are merged into a single user message.
 //! Wire types stay private to this module.
+//!
+//! # Capability enforcement
+//!
+//! The connection's [`AdapterCapabilities`] (adapter defaults, then an
+//! optional preset, then explicit overrides, resolved by the caller through
+//! [`crate::contract::resolve_capabilities`]) is enforced as a preflight
+//! inside [`ModelProvider::stream`], before any HTTP request is built:
+//!
+//! - `structured_output: JsonObject` — the default and only implemented
+//!   mode: the JSON Schema is embedded in the `system` prompt and the reply
+//!   text is parsed with the shared `parse_jsonish` helper into a
+//!   `StructuredOutput` event.
+//! - `structured_output: JsonSchema` — rejected before any HTTP call: the
+//!   Messages API has no `json_schema` response format, so the native mode
+//!   cannot be honored (configure `json-object` instead).
+//! - `structured_output: Unsupported` and `tool_calls: Unsupported` —
+//!   requests carrying those features fail with actionable errors before
+//!   any HTTP call.
+//! - `instructions` is recorded as `SystemInstruction`; the Messages API has
+//!   no developer role, so instructions always travel in the `system`
+//!   parameter (a configured `developer` style is this documented
+//!   translation, never a silent drop).
+//! - `output_token_param` is `MaxTokens` (the only parameter the protocol
+//!   accepts); `parallel_tool_calls` and `image_input` are recorded
+//!   capabilities only, enforced when Relay begins requesting them.
 
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver as StdReceiver, RecvTimeoutError};
@@ -18,9 +43,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::contract::{
-    AssistantContent, CancelToken, FinishReason, ModelMessage, ModelProvider, ModelRequest,
-    ProviderErrorKind, ProviderEventStream, ProviderFailure, ProviderName, ProviderStreamEvent,
-    ToolCall, ToolSpec,
+    AdapterCapabilities, AdapterKind, AssistantContent, CancelToken, FeatureSupport, FinishReason,
+    ModelMessage, ModelProvider, ModelRequest, ProviderErrorKind, ProviderEventStream,
+    ProviderFailure, ProviderStreamEvent, StructuredOutputMode, ToolCall, ToolSpec,
 };
 use crate::errors::to_provider_failure;
 use crate::sse::{FetchItem, fetch_sse};
@@ -43,11 +68,23 @@ const DEFAULT_MAX_TOKENS: u64 = 8192;
 /// Options for constructing an [`AnthropicProvider`].
 #[derive(Debug, Clone, Default)]
 pub struct AnthropicProviderOptions {
-    /// API key; when omitted the adapter reads `API_KEY_ENV` from the
-    /// environment. Never logged or echoed.
+    /// API key value; explicit values win over the environment. When
+    /// omitted, the adapter reads the variable named by
+    /// [`Self::api_key_env`] (default `ANTHROPIC_API_KEY`). Never logged or
+    /// echoed.
     pub api_key: Option<String>,
+    /// Name of the environment variable that carries the API key when
+    /// [`Self::api_key`] is omitted (default `ANTHROPIC_API_KEY`). Only the
+    /// variable *name* is configured; the value is resolved here, at the
+    /// adapter boundary, and never persisted.
+    pub api_key_env: Option<String>,
     /// Base URL override (used by the offline conformance tests).
     pub base_url: Option<String>,
+    /// Effective capability profile enforced by this connection. `None`
+    /// means the `anthropic` adapter defaults; configuration layers resolve
+    /// presets and overrides through
+    /// [`crate::contract::resolve_capabilities`] before construction.
+    pub capabilities: Option<AdapterCapabilities>,
 }
 
 // ---------------------------------------------------------------------------
@@ -192,20 +229,29 @@ enum WireStreamEvent {
 // ---------------------------------------------------------------------------
 
 /// The Anthropic Messages API provider.
+///
+/// One instance is one configured connection: its endpoint, resolved
+/// credential, and effective capability profile are fixed at construction,
+/// and every [`ModelProvider::stream`] call is preflight-checked against
+/// that profile before any HTTP request is built.
 pub struct AnthropicProvider {
     client: reqwest::blocking::Client,
     api_key: String,
     base_url: String,
+    capabilities: AdapterCapabilities,
 }
 
 impl AnthropicProvider {
     /// Build a provider. Mirrors the SDK's constructor behavior of failing
-    /// when no API key is available.
+    /// when no API key is available: an explicit key wins, then the
+    /// configured (or default) credential variable, then construction fails
+    /// with the redacted missing-variable auth error.
     pub fn new(options: AnthropicProviderOptions) -> Result<Self, ProviderFailure> {
+        let env_name = options.api_key_env.as_deref().unwrap_or(API_KEY_ENV);
         let api_key = crate::openai::resolve_api_key_for(
-            API_KEY_ENV,
+            env_name,
             options.api_key,
-            std::env::var(API_KEY_ENV).ok().as_deref(),
+            std::env::var(env_name).ok().as_deref(),
         )?;
         let client = reqwest::blocking::Client::builder()
             .timeout(REQUEST_TIMEOUT)
@@ -223,8 +269,73 @@ impl AnthropicProvider {
             base_url: options
                 .base_url
                 .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned()),
+            capabilities: options
+                .capabilities
+                .unwrap_or_else(|| AdapterCapabilities::defaults_for(AdapterKind::Anthropic)),
         })
     }
+
+    /// The effective capability profile this connection enforces.
+    pub fn capabilities(&self) -> &AdapterCapabilities {
+        &self.capabilities
+    }
+
+    /// Preflight a request against the connection's capability profile.
+    /// Returns the failure to emit before any HTTP request is built, or
+    /// `None` when every requested feature is supported or translated.
+    fn preflight_failure(&self, request: &ModelRequest) -> Option<ProviderFailure> {
+        if request
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+            && self.capabilities.tool_calls == FeatureSupport::Unsupported
+        {
+            return Some(unsupported_capability(
+                "tool_calls",
+                "the request carries tools, but this connection declares tool calls unsupported",
+            ));
+        }
+        if request.structured_output.is_some() {
+            match self.capabilities.structured_output {
+                StructuredOutputMode::Unsupported => {
+                    return Some(unsupported_capability(
+                        "structured_output",
+                        "the request asks for structured output, but this connection declares \
+                         structured output unsupported",
+                    ));
+                }
+                // The Messages API has no json_schema response format; the
+                // native mode cannot be honored, so fail closed rather than
+                // silently downgrading to the embedded-schema translation.
+                StructuredOutputMode::JsonSchema => {
+                    return Some(ProviderFailure::new(
+                        ProviderErrorKind::UnsupportedCapability,
+                        crate::errors::normalized_message(
+                            "structured-output mode json-schema is not implemented by the \
+                             anthropic adapter; configure structured-output: json-object on this \
+                             anthropic connection (the JSON Schema is embedded in the system \
+                             prompt)",
+                        ),
+                    ));
+                }
+                StructuredOutputMode::JsonObject => {}
+            }
+        }
+        None
+    }
+}
+
+/// An actionable preflight failure for a Relay feature the connection's
+/// capability profile does not allow, in the same shape the OpenAI-compatible
+/// adapter emits.
+fn unsupported_capability(capability: &str, detail: &str) -> ProviderFailure {
+    ProviderFailure::new(
+        ProviderErrorKind::UnsupportedCapability,
+        format!(
+            "unsupported capability on this anthropic connection: {capability} ({detail}); \
+             change the connection's capability configuration before retrying"
+        ),
+    )
 }
 
 fn map_stop_reason(reason: &str) -> FinishReason {
@@ -494,10 +605,12 @@ impl Iterator for AnthropicStream {
                         Err(error) => {
                             self.finished = true;
                             return Some(ProviderStreamEvent::Error {
-                                error: to_provider_failure(crate::errors::ErrorSignal {
-                                    message: format!("malformed stream event: {error}"),
-                                    ..crate::errors::ErrorSignal::default()
-                                }),
+                                error: ProviderFailure::new(
+                                    ProviderErrorKind::InvalidResponse,
+                                    crate::errors::normalized_message(&format!(
+                                        "malformed stream event: {error}"
+                                    )),
+                                ),
                             });
                         }
                     }
@@ -547,8 +660,8 @@ impl Iterator for AnthropicStream {
 }
 
 impl ModelProvider for AnthropicProvider {
-    fn name(&self) -> ProviderName {
-        ProviderName::Anthropic
+    fn name(&self) -> AdapterKind {
+        AdapterKind::Anthropic
     }
 
     fn models(&self) -> Vec<String> {
@@ -569,6 +682,14 @@ impl ModelProvider for AnthropicProvider {
         {
             let failure =
                 ProviderFailure::new(ProviderErrorKind::Canceled, "This operation was aborted");
+            return Box::new(std::iter::once(ProviderStreamEvent::Error {
+                error: failure,
+            }));
+        }
+
+        // Capability preflight: a Relay feature this connection cannot carry
+        // or translate fails here, before any HTTP request is built.
+        if let Some(failure) = self.preflight_failure(request) {
             return Box::new(std::iter::once(ProviderStreamEvent::Error {
                 error: failure,
             }));

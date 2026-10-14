@@ -16,8 +16,8 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::contract::{
-    CancelToken, FinishReason, ModelProvider, ModelRequest, ProviderErrorKind, ProviderEventStream,
-    ProviderFailure, ProviderName, ProviderStreamEvent, ToolCall,
+    AdapterCapabilities, AdapterKind, CancelToken, FinishReason, ModelProvider, ModelRequest,
+    ProviderErrorKind, ProviderEventStream, ProviderFailure, ProviderStreamEvent, ToolCall,
 };
 
 /// How a scripted step matches the request purpose.
@@ -159,6 +159,13 @@ impl FakeProvider {
         Self::new(Vec::new())
     }
 
+    /// The fake's capability profile: the `fake` adapter defaults. The fake
+    /// is maximally permissive and performs no protocol translation, so the
+    /// profile is a constant, never a construction option.
+    pub fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities::defaults_for(AdapterKind::Fake)
+    }
+
     /// Ordered log of every call this provider served.
     pub fn call_log(&self) -> Vec<FakeCallLogEntry> {
         self.lock_state().log.clone()
@@ -228,8 +235,8 @@ impl FakeProvider {
 }
 
 impl ModelProvider for FakeProvider {
-    fn name(&self) -> ProviderName {
-        ProviderName::Fake
+    fn name(&self) -> AdapterKind {
+        AdapterKind::Fake
     }
 
     fn models(&self) -> Vec<String> {
@@ -768,7 +775,24 @@ mod tests {
     #[test]
     fn reports_name_and_models() {
         let provider = FakeProvider::echo();
-        assert_eq!(provider.name(), ProviderName::Fake);
+        assert_eq!(provider.name(), AdapterKind::Fake);
         assert_eq!(provider.models(), vec!["fake-standard", "fake-mini"]);
+    }
+
+    #[test]
+    fn reports_the_maximally_permissive_fake_capability_defaults() {
+        let provider = FakeProvider::echo();
+        assert_eq!(
+            provider.capabilities(),
+            AdapterCapabilities::defaults_for(AdapterKind::Fake)
+        );
+        assert_eq!(
+            provider.capabilities().tool_calls,
+            crate::contract::FeatureSupport::Supported
+        );
+        assert_eq!(
+            provider.capabilities().structured_output,
+            crate::contract::StructuredOutputMode::JsonSchema
+        );
     }
 }

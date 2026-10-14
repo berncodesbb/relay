@@ -533,6 +533,7 @@ fn guided_session(
             system: Some(guidance.system_prompt()),
             prompt,
             max_output_tokens: spec.grant.budget.max_output_tokens,
+            temperature: None,
         };
         let response = match context.model.complete(&route, &request, &context.signal) {
             Ok(response) => response,
@@ -840,6 +841,7 @@ mod tests {
                 text,
                 input_tokens: 1,
                 output_tokens: 1,
+                routes_attempted: Vec::new(),
             })
         }
     }

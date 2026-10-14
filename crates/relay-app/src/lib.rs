@@ -22,7 +22,9 @@
 //!   conversation facts.
 //! - [`runner`]: orchestrator composition for `run` (which executors, which
 //!   model client, how jobs spawn).
-//! - [`providers`]: provider-name resolution for runs (preview wiring).
+//! - [`routing`]: the catalog-phase → routing-purpose mapping grants consult.
+//! - [`runtime_routing`]: configuration-driven routing for runs and
+//!   conversational turns (registry, plan, turn seam).
 //! - [`views`]: serde view models — the single shape JSON and human
 //!   presentations render.
 //! - [`markdown`]: deterministic Markdown views over published artifact
@@ -37,13 +39,15 @@ pub mod error;
 pub mod ids;
 pub mod jobs;
 pub mod markdown;
-pub mod providers;
+pub mod routing;
 pub mod runner;
+pub mod runtime_routing;
 pub mod session;
 pub mod sink;
 pub mod views;
 
 pub use error::AppError;
 pub use runner::RuntimeWiring;
+pub use runtime_routing::{RuntimeRouting, TurnRouting};
 pub use session::{ProjectSession, SessionOpenReport, SessionOptions, SessionSnapshot};
 pub use sink::StoreFactSink;

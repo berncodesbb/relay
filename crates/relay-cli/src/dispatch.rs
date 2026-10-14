@@ -11,15 +11,14 @@
 
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use relay_app::commands as app;
 use relay_app::conversation::{self, ConversationEvent, ConversationLimits, TurnStatus};
-use relay_app::providers;
+use relay_app::runtime_routing::{RuntimeRouting, TurnRouting};
 use relay_app::session::{ProjectSession, SessionOptions};
 use relay_app::{AppError, RuntimeWiring};
 use relay_engine::{Autonomy, SchedulingPolicy};
-use relay_providers::contract::{CancelToken, ModelProvider};
+use relay_providers::contract::CancelToken;
 
 use crate::args::Command;
 use crate::args::DoctorAction;
@@ -31,14 +30,18 @@ use crate::invocation::TerminalCapability;
 use crate::output::OutputWriter;
 use crate::render;
 
-/// How a run wires its runtime: production (provider-backed, by name) or
+/// How a run wires its runtime: production (configuration-driven) or
 /// injected (deterministic tests).
 #[derive(Clone)]
 pub enum RuntimeSelection {
-    /// Build production wiring for a provider name.
+    /// Resolve production wiring from the effective configuration. The
+    /// optional provider-connection override is the `--provider` flag: a
+    /// configured connection name that every route is forced onto (the
+    /// legacy `fake`, `openai`, and `anthropic` spellings are the default
+    /// connection names). `None` routes through configuration as-is.
     Production {
-        /// The provider name (`fake`, `openai`, `anthropic`).
-        provider: String,
+        /// The `--provider <connection>` override, when given.
+        provider: Option<String>,
     },
     /// Use caller-supplied wiring (tests).
     Injected(RuntimeWiring),
@@ -54,12 +57,12 @@ pub struct CliDeps {
 }
 
 impl CliDeps {
-    /// Production dependencies: real clocks, provider by name.
+    /// Production dependencies: real clocks, optional provider override.
     pub fn production(provider: Option<&str>) -> Self {
         CliDeps {
             session_options: SessionOptions::production(),
             runtime: RuntimeSelection::Production {
-                provider: provider.unwrap_or(providers::DEFAULT_PROVIDER).to_string(),
+                provider: provider.map(str::to_string),
             },
         }
     }
@@ -234,14 +237,8 @@ pub fn run_with_capability(
                 Some(_) if matches!(deps.runtime, RuntimeSelection::Injected(_)) => {
                     deps.runtime.clone()
                 }
-                Some(name) => match validate_provider(name) {
-                    Ok(()) => RuntimeSelection::Production {
-                        provider: name.to_string(),
-                    },
-                    Err(error) => {
-                        writer.error(&format!("relay: {error}"));
-                        return EXIT_USAGE;
-                    }
+                Some(name) => RuntimeSelection::Production {
+                    provider: Some(name.to_string()),
                 },
             };
             run_command(
@@ -389,11 +386,16 @@ fn emit<T: serde::Serialize>(
     EXIT_OK
 }
 
-/// Map an [`AppError`] onto message + exit code.
+/// Map an [`AppError`] onto message + exit code. Configuration, credential,
+/// and route-resolution failures are usage-class (2); runtime failures stay
+/// 1.
 fn app_error(writer: &mut OutputWriter, error: AppError) -> i32 {
     writer.error(&format!("relay: {}", error.message()));
     if matches!(error, AppError::NotInitialized) {
         writer.error("Initialize the project first: `relay init --goal <text>`.");
+    }
+    if matches!(error, AppError::Configuration(_)) {
+        return EXIT_USAGE;
     }
     EXIT_FAILURE
 }
@@ -465,19 +467,31 @@ fn chat_command(
         writer.error("Run `relay --help` for usage.");
         return EXIT_USAGE;
     }
-    crate::tui::run_chat(workspace, deps, initial_prompt)
+    // Routing resolves before any terminal setup and before any state: an
+    // invalid configuration or unavailable intent connection is a plain
+    // usage-class message, never a raw-mode surprise or a half-created
+    // workspace.
+    let routing = match conversational_routing(workspace, &deps.runtime) {
+        Ok(routing) => routing,
+        Err(error) => return app_error(writer, error),
+    };
+    crate::tui::run_chat(workspace, deps, routing, initial_prompt)
 }
 
-/// Resolve the conversational provider: the same selection as `run` — the
-/// production wiring's provider name (default fake); injected test
-/// wirings carry run-command executors, so their scripted turns use the
-/// deterministic fake.
-pub(crate) fn conversational_provider(
+/// Resolve the conversational turn routing: the same selection as `run` —
+/// the production wiring's provider-connection override when one was
+/// given; injected test wirings carry run-command executors, so their
+/// scripted turns use the configuration's default routing (the offline
+/// fake profile in a fresh workspace).
+pub(crate) fn conversational_routing(
+    workspace: &Path,
     runtime: &RuntimeSelection,
-) -> Result<(Arc<dyn ModelProvider>, String), AppError> {
+) -> Result<TurnRouting, AppError> {
     match runtime {
-        RuntimeSelection::Production { provider } => providers::provider_by_name(provider),
-        RuntimeSelection::Injected(_) => providers::provider_by_name(providers::DEFAULT_PROVIDER),
+        RuntimeSelection::Production { provider } => {
+            RuntimeRouting::resolve(workspace, provider.as_deref())?.turn_routing()
+        }
+        RuntimeSelection::Injected(_) => RuntimeRouting::resolve(workspace, None)?.turn_routing(),
     }
 }
 
@@ -485,7 +499,7 @@ pub(crate) fn conversational_provider(
 /// TTY and off it — no terminal mode is ever entered. The final assistant
 /// text goes to stdout; proposal outcomes, failures, and cancellation
 /// reasons go to stderr. Exit codes: 0 completed, 1 failed/cancelled or
-/// infrastructure error, 2 malformed invocation.
+/// infrastructure error, 2 malformed invocation or invalid routing.
 fn print_command(writer: &mut OutputWriter, workspace: &Path, deps: &CliDeps, prompt: &str) -> i32 {
     let prompt = prompt.trim();
     if prompt.is_empty() {
@@ -493,8 +507,11 @@ fn print_command(writer: &mut OutputWriter, workspace: &Path, deps: &CliDeps, pr
         writer.error("Run `relay --help` for usage.");
         return EXIT_USAGE;
     }
-    let (provider, model) = match conversational_provider(&deps.runtime) {
-        Ok(resolved) => resolved,
+    // Routing resolves before the session opens: an invalid configuration,
+    // unknown connection, or unavailable intent connection fails here with
+    // the usage exit code and creates no project state.
+    let routing = match conversational_routing(workspace, &deps.runtime) {
+        Ok(routing) => routing,
         Err(error) => return app_error(writer, error),
     };
     // The turn durably records its facts, so the session (and on a fresh
@@ -507,8 +524,7 @@ fn print_command(writer: &mut OutputWriter, workspace: &Path, deps: &CliDeps, pr
     let (events, drain) = std::sync::mpsc::channel::<ConversationEvent>();
     let turn = conversation::start_turn(
         &session,
-        provider,
-        &model,
+        routing,
         prompt,
         &ConversationLimits::default(),
         CancelToken::new(),
@@ -588,14 +604,22 @@ fn run_command(
     policy: SchedulingPolicy,
     max_ticks: usize,
 ) -> i32 {
+    // Production wiring resolves from the effective configuration and
+    // preflights its routes before the session opens: invalid
+    // configuration, an unknown `--provider` connection, or a missing
+    // credential on a route's primary connection is a usage-class failure
+    // that creates no project state. Provider *transport* failures stay
+    // runtime failures (exit 1) inside the run.
     let wiring = match selection {
-        RuntimeSelection::Production { provider } => match providers::route_for(&provider) {
-            Ok(route) => match providers::provider_by_name(&provider) {
-                Ok((provider, _)) => RuntimeWiring::production(provider, route),
+        RuntimeSelection::Production { provider } => {
+            match RuntimeRouting::resolve(workspace, provider.as_deref()) {
+                Ok(routing) => match routing.preflight_purposes() {
+                    Ok(()) => routing.into_wiring(),
+                    Err(error) => return app_error(writer, error),
+                },
                 Err(error) => return app_error(writer, error),
-            },
-            Err(error) => return app_error(writer, error),
-        },
+            }
+        }
         RuntimeSelection::Injected(wiring) => wiring,
     };
     let session = match ProjectSession::open(workspace, deps.session_options.clone()) {
@@ -822,17 +846,6 @@ fn parse_autonomy(text: Option<&str>) -> Result<SchedulingPolicy, String> {
     })
 }
 
-fn validate_provider(name: &str) -> Result<(), String> {
-    if providers::PROVIDER_NAMES.contains(&name) {
-        Ok(())
-    } else {
-        Err(format!(
-            "unknown provider \"{name}\" (expected one of: {})",
-            providers::PROVIDER_NAMES.join(", ")
-        ))
-    }
-}
-
 fn split_reference(target: &str) -> (String, Option<u32>) {
     match target.split_once('@') {
         Some((artifact, version)) => (artifact.to_string(), version.parse::<u32>().ok()),
@@ -867,12 +880,25 @@ mod tests {
     }
 
     #[test]
-    fn the_conversational_provider_follows_the_run_selection() {
-        let (provider, model) = conversational_provider(&RuntimeSelection::Production {
-            provider: "fake".to_string(),
-        })
-        .unwrap();
-        assert_eq!(model, "fake-standard");
-        assert_eq!(provider.name().as_str(), "fake");
+    fn the_conversational_routing_follows_the_run_selection() {
+        // A unique scratch directory (std-only: lib unit tests have no
+        // dev-dependencies), removed before asserting so a failure cannot
+        // leak it.
+        let root = std::env::temp_dir().join(format!(
+            "relay-cli-dispatch-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).ok().unwrap();
+        let routing =
+            conversational_routing(&root, &RuntimeSelection::Production { provider: None })
+                .ok()
+                .unwrap();
+        std::fs::remove_dir_all(&root).ok();
+        // The offline default: the intent route resolves onto the fake
+        // connection with its default model.
+        assert_eq!(routing.route.provider, "fake");
+        assert_eq!(routing.route.model, "fake-standard");
+        assert_eq!(routing.provider.name().as_str(), "fake");
     }
 }

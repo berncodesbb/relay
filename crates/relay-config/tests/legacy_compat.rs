@@ -1,8 +1,10 @@
 //! Ports of the retired `test/unit/config/legacy-compat.test.ts` (removed
-//! from the tree 2026-10-14): TODAY's behavior for
+//! from the repository 2026-10-14): TODAY's behavior for
 //! complete version-1 configurations that use only inline mode routes (no
-//! `models` catalog, no role references, no `intent` key). The named-role
-//! routing work must keep every one of these passing unchanged.
+//! `models` catalog, no role references, no `intent` key). The
+//! named-connection routing work must keep every one of these passing with
+//! equivalent semantics: the same chains modulo `provider` now being the
+//! connection-name string.
 //!
 //! The TypeScript file also drives a `ModelRouter` with fake providers; the
 //! router-owned assertions are covered here through the same normalized
@@ -13,9 +15,10 @@
 mod common;
 
 use common::{LEGACY_YAML, defaults, load_for, workspace_with_project_config};
+use relay_config::DEFAULT_FAKE_MODEL;
 use relay_config::load::{ConfigOverrides, LoadOptions, load_config};
 use relay_config::normalized::{NormalizedRoute, normalize_routing};
-use relay_config::schema::{ProviderName, RoutingValue, WORKFLOW_MODES};
+use relay_config::schema::{RoutingValue, WORKFLOW_MODES};
 
 fn parse_legacy(text: &str) -> relay_config::schema::RelayConfig {
     relay_config::load::parse_yaml_layer("legacy.yaml", text).expect("legacy layer should parse")
@@ -32,7 +35,7 @@ fn parses_a_complete_version_one_inline_only_configuration_unchanged() {
     assert_eq!(
         parsed.routing.get("verification"),
         Some(&RoutingValue::Inline(relay_config::schema::RouteConfig {
-            provider: ProviderName::OpenAi,
+            provider: "openai".to_string(),
             model: "gpt-5.2".to_string(),
             fallbacks: None,
             limits: None,
@@ -42,12 +45,25 @@ fn parses_a_complete_version_one_inline_only_configuration_unchanged() {
         Some(RoutingValue::Inline(route)) => assert_eq!(
             route.fallbacks,
             Some(vec![relay_config::schema::InlineFallback {
-                provider: ProviderName::Anthropic,
+                provider: "anthropic".to_string(),
                 model: "claude-sonnet-5-5".to_string(),
             }])
         ),
         other => panic!("planning should be an inline route: {other:?}"),
     }
+    // The legacy provider spellings load with the default connection set:
+    // the two legacy live keys plus the offline fake from the defaults layer
+    // when merged.
+    assert!(parsed.providers.contains("openai"));
+    assert!(parsed.providers.contains("anthropic"));
+    assert_eq!(
+        parsed.providers.get("openai").unwrap().adapter,
+        relay_config::schema::AdapterKind::OpenaiChat
+    );
+    assert_eq!(
+        parsed.providers.get("anthropic").unwrap().adapter,
+        relay_config::schema::AdapterKind::Anthropic
+    );
 }
 
 #[test]
@@ -66,14 +82,14 @@ fn resolves_every_workflow_mode_through_inline_routes_without_a_models_catalog()
             .purpose_chains
             .get(key)
             .and_then(|chain| chain.first())
-            .map(|route| route.provider)
+            .map(|route| route.provider.clone())
     };
     assert_eq!(model_of("discovery"), Some("claude-sonnet-5-5".to_string()));
     assert_eq!(
         model_of("technical-design"),
         Some("claude-opus-5-5".to_string())
     );
-    assert_eq!(provider_of("verification"), Some(ProviderName::OpenAi));
+    assert_eq!(provider_of("verification"), Some("openai".to_string()));
     assert_eq!(model_of("delivery"), Some("claude-haiku-4-5".to_string()));
     // No role names are fabricated for inline routes.
     assert_eq!(
@@ -94,7 +110,7 @@ fn keeps_the_historical_intent_fallback_first_configured_route_insertion_order()
     let routing = normalize_routing(&config);
     let fallback = routing.legacy_fallback.as_ref().unwrap();
     assert_eq!(fallback.len(), 1);
-    assert_eq!(fallback[0].provider, ProviderName::Anthropic);
+    assert_eq!(fallback[0].provider, "anthropic");
     assert_eq!(fallback[0].model, "claude-sonnet-5-5");
     assert_eq!(
         fallback,
@@ -116,35 +132,16 @@ fn preserves_inline_fallback_order_in_the_normalized_chain() {
 }
 
 #[test]
-fn builtin_defaults_still_route_every_mode_to_todays_providers_and_models() {
+fn builtin_defaults_route_every_mode_to_the_offline_fake_connection() {
     assert_eq!(defaults().version, 1);
     let routing = normalize_routing(&defaults());
-    let expected: Vec<(&str, ProviderName, &str)> = vec![
-        ("discovery", ProviderName::Anthropic, "claude-sonnet-5-5"),
-        (
-            "specification",
-            ProviderName::Anthropic,
-            "claude-sonnet-5-5",
-        ),
-        (
-            "technical-design",
-            ProviderName::Anthropic,
-            "claude-opus-5-5",
-        ),
-        ("planning", ProviderName::Anthropic, "claude-sonnet-5-5"),
-        (
-            "implementation",
-            ProviderName::Anthropic,
-            "claude-sonnet-5-5",
-        ),
-        ("verification", ProviderName::OpenAi, "gpt-5.2"),
-        ("delivery", ProviderName::Anthropic, "claude-haiku-4-5"),
-    ];
-    for (mode, provider, model) in expected {
-        let chain = routing.purpose_chains.get(mode).unwrap();
+    let mut modes: Vec<&str> = WORKFLOW_MODES.to_vec();
+    modes.push("intent");
+    for key in modes {
+        let chain = routing.purpose_chains.get(key).unwrap();
         let first: &NormalizedRoute = chain.first().unwrap();
-        assert_eq!(first.provider, provider, "{mode}");
-        assert_eq!(first.model, model, "{mode}");
+        assert_eq!(first.provider, "fake", "{key}");
+        assert_eq!(first.model, DEFAULT_FAKE_MODEL, "{key}");
     }
 }
 
@@ -187,6 +184,18 @@ routing:
         loaded.config.budgets.max_turns,
         defaults().budgets.max_turns
     );
+    // The legacy openai/anthropic settings keep their default credential
+    // variable names after the merge.
+    assert_eq!(
+        loaded
+            .config
+            .providers
+            .get("openai")
+            .unwrap()
+            .api_key_env
+            .as_deref(),
+        Some("OPENAI_API_KEY")
+    );
 }
 
 #[test]
@@ -197,19 +206,14 @@ fn force_provider_rewrites_providers_while_keeping_model_identifiers() {
         user_config_path: None,
         overrides: Some(ConfigOverrides {
             autonomy: None,
-            force_provider: Some(ProviderName::Fake),
+            force_provider: Some("fake".to_string()),
         }),
     })
     .unwrap();
     let routing = normalize_routing(&loaded.config);
     for mode in WORKFLOW_MODES {
         let chain = routing.purpose_chains.get(mode).unwrap();
-        assert!(
-            chain
-                .iter()
-                .all(|route| route.provider == ProviderName::Fake),
-            "{mode}"
-        );
+        assert!(chain.iter().all(|route| route.provider == "fake"), "{mode}");
     }
     assert_eq!(
         routing

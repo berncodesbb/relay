@@ -138,12 +138,15 @@ Read/model attempts may run concurrently; workspace-changing attempts are serial
 
 ## Providers (`relay-providers`)
 
-The neutral contract (`ModelClient`, streaming events, usage, finish reasons) is the only boundary between runtime and vendors. Adapters translate SDK/wire responses into Relay-owned types inside their modules; provider wire types stay private:
+The neutral contract (`ModelClient`, streaming events, usage, finish reasons) is the only boundary between runtime and vendors. Adapter identity is the wire *protocol* — the closed set `openai-chat` (any OpenAI-compatible Chat Completions endpoint), `anthropic`, and `fake` — kept deliberately distinct from the user-named **provider connections** in configuration; several connections may share one adapter, and no vendor ever earns its own enum variant. Adapters translate wire responses into Relay-owned types inside their modules; provider wire types stay private:
 
-- **OpenAI adapter** — Chat Completions with streaming and usage; model-specific token-limit handling.
-- **Anthropic adapter** — Messages API with merged tool results and defaulted token limits.
-- **Fake provider** — in-process, offline, scriptable; the deterministic engine behind tests and the default for `relay run`.
-- **Error normalization** — SDK/transport failures map to neutral kinds (`rate-limit`, `server`, `network`, `timeout`, `canceled`, `auth`, `invalid-response`, `unknown`) with retryability hints and redacted, trimmed messages. Headers and bodies never survive the adapter.
+- **openai-chat adapter** — Chat Completions compatibility with streaming, usage, tools, and structured output (native `json-schema` or the `json-object` translation with the schema embedded in the instruction). Not the Responses API, and not a promise of full OpenAI parity.
+- **anthropic adapter** — Messages API with merged tool results and defaulted token limits.
+- **Fake adapter** — in-process, offline, scriptable; the deterministic engine behind tests and the built-in default routing.
+- **Capability profiles** — each connection carries an effective profile resolved as adapter defaults → preset (first shipped: `glm`) → explicit overrides. A requested feature is translated by a documented rule (developer → system instruction; `json-schema` → `json-object` embedding) or rejected with an `unsupported-capability` failure **before any HTTP request** — never silently dropped.
+- **Error normalization** — SDK/transport failures map to neutral kinds (`rate-limit`, `server`, `network`, `timeout`, `canceled`, `auth`, `invalid-response`, `unsupported-capability`, `unknown`) with retryability hints and redacted, trimmed messages. Headers and bodies never survive the adapter.
+
+Model routing composes at the application seam: the executor's connection registry builds each configured connection once (credential values are resolved from the configured environment-variable names at construction and never logged), and the routed model client resolves each attempt's granted route through it — bounded, ordered fallback along the normalized chain for availability failures only (never for cancellation, invalid output, auth, or unsupported capabilities), with every attempted route visible in bounded, redacted diagnostics.
 
 ## Tools and safety (`relay-tools`)
 
@@ -159,7 +162,7 @@ Capability grants (scoped operations and paths per work item) are enforced befor
 
 ## Configuration (`relay-config`)
 
-Layered YAML configuration (defaults < user < project < invocation) with strict, actionable validation: the named model-role catalog, purpose routing (including the legacy inline form), budgets, tool settings, and provider credential-variable names. Configuration contains no credentials — only the *names* of environment variables holding them. See [configuration.md](configuration.md).
+Layered YAML configuration (defaults < user < project < invocation) with strict, actionable validation: named provider connections (adapter kind, credential-variable name, base URL, capability preset/overrides), the named model-role catalog, purpose routing (including the legacy inline form), budgets, and tool settings. The built-in defaults are an explicit offline profile — every role on the `fake` connection — so a fresh checkout is fully offline by configuration, not by CLI branching. Configuration contains no credentials — only the *names* of environment variables holding them. See [configuration.md](configuration.md).
 
 ## Artifacts (`relay-artifacts`)
 
@@ -206,7 +209,8 @@ The fixture corpus under `tests/fixtures/` is frozen historical evidence exporte
 
 ## Extension points
 
-- **New provider adapter.** Implement the neutral contract in `relay-providers`, normalize errors through the shared failure mapping, and register the provider name in `relay-config`. Nothing outside the adapter changes.
+- **New provider connection.** Any OpenAI-compatible endpoint is YAML only: name a connection under `providers:` with `adapter: openai-chat`, its base URL, credential-variable name, and optional preset. No code changes.
+- **New adapter kind.** Implementing a new wire protocol means adding an `AdapterKind` and adapter in `relay-providers` (neutral contract, private wire types, capability defaults, error normalization through the shared failure mapping). Nothing outside the adapter changes.
 - **New tool.** Define a typed `ToolDefinition` (args schema, capability, timeout, output cap) and register it in `create_default_tool_registry`; capability grants and the permission gate pick it up.
 - **New workflow work definition.** Extend the catalog in `relay-workflows` (work definition, schemas, completion and invalidation rules, view template). Expansion still flows through `validate_graph_change`.
 - **Configuration layers.** Add or adjust layers in `relay-config/src/load.rs`; see [configuration.md](configuration.md) for precedence.

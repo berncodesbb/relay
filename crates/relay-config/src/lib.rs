@@ -2,11 +2,12 @@
 //!
 //! Relay is configured in YAML with strict, actionable validation. This crate
 //! ports the retired TypeScript implementation (`src/config/**`, removed from
-//! the tree 2026-10-14): raw layered
-//! parsing (defaults < user < project < invocation), the named model-role
-//! catalog with role-reference or legacy inline routing values, effective
-//! (merged) configuration cross-reference validation, the runtime-facing
-//! normalized routing contract, and invocation override precedence.
+//! the tree 2026-10-14) and generalizes its providers: raw layered parsing
+//! (defaults < user < project < invocation), named provider connections bound
+//! to reusable protocol adapters, the named model-role catalog with
+//! role-reference or legacy inline routing values, effective (merged)
+//! configuration cross-reference validation, the runtime-facing normalized
+//! routing contract, and invocation override precedence.
 //!
 //! Configuration never contains credentials — only the *names* of environment
 //! variables that hold them; keys are read from the environment at provider
@@ -37,7 +38,7 @@ pub mod normalized;
 pub mod raw;
 pub mod schema;
 
-pub use defaults::default_config;
+pub use defaults::{DEFAULT_CONNECTION_NAMES, DEFAULT_FAKE_MODEL, default_config};
 pub use invocation::{InvocationOverrides, RouteResolutionError, apply_invocation_overrides};
 pub use load::{
     ConfigError, ConfigLayer, ConfigLayerSource, ConfigOverrides, EFFECTIVE_CONFIG_SOURCE,
@@ -50,9 +51,10 @@ pub use normalized::{
 };
 pub use raw::{RawMapping, RawValue, YamlError};
 pub use schema::{
-    ALLOWED_ROUTING_KEYS, AUTONOMY_MESSAGE, BudgetLimits, CONFIG_SCHEMA_VERSION,
-    ConfigValidationError, InlineFallback, ModelRoleConfig, PROVIDER_NAMES, ProviderName,
-    ProviderSettings, Providers, ROLE_NAME_MESSAGE, ROLE_NAME_PATTERN, ROUTING_VALUE_MESSAGE,
-    RelayConfig, RouteConfig, RouteLimits, RoutingValue, ToolSettings, WORKFLOW_MODES,
-    is_valid_role_name, parse_relay_config,
+    ALLOWED_ROUTING_KEYS, API_KEY_ENV_MESSAGE, AUTONOMY_MESSAGE, AdapterKind, BudgetLimits,
+    CONFIG_SCHEMA_VERSION, CONNECTION_NAME_MESSAGE, CapabilityOverrides, ConfigValidationError,
+    InlineFallback, ModelRoleConfig, PROVIDER_REFERENCE_MESSAGE, ProviderConnection, Providers,
+    ROLE_NAME_MESSAGE, ROLE_NAME_PATTERN, ROUTING_VALUE_MESSAGE, RelayConfig, RouteConfig,
+    RouteLimits, RoutingValue, ToolSettings, WORKFLOW_MODES, is_valid_role_name,
+    parse_relay_config,
 };

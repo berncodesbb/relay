@@ -1,12 +1,50 @@
-//! OpenAI adapter.
+//! OpenAI-compatible chat-completions adapter.
 //!
 //! Ported from `src/providers/openai.ts` (retired TypeScript tree, removed
 //! from the repository 2026-10-14). Translates Relay-owned requests
-//! into OpenAI chat-completion wire calls and normalizes streamed chunks back
+//! into OpenAI Chat Completions wire calls and normalizes streamed chunks back
 //! into Relay-owned provider events. No wire type appears in this module's
 //! public API; errors pass through the shared normalizer so headers and
 //! bodies never leak. SDK-level retries are disabled so Relay's own retry
 //! policy owns backoff.
+//!
+//! This adapter speaks the *protocol*, not a vendor: any OpenAI-compatible
+//! `/chat/completions` endpoint (OpenAI itself, GLM, other gateways, local
+//! servers) is a connection built on it, distinguished by its configured
+//! base URL, credential variable name, and effective capability profile.
+//!
+//! # Capability enforcement
+//!
+//! The connection's [`AdapterCapabilities`] (resolved by the caller from
+//! adapter defaults, an optional preset, then explicit overrides — see
+//! [`crate::contract::resolve_capabilities`]) is enforced as a preflight
+//! inside [`ModelProvider::stream`], before any HTTP request is built:
+//!
+//! - `instructions: SystemInstruction` — the documented safe fallback that
+//!   carries the Relay system prompt as a `system`-role message instead of
+//!   `developer` (used by the GLM preset).
+//! - `structured_output: JsonSchema` — the native
+//!   `response_format: json_schema` request (default).
+//! - `structured_output: JsonObject` — `response_format: {"type":
+//!   "json_object"}` plus the JSON Schema embedded in a bounded instruction
+//!   block so the model knows the required shape; the reply text is parsed
+//!   with the shared `parse_jsonish` helper into a `StructuredOutput` event.
+//! - `structured_output: Unsupported` — a request carrying structured output
+//!   fails with an actionable error before any HTTP call.
+//! - `tool_calls: Unsupported` — a request carrying tools fails the same way.
+//! - `streamed_usage: Unsupported` — `stream_options` is omitted entirely
+//!   and streams that never report usage complete with zero usage.
+//! - `output_token_param` — `MaxTokens` always sends `max_tokens`,
+//!   `MaxCompletionTokens` always sends `max_completion_tokens`, and
+//!   `ModelDefault` keeps the per-model heuristic (`gpt-5*`/`o<digit>*`
+//!   models use `max_completion_tokens`).
+//!
+//! `parallel_tool_calls` and `image_input` are recorded capabilities only:
+//! Relay does not request either yet, so nothing is enforced, and the profile
+//! exists so the gap fails early when Relay starts requesting them.
+//! `streamed_tool_arguments` is likewise recorded only — the accumulator
+//! already tolerates arguments arriving whole or split across any number of
+//! deltas.
 
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver as StdReceiver, RecvTimeoutError};
@@ -17,8 +55,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::contract::{
-    CancelToken, FinishReason, ModelMessage, ModelProvider, ModelRequest, ProviderErrorKind,
-    ProviderEventStream, ProviderFailure, ProviderName, ProviderStreamEvent, ToolCall, ToolSpec,
+    AdapterCapabilities, AdapterKind, CancelToken, FeatureSupport, FinishReason, InstructionStyle,
+    ModelMessage, ModelProvider, ModelRequest, OutputTokenParam, ProviderErrorKind,
+    ProviderEventStream, ProviderFailure, ProviderStreamEvent, StructuredOutputMode,
+    StructuredOutputRequest, ToolCall, ToolSpec,
 };
 use crate::errors::to_provider_failure;
 use crate::sse::{FetchItem, fetch_sse};
@@ -29,17 +69,43 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 /// Total request timeout, matching the OpenAI SDK's 10-minute default.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Environment variable read when no API key is passed in.
+/// Environment variable read when no API key is passed in and no variable
+/// name is configured.
 const API_KEY_ENV: &str = "OPENAI_API_KEY";
 
+/// Upper bound on a JSON Schema embedded into instruction text for the
+/// `json_object` structured-output translation, so a pathological schema
+/// cannot silently balloon the prompt.
+const MAX_EMBEDDED_SCHEMA_CHARS: usize = 16 * 1024;
+
 /// Options for constructing an [`OpenAIProvider`].
+///
+/// Each configured provider connection builds its own provider from its own
+/// options, so any number of `openai-chat` connections (OpenAI, GLM, local
+/// gateways) can coexist with distinct endpoints, credential variables, and
+/// capability profiles.
 #[derive(Debug, Clone, Default)]
 pub struct OpenAIProviderOptions {
-    /// API key; when omitted the adapter reads `API_KEY_ENV` from the
-    /// environment. Never logged or echoed.
+    /// API key value; explicit values win over the environment. When
+    /// omitted, the adapter reads the variable named by
+    /// [`Self::api_key_env`] (default `OPENAI_API_KEY`). Never logged or
+    /// echoed.
     pub api_key: Option<String>,
-    /// Base URL override (used by the offline conformance tests).
+    /// Name of the environment variable that carries the API key when
+    /// [`Self::api_key`] is omitted (default `OPENAI_API_KEY`). Only the
+    /// variable *name* is configured; the value is resolved here, at the
+    /// adapter boundary, and never persisted.
+    pub api_key_env: Option<String>,
+    /// Base URL override (used by the offline conformance tests). The
+    /// adapter appends `/chat/completions` after trimming trailing slashes,
+    /// so bases with and without a trailing slash (and with a path prefix
+    /// such as `/v4`) join the same way.
     pub base_url: Option<String>,
+    /// Effective capability profile enforced by this connection. `None`
+    /// means the `openai-chat` adapter defaults; configuration layers
+    /// resolve presets and overrides through
+    /// [`crate::contract::resolve_capabilities`] before construction.
+    pub capabilities: Option<AdapterCapabilities>,
 }
 
 // ---------------------------------------------------------------------------
@@ -51,7 +117,8 @@ struct WireRequest {
     model: String,
     messages: Vec<WireMessage>,
     stream: bool,
-    stream_options: WireStreamOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<WireStreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<WireTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -74,6 +141,8 @@ struct WireStreamOptions {
 enum WireMessage {
     #[serde(rename = "developer")]
     Developer { content: String },
+    #[serde(rename = "system")]
+    System { content: String },
     #[serde(rename = "user")]
     User { content: String },
     #[serde(rename = "assistant")]
@@ -122,7 +191,8 @@ struct WireToolDefinition {
 struct WireResponseFormat {
     #[serde(rename = "type")]
     kind: &'static str,
-    json_schema: WireJsonSchema,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    json_schema: Option<WireJsonSchema>,
 }
 
 #[derive(Serialize)]
@@ -182,18 +252,31 @@ struct WireUsage {
 // Adapter
 // ---------------------------------------------------------------------------
 
-/// The OpenAI chat-completions provider.
+/// The OpenAI-compatible chat-completions provider.
+///
+/// One instance is one configured connection: its endpoint, resolved
+/// credential, and effective capability profile are fixed at construction,
+/// and every [`ModelProvider::stream`] call is preflight-checked against
+/// that profile before any HTTP request is built.
 pub struct OpenAIProvider {
     client: reqwest::blocking::Client,
     api_key: String,
     base_url: String,
+    capabilities: AdapterCapabilities,
 }
 
 impl OpenAIProvider {
     /// Build a provider. Mirrors the SDK's constructor behavior of failing
-    /// when no API key is available.
+    /// when no API key is available: an explicit key wins, then the
+    /// configured (or default) credential variable, then construction fails
+    /// with the redacted missing-variable auth error.
     pub fn new(options: OpenAIProviderOptions) -> Result<Self, ProviderFailure> {
-        let api_key = resolve_api_key(options.api_key, std::env::var(API_KEY_ENV).ok().as_deref())?;
+        let env_name = options.api_key_env.as_deref().unwrap_or(API_KEY_ENV);
+        let api_key = resolve_api_key_for(
+            env_name,
+            options.api_key,
+            std::env::var(env_name).ok().as_deref(),
+        )?;
         let client = reqwest::blocking::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -210,21 +293,62 @@ impl OpenAIProvider {
             base_url: options
                 .base_url
                 .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned()),
+            capabilities: options
+                .capabilities
+                .unwrap_or_else(|| AdapterCapabilities::defaults_for(AdapterKind::OpenaiChat)),
         })
+    }
+
+    /// The effective capability profile this connection enforces.
+    pub fn capabilities(&self) -> &AdapterCapabilities {
+        &self.capabilities
+    }
+
+    /// Preflight a request against the connection's capability profile.
+    /// Returns the failure to emit before any HTTP request is built, or
+    /// `None` when every requested feature is supported or translated.
+    fn preflight_failure(&self, request: &ModelRequest) -> Option<ProviderFailure> {
+        if request
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+            && self.capabilities.tool_calls == FeatureSupport::Unsupported
+        {
+            return Some(unsupported_capability(
+                "tool_calls",
+                "the request carries tools, but this connection declares tool calls unsupported",
+            ));
+        }
+        if request.structured_output.is_some()
+            && self.capabilities.structured_output == StructuredOutputMode::Unsupported
+        {
+            return Some(unsupported_capability(
+                "structured_output",
+                "the request asks for structured output, but this connection declares \
+                 structured output unsupported",
+            ));
+        }
+        None
     }
 }
 
-/// Resolve the API key: explicit value first, environment second, mirroring
-/// the SDK's constructor failure when neither is available.
-pub(crate) fn resolve_api_key(
-    explicit: Option<String>,
-    from_env: Option<&str>,
-) -> Result<String, ProviderFailure> {
-    resolve_api_key_for(API_KEY_ENV, explicit, from_env)
+/// An actionable preflight failure for a Relay feature the connection's
+/// capability profile does not allow. Emitted before any HTTP call so a
+/// misconfigured connection fails fast and loudly instead of halfway through
+/// an attempt.
+fn unsupported_capability(capability: &str, detail: &str) -> ProviderFailure {
+    ProviderFailure::new(
+        ProviderErrorKind::UnsupportedCapability,
+        format!(
+            "unsupported capability on this openai-chat connection: {capability} ({detail}); \
+             change the connection's capability configuration before retrying"
+        ),
+    )
 }
 
 /// Key resolution parameterized by environment variable name, shared with the
-/// Anthropic adapter.
+/// Anthropic adapter: an explicit value wins, then the named variable's
+/// value, mirroring the SDK's constructor failure when neither is available.
 pub(crate) fn resolve_api_key_for(
     env_name: &str,
     explicit: Option<String>,
@@ -257,12 +381,22 @@ fn map_finish_reason(reason: &str) -> FinishReason {
     }
 }
 
-fn to_wire_messages(messages: &[ModelMessage], system: Option<&str>) -> Vec<WireMessage> {
+fn to_wire_messages(
+    messages: &[ModelMessage],
+    instruction: Option<&str>,
+    style: InstructionStyle,
+) -> Vec<WireMessage> {
     let mut mapped: Vec<WireMessage> = Vec::new();
-    // The system prompt becomes a leading developer message.
-    if let Some(system) = system {
-        mapped.push(WireMessage::Developer {
-            content: system.to_owned(),
+    // The Relay system prompt becomes a leading developer message, or a
+    // system message under the SystemInstruction compatibility fallback.
+    if let Some(instruction) = instruction {
+        mapped.push(match style {
+            InstructionStyle::Developer => WireMessage::Developer {
+                content: instruction.to_owned(),
+            },
+            InstructionStyle::SystemInstruction => WireMessage::System {
+                content: instruction.to_owned(),
+            },
         });
     }
     for message in messages {
@@ -335,6 +469,102 @@ fn to_wire_tools(tools: &[ToolSpec]) -> Vec<WireTool> {
             },
         })
         .collect()
+}
+
+/// Compose the leading instruction message content: the Relay system prompt,
+/// plus (only in `json_object` mode) a bounded block embedding the requested
+/// JSON Schema so the model knows the required shape. `json_schema` mode
+/// carries the schema natively in `response_format`, so the instruction is
+/// the system prompt unchanged.
+fn compose_instruction(
+    system: Option<&str>,
+    structured: Option<&StructuredOutputRequest>,
+    mode: StructuredOutputMode,
+) -> Result<Option<String>, ProviderFailure> {
+    let Some(structured) = structured.filter(|_| mode == StructuredOutputMode::JsonObject) else {
+        return Ok(system.map(str::to_owned));
+    };
+    let block = embedded_schema_block(structured)?;
+    Ok(Some(match system.filter(|system| !system.is_empty()) {
+        Some(system) => format!("{system}\n\n{block}"),
+        None => block,
+    }))
+}
+
+/// The bounded instruction block used when the connection's structured-output
+/// mode is `json_object`: it names the requested output and embeds the JSON
+/// Schema verbatim. A schema larger than [`MAX_EMBEDDED_SCHEMA_CHARS`] fails
+/// here rather than silently truncating the schema the model must satisfy.
+fn embedded_schema_block(structured: &StructuredOutputRequest) -> Result<String, ProviderFailure> {
+    let schema = serde_json::to_string(&structured.schema).unwrap_or_default();
+    if schema.chars().count() > MAX_EMBEDDED_SCHEMA_CHARS {
+        return Err(ProviderFailure::new(
+            ProviderErrorKind::UnsupportedCapability,
+            format!(
+                "structured-output schema for \"{}\" is too large to embed for the json-object \
+                 translation ({} characters, limit {MAX_EMBEDDED_SCHEMA_CHARS}); use a connection \
+                 with native json-schema structured output or shrink the schema",
+                structured.name,
+                schema.chars().count()
+            ),
+        ));
+    }
+    Ok(format!(
+        "Structured output \"{}\" is requested. Respond with ONLY a JSON object (no prose, no \
+         code fences) conforming to this JSON Schema:\n{schema}",
+        structured.name
+    ))
+}
+
+/// Choose the output-token wire parameters for a limit under the
+/// connection's parameter convention: `MaxTokens` always sends `max_tokens`,
+/// `MaxCompletionTokens` always sends `max_completion_tokens`, and
+/// `ModelDefault` keeps the per-model heuristic.
+fn select_output_token_params(
+    limit: Option<u64>,
+    model: &str,
+    param: OutputTokenParam,
+) -> (Option<u64>, Option<u64>) {
+    let Some(limit) = limit else {
+        return (None, None);
+    };
+    let completion = match param {
+        OutputTokenParam::MaxCompletionTokens => true,
+        OutputTokenParam::MaxTokens => false,
+        OutputTokenParam::ModelDefault => uses_completion_tokens(model),
+    };
+    if completion {
+        (None, Some(limit))
+    } else {
+        (Some(limit), None)
+    }
+}
+
+/// The `response_format` wire value for a structured-output request under the
+/// connection's mode: native `json_schema` (with the schema and name), the
+/// compatibility `json_object` spelling (schema embedded in the instruction
+/// instead), or `None`. `Unsupported` never reaches here — preflight rejects
+/// the request first — so it maps to `None` for totality.
+fn wire_response_format(
+    structured: Option<&StructuredOutputRequest>,
+    mode: StructuredOutputMode,
+) -> Option<WireResponseFormat> {
+    let structured = structured?;
+    match mode {
+        StructuredOutputMode::JsonSchema => Some(WireResponseFormat {
+            kind: "json_schema",
+            json_schema: Some(WireJsonSchema {
+                name: structured.name.clone(),
+                schema: structured.schema.clone(),
+                strict: false,
+            }),
+        }),
+        StructuredOutputMode::JsonObject => Some(WireResponseFormat {
+            kind: "json_object",
+            json_schema: None,
+        }),
+        StructuredOutputMode::Unsupported => None,
+    }
 }
 
 /// Parse JSON that models sometimes wrap in markdown fences.
@@ -538,10 +768,12 @@ impl Iterator for OpenAiStream {
                         Err(error) => {
                             self.finished = true;
                             return Some(ProviderStreamEvent::Error {
-                                error: to_provider_failure(crate::errors::ErrorSignal {
-                                    message: format!("malformed stream chunk: {error}"),
-                                    ..crate::errors::ErrorSignal::default()
-                                }),
+                                error: ProviderFailure::new(
+                                    ProviderErrorKind::InvalidResponse,
+                                    crate::errors::normalized_message(&format!(
+                                        "malformed stream chunk: {error}"
+                                    )),
+                                ),
                             });
                         }
                     }
@@ -585,8 +817,8 @@ impl Iterator for OpenAiStream {
 }
 
 impl ModelProvider for OpenAIProvider {
-    fn name(&self) -> ProviderName {
-        ProviderName::Openai
+    fn name(&self) -> AdapterKind {
+        AdapterKind::OpenaiChat
     }
 
     fn models(&self) -> Vec<String> {
@@ -613,34 +845,56 @@ impl ModelProvider for OpenAIProvider {
             }));
         }
 
+        // Capability preflight: a Relay feature this connection cannot carry
+        // or translate fails here, before any HTTP request is built.
+        if let Some(failure) = self.preflight_failure(request) {
+            return Box::new(std::iter::once(ProviderStreamEvent::Error {
+                error: failure,
+            }));
+        }
+
+        let instruction = match compose_instruction(
+            request.system.as_deref(),
+            request.structured_output.as_ref(),
+            self.capabilities.structured_output,
+        ) {
+            Ok(instruction) => instruction,
+            Err(failure) => {
+                return Box::new(std::iter::once(ProviderStreamEvent::Error {
+                    error: failure,
+                }));
+            }
+        };
+
         let tools = request.tools.as_deref().map(to_wire_tools);
         let wire = WireRequest {
             model: request.model.clone(),
-            messages: to_wire_messages(&request.messages, request.system.as_deref()),
+            messages: to_wire_messages(
+                &request.messages,
+                instruction.as_deref(),
+                self.capabilities.instructions,
+            ),
             stream: true,
-            stream_options: WireStreamOptions {
-                include_usage: true,
-            },
+            // Connections whose streams never report usage must not ask for
+            // them: stream_options is omitted entirely.
+            stream_options: (self.capabilities.streamed_usage == FeatureSupport::Supported)
+                .then_some(WireStreamOptions {
+                    include_usage: true,
+                }),
             tools: tools.filter(|tools| !tools.is_empty()),
             temperature: request.temperature,
             max_tokens: None,
             max_completion_tokens: None,
-            response_format: request.structured_output.as_ref().map(|structured| {
-                WireResponseFormat {
-                    kind: "json_schema",
-                    json_schema: WireJsonSchema {
-                        name: structured.name.clone(),
-                        schema: structured.schema.clone(),
-                        strict: false,
-                    },
-                }
-            }),
+            response_format: wire_response_format(
+                request.structured_output.as_ref(),
+                self.capabilities.structured_output,
+            ),
         };
-        let (max_tokens, max_completion_tokens) = match request.max_output_tokens {
-            Some(limit) if uses_completion_tokens(&request.model) => (None, Some(limit)),
-            Some(limit) => (Some(limit), None),
-            None => (None, None),
-        };
+        let (max_tokens, max_completion_tokens) = select_output_token_params(
+            request.max_output_tokens,
+            &request.model,
+            self.capabilities.output_token_param,
+        );
         let wire = WireRequest {
             max_tokens,
             max_completion_tokens,
@@ -689,24 +943,211 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolves_explicit_keys_before_environment_keys() {
+    fn resolves_explicit_keys_before_named_environment_keys() {
         assert_eq!(
-            resolve_api_key(Some("explicit".into()), Some("from-env")).as_deref(),
+            resolve_api_key_for("GLM_API_KEY", Some("explicit".into()), Some("from-env"))
+                .as_deref(),
             Ok("explicit")
         );
         assert_eq!(
-            resolve_api_key(None, Some("from-env")).as_deref(),
+            resolve_api_key_for("GLM_API_KEY", None, Some("from-env")).as_deref(),
             Ok("from-env")
         );
-        let error = resolve_api_key(None, None).expect_err("missing key");
+        let error = resolve_api_key_for("GLM_API_KEY", None, None).expect_err("missing key");
         assert_eq!(error.kind, ProviderErrorKind::Auth);
         assert!(
-            error.message.contains("OPENAI_API_KEY"),
+            error
+                .message
+                .contains("The GLM_API_KEY environment variable is missing"),
             "{}",
             error.message
         );
-        let error = resolve_api_key(Some(String::new()), None).expect_err("empty key");
+        let error =
+            resolve_api_key_for("GLM_API_KEY", Some(String::new()), None).expect_err("empty key");
         assert_eq!(error.kind, ProviderErrorKind::Auth);
+    }
+
+    #[test]
+    fn defaults_are_the_openai_chat_adapter_defaults() {
+        let provider = OpenAIProvider::new(OpenAIProviderOptions {
+            api_key: Some("explicit-test-key".into()),
+            ..OpenAIProviderOptions::default()
+        })
+        .expect("provider constructs offline");
+        assert_eq!(
+            provider.capabilities(),
+            &AdapterCapabilities::defaults_for(AdapterKind::OpenaiChat)
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_unsupported_tools_and_structured_output() {
+        let provider = |capabilities: AdapterCapabilities| {
+            OpenAIProvider::new(OpenAIProviderOptions {
+                api_key: Some("explicit-test-key".into()),
+                capabilities: Some(capabilities),
+                ..OpenAIProviderOptions::default()
+            })
+            .expect("provider constructs offline")
+        };
+
+        let no_tools = provider(AdapterCapabilities {
+            tool_calls: FeatureSupport::Unsupported,
+            ..AdapterCapabilities::defaults_for(AdapterKind::OpenaiChat)
+        });
+        let mut with_tools = ModelRequest::simple("glm-4.6", "hi");
+        with_tools.tools = Some(vec![ToolSpec {
+            name: "read-file".into(),
+            description: "reads".into(),
+            parameters: serde_json::Map::new(),
+        }]);
+        let failure = no_tools
+            .preflight_failure(&with_tools)
+            .expect("tools rejected");
+        assert_eq!(failure.kind, ProviderErrorKind::UnsupportedCapability);
+        assert!(!failure.retryable);
+        assert!(
+            failure.message.contains("tool_calls")
+                && failure.message.contains("openai-chat")
+                && failure.message.contains("capability configuration"),
+            "{failure}"
+        );
+        // A request without tools is unaffected by the tools capability.
+        assert!(
+            no_tools
+                .preflight_failure(&ModelRequest::simple("glm-4.6", "hi"))
+                .is_none()
+        );
+
+        let no_structured = provider(AdapterCapabilities {
+            structured_output: StructuredOutputMode::Unsupported,
+            ..AdapterCapabilities::defaults_for(AdapterKind::OpenaiChat)
+        });
+        let mut with_structured = ModelRequest::simple("glm-4.6", "hi");
+        with_structured.structured_output = Some(StructuredOutputRequest {
+            name: "intent-proposal".into(),
+            schema: serde_json::Map::new(),
+        });
+        let failure = no_structured
+            .preflight_failure(&with_structured)
+            .expect("structured output rejected");
+        assert!(
+            failure.message.contains("structured_output")
+                && failure.message.contains("openai-chat"),
+            "{failure}"
+        );
+        assert!(
+            no_structured
+                .preflight_failure(&ModelRequest::simple("glm-4.6", "hi"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn json_object_instructions_embed_the_schema_json_schema_does_not() {
+        let schema = serde_json::Map::from_iter([
+            ("type".to_owned(), json!("object")),
+            (
+                "properties".to_owned(),
+                json!({ "mode": { "type": "string" } }),
+            ),
+        ]);
+        let structured = StructuredOutputRequest {
+            name: "intent-proposal".into(),
+            schema: schema.clone(),
+        };
+
+        let embedded = compose_instruction(
+            Some("classifier"),
+            Some(&structured),
+            StructuredOutputMode::JsonObject,
+        )
+        .expect("embeds")
+        .expect("some instruction");
+        assert!(embedded.starts_with("classifier\n\n"), "{embedded}");
+        assert!(
+            embedded.contains("Structured output \"intent-proposal\" is requested."),
+            "{embedded}"
+        );
+        // Map keys serialize in sorted order; the schema text is embedded
+        // verbatim either way.
+        assert!(
+            embedded.contains("\"properties\":{\"mode\":{\"type\":\"string\"}}")
+                && embedded.contains("\"type\":\"object\""),
+            "{embedded}"
+        );
+
+        let without_system =
+            compose_instruction(None, Some(&structured), StructuredOutputMode::JsonObject)
+                .expect("embeds");
+        assert!(
+            without_system
+                .as_deref()
+                .is_some_and(|text| text.starts_with("Structured output")),
+            "{without_system:?}"
+        );
+
+        let native = compose_instruction(
+            Some("classifier"),
+            Some(&structured),
+            StructuredOutputMode::JsonSchema,
+        )
+        .expect("native mode passes through");
+        assert_eq!(native.as_deref(), Some("classifier"));
+
+        let no_structured =
+            compose_instruction(Some("classifier"), None, StructuredOutputMode::JsonSchema)
+                .expect("plain system passes through");
+        assert_eq!(no_structured.as_deref(), Some("classifier"));
+    }
+
+    #[test]
+    fn oversized_schemas_fail_the_json_object_translation() {
+        let mut schema = serde_json::Map::new();
+        schema.insert(
+            "padding".to_owned(),
+            Value::String("x".repeat(MAX_EMBEDDED_SCHEMA_CHARS)),
+        );
+        let structured = StructuredOutputRequest {
+            name: "huge".into(),
+            schema,
+        };
+        let failure = embedded_schema_block(&structured).expect_err("oversized rejected");
+        assert_eq!(failure.kind, ProviderErrorKind::UnsupportedCapability);
+        assert!(
+            failure.message.contains("too large to embed") && failure.message.contains("\"huge\""),
+            "{failure}"
+        );
+    }
+
+    #[test]
+    fn output_token_params_follow_the_configured_convention() {
+        // MaxTokens pins max_tokens even for models the heuristic would
+        // route to max_completion_tokens.
+        assert_eq!(
+            select_output_token_params(Some(128), "gpt-5.2", OutputTokenParam::MaxTokens),
+            (Some(128), None)
+        );
+        // MaxCompletionTokens pins max_completion_tokens even for older
+        // models.
+        assert_eq!(
+            select_output_token_params(Some(64), "gpt-4o", OutputTokenParam::MaxCompletionTokens),
+            (None, Some(64))
+        );
+        // ModelDefault keeps the per-model heuristic.
+        assert_eq!(
+            select_output_token_params(Some(32), "gpt-5.2", OutputTokenParam::ModelDefault),
+            (None, Some(32))
+        );
+        assert_eq!(
+            select_output_token_params(Some(32), "glm-4.6", OutputTokenParam::ModelDefault),
+            (Some(32), None)
+        );
+        // Without a limit, neither parameter is sent.
+        assert_eq!(
+            select_output_token_params(None, "gpt-4o", OutputTokenParam::MaxCompletionTokens),
+            (None, None)
+        );
     }
 
     #[test]

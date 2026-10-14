@@ -60,10 +60,10 @@ use relay_app::conversation::TurnStatus;
 use relay_app::conversation::start_turn;
 use relay_app::conversation_views::ChatView;
 use relay_app::conversation_views::chat_view;
+use relay_app::runtime_routing::TurnRouting;
 use relay_app::session::ProjectSession;
 use relay_app::session::SessionOptions;
 use relay_providers::contract::CancelToken;
-use relay_providers::contract::ModelProvider;
 use relay_ui::chat::ChatUi;
 use relay_ui::chat::ChatUiOutcome;
 use relay_ui::chat::ChatUiRequest;
@@ -74,7 +74,6 @@ use relay_ui::work::terminal::RestoreFn;
 use relay_ui::work::terminal::TerminalGuard;
 
 use crate::dispatch::CliDeps;
-use crate::dispatch::conversational_provider;
 use crate::dispatch::{EXIT_FAILURE, EXIT_OK};
 use crate::output::OutputWriter;
 
@@ -101,21 +100,18 @@ const FACT_STORE_MANIFEST: &str = ".relay-graph/manifest.json";
 
 /// Run the interactive chat interface over `workspace`.
 ///
-/// Interactive only — dispatch guarantees a fully interactive terminal
-/// before calling. Returns the process exit code; every path (quit,
-/// provider failure, cancellation, forced exit, panic) restores the
-/// terminal through the [`TerminalGuard`].
-pub fn run_chat(workspace: &Path, deps: &CliDeps, initial_prompt: Option<&str>) -> i32 {
-    // Resolve the provider before any terminal setup so a routing failure
-    // is a plain stderr message, never a raw-mode surprise.
-    let (provider, model) = match conversational_provider(&deps.runtime) {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            let mut writer = OutputWriter::std(false);
-            writer.error(&format!("relay: {}", error.message()));
-            return EXIT_FAILURE;
-        }
-    };
+/// Interactive only — dispatch guarantees a fully interactive terminal and
+/// already-resolved [`TurnRouting`] before calling (a routing failure is a
+/// plain usage-class stderr message there, never a raw-mode surprise).
+/// Returns the process exit code; every path (quit, provider failure,
+/// cancellation, forced exit, panic) restores the terminal through the
+/// [`TerminalGuard`].
+pub fn run_chat(
+    workspace: &Path,
+    deps: &CliDeps,
+    routing: TurnRouting,
+    initial_prompt: Option<&str>,
+) -> i32 {
     // An existing project resumes its latest conversation; a fresh
     // workspace stays untouched until the first prompt (the manifest probe
     // never opens or creates the store).
@@ -146,8 +142,7 @@ pub fn run_chat(workspace: &Path, deps: &CliDeps, initial_prompt: Option<&str>) 
         workspace: workspace.to_path_buf(),
         session_options: deps.session_options.clone(),
         session,
-        provider,
-        model,
+        routing,
         running: None,
         last_work: work,
     };
@@ -242,8 +237,7 @@ impl RunningTurn {
     /// event loop; its events and result arrive over the channels.
     fn spawn(
         session: Arc<ProjectSession>,
-        provider: Arc<dyn ModelProvider>,
-        model: String,
+        routing: TurnRouting,
         prompt: String,
     ) -> io::Result<RunningTurn> {
         let (event_tx, event_rx) = channel::<ConversationEvent>();
@@ -255,8 +249,7 @@ impl RunningTurn {
             .spawn(move || {
                 let result = start_turn(
                     &session,
-                    provider,
-                    &model,
+                    routing,
                     &prompt,
                     &ConversationLimits::default(),
                     worker_cancel,
@@ -300,15 +293,14 @@ impl RunningTurn {
     }
 }
 
-/// Driver-owned state: the lazily opened session, the resolved provider,
-/// the running turn, and the last work snapshot (the base for detail
+/// Driver-owned state: the lazily opened session, the turn routing, the
+/// running turn, and the last work snapshot (the base for detail
 /// overlays — `ChatUi` does not expose its snapshot).
 struct DriverState {
     workspace: PathBuf,
     session_options: SessionOptions,
     session: Option<Arc<ProjectSession>>,
-    provider: Arc<dyn ModelProvider>,
-    model: String,
+    routing: TurnRouting,
     running: Option<RunningTurn>,
     last_work: WorkSnapshot,
 }
@@ -350,12 +342,7 @@ impl DriverState {
         };
         ui.set_busy(true);
         ui.set_status("asking…");
-        match RunningTurn::spawn(
-            session,
-            Arc::clone(&self.provider),
-            self.model.clone(),
-            prompt,
-        ) {
+        match RunningTurn::spawn(session, self.routing.clone(), prompt) {
             Ok(turn) => self.running = Some(turn),
             Err(error) => {
                 ui.set_busy(false);
@@ -624,17 +611,16 @@ mod tests {
     }
 
     fn test_state(root: &Path) -> DriverState {
-        let (provider, model) =
-            conversational_provider(&crate::dispatch::RuntimeSelection::Production {
-                provider: "fake".to_string(),
-            })
-            .expect("the fake provider resolves");
         DriverState {
             workspace: root.to_path_buf(),
             session_options: SessionOptions::deterministic(0),
             session: None,
-            provider,
-            model,
+            // The offline turn seam: the echo fake serves the turn under
+            // the `fake` connection, and proposal-driven runs route through
+            // the offline default plan.
+            routing: TurnRouting::with_provider(Arc::new(
+                relay_providers::fake::FakeProvider::echo(),
+            )),
             running: None,
             last_work: empty_work_snapshot(),
         }
