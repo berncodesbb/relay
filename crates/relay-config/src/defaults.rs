@@ -8,9 +8,11 @@
 //! routing-purpose mapping are unchanged, so user and project layers can
 //! override individual roles predictably.
 //!
-//! The `providers` map also defines `openai` and `anthropic` connections with
-//! their default credential-variable names, ready to be referenced by higher
-//! layers without redefining infrastructure.
+//! The `providers` map also defines the `anthropic` connection with its
+//! default credential-variable name, ready to be referenced by higher layers
+//! without redefining infrastructure. (The implicit `openai` connection was
+//! removed with the `openai-chat` adapter; configuration naming it fails
+//! schema validation with migration guidance.)
 
 use crate::schema::{
     AdapterKind, BudgetLimits, CapabilityOverrides, ModelRoleConfig, ProviderConnection, Providers,
@@ -22,7 +24,7 @@ use indexmap::{IndexMap, indexmap};
 pub const DEFAULT_FAKE_MODEL: &str = "fake-standard";
 
 /// The connection names the default profile defines, in order.
-pub const DEFAULT_CONNECTION_NAMES: [&str; 3] = ["fake", "openai", "anthropic"];
+pub const DEFAULT_CONNECTION_NAMES: [&str; 2] = ["fake", "anthropic"];
 
 fn connection(adapter: AdapterKind, api_key_env: Option<&str>) -> ProviderConnection {
     ProviderConnection {
@@ -66,7 +68,6 @@ pub fn default_config() -> RelayConfig {
         version: crate::schema::CONFIG_SCHEMA_VERSION,
         providers: Providers(indexmap! {
             "fake".to_string() => connection(AdapterKind::Fake, None),
-            "openai".to_string() => connection(AdapterKind::OpenaiChat, Some("OPENAI_API_KEY")),
             "anthropic".to_string() => connection(AdapterKind::Anthropic, Some("ANTHROPIC_API_KEY")),
         }),
         models: Some(models),

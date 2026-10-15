@@ -102,10 +102,9 @@ impl ModelClient for EchoModel {
         _signal: &CancelToken,
     ) -> Result<ModelTurnResponse, ModelClientError> {
         Ok(ModelTurnResponse {
-            text: format!("echo: {}", request.prompt),
             input_tokens: 1,
             output_tokens: 1,
-            routes_attempted: Vec::new(),
+            ..ModelTurnResponse::from_text(format!("echo: {}", request.last_user_text()))
         })
     }
 }

@@ -35,8 +35,8 @@ fn parses_a_complete_version_one_inline_only_configuration_unchanged() {
     assert_eq!(
         parsed.routing.get("verification"),
         Some(&RoutingValue::Inline(relay_config::schema::RouteConfig {
-            provider: "openai".to_string(),
-            model: "gpt-5.2".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-haiku-4-5".to_string(),
             fallbacks: None,
             limits: None,
         }))
@@ -46,20 +46,14 @@ fn parses_a_complete_version_one_inline_only_configuration_unchanged() {
             route.fallbacks,
             Some(vec![relay_config::schema::InlineFallback {
                 provider: "anthropic".to_string(),
-                model: "claude-sonnet-5-5".to_string(),
+                model: "claude-haiku-4-5".to_string(),
             }])
         ),
         other => panic!("planning should be an inline route: {other:?}"),
     }
     // The legacy provider spellings load with the default connection set:
-    // the two legacy live keys plus the offline fake from the defaults layer
-    // when merged.
-    assert!(parsed.providers.contains("openai"));
+    // the anthropic connection inferred from the legacy key.
     assert!(parsed.providers.contains("anthropic"));
-    assert_eq!(
-        parsed.providers.get("openai").unwrap().adapter,
-        relay_config::schema::AdapterKind::OpenaiChat
-    );
     assert_eq!(
         parsed.providers.get("anthropic").unwrap().adapter,
         relay_config::schema::AdapterKind::Anthropic
@@ -89,7 +83,7 @@ fn resolves_every_workflow_mode_through_inline_routes_without_a_models_catalog()
         model_of("technical-design"),
         Some("claude-opus-5-5".to_string())
     );
-    assert_eq!(provider_of("verification"), Some("openai".to_string()));
+    assert_eq!(provider_of("verification"), Some("anthropic".to_string()));
     assert_eq!(model_of("delivery"), Some("claude-haiku-4-5".to_string()));
     // No role names are fabricated for inline routes.
     assert_eq!(
@@ -125,7 +119,7 @@ fn preserves_inline_fallback_order_in_the_normalized_chain() {
     let routing = normalize_routing(&config);
     let chain = routing.purpose_chains.get("planning").unwrap();
     let models: Vec<&str> = chain.iter().map(|route| route.model.as_str()).collect();
-    assert_eq!(models, vec!["gpt-5-mini", "claude-sonnet-5-5"]);
+    assert_eq!(models, vec!["claude-sonnet-5-5", "claude-haiku-4-5"]);
     // Provider registration filtering is a provider-time concern and is
     // exercised by the runtime crate with its fake providers.
     assert!(chain.iter().all(|route| route.role.is_none()));
@@ -133,7 +127,7 @@ fn preserves_inline_fallback_order_in_the_normalized_chain() {
 
 #[test]
 fn builtin_defaults_route_every_mode_to_the_offline_fake_connection() {
-    assert_eq!(defaults().version, 1);
+    assert_eq!(defaults().version, relay_config::CONFIG_SCHEMA_VERSION);
     let routing = normalize_routing(&defaults());
     let mut modes: Vec<&str> = WORKFLOW_MODES.to_vec();
     modes.push("intent");
@@ -152,13 +146,13 @@ fn applies_a_legacy_project_layer_over_defaults_without_edits() {
 version: 1
 budgets: {}
 routing:
-  discovery: { provider: openai, model: gpt-5-mini }
-  specification: { provider: openai, model: gpt-5-mini }
-  technical-design: { provider: openai, model: gpt-5.2 }
-  planning: { provider: openai, model: gpt-5-mini }
-  implementation: { provider: openai, model: gpt-5-mini }
-  verification: { provider: openai, model: gpt-5.2 }
-  delivery: { provider: openai, model: gpt-5-mini }
+  discovery: { provider: anthropic, model: claude-sonnet-5-5 }
+  specification: { provider: anthropic, model: claude-sonnet-5-5 }
+  technical-design: { provider: anthropic, model: claude-opus-5-5 }
+  planning: { provider: anthropic, model: claude-sonnet-5-5 }
+  implementation: { provider: anthropic, model: claude-sonnet-5-5 }
+  verification: { provider: anthropic, model: claude-haiku-4-5 }
+  delivery: { provider: anthropic, model: claude-sonnet-5-5 }
 "#,
     );
     let loaded = load_for(workspace.path());
@@ -177,24 +171,24 @@ routing:
             .first()
             .unwrap()
             .model,
-        "gpt-5-mini"
+        "claude-sonnet-5-5"
     );
     // Untouched layer values survive: budgets keep defaults.
     assert_eq!(
         loaded.config.budgets.max_turns,
         defaults().budgets.max_turns
     );
-    // The legacy openai/anthropic settings keep their default credential
-    // variable names after the merge.
+    // The legacy anthropic setting keeps its default credential variable
+    // name after the merge.
     assert_eq!(
         loaded
             .config
             .providers
-            .get("openai")
+            .get("anthropic")
             .unwrap()
             .api_key_env
             .as_deref(),
-        Some("OPENAI_API_KEY")
+        Some("ANTHROPIC_API_KEY")
     );
 }
 
@@ -223,7 +217,7 @@ fn force_provider_rewrites_providers_while_keeping_model_identifiers() {
             .first()
             .unwrap()
             .model,
-        "gpt-5.2"
+        "claude-haiku-4-5"
     );
 }
 
@@ -240,9 +234,9 @@ routing:
   technical-design: { provider: anthropic, model: claude-opus-5-5 }
   planning: { provider: anthropic, model: claude-sonnet-5-5 }
   implementation: { provider: anthropic, model: claude-sonnet-5-5 }
-  verification: { provider: openai, model: gpt-5.2 }
+  verification: { provider: anthropic, model: claude-haiku-4-5 }
   delivery: { provider: anthropic, model: claude-haiku-4-5 }
-  frobnicate: { provider: openai, model: gpt-5.2 }
+  frobnicate: { provider: anthropic, model: claude-sonnet-5-5 }
 "#,
     )
     .unwrap_err();
@@ -273,4 +267,38 @@ fn the_full_legacy_shape_remains_representable() {
     // configuration carries at least the seven mode routes.
     let config = parse_legacy(LEGACY_YAML);
     assert!(config.routing.len() >= WORKFLOW_MODES.len());
+}
+
+#[test]
+fn a_legacy_layer_routing_to_the_removed_openai_connection_fails_listing_connections() {
+    // A version-1 layer whose routes still name the removed implicit
+    // `openai` connection parses (the name is syntactically valid) but
+    // fails effective validation with the connections that do exist.
+    let error = relay_config::load::parse_yaml_layer(
+        "legacy.yaml",
+        r#"
+version: 1
+budgets: {}
+routing:
+  discovery: { provider: anthropic, model: claude-sonnet-5-5 }
+  specification: { provider: anthropic, model: claude-sonnet-5-5 }
+  technical-design: { provider: anthropic, model: claude-opus-5-5 }
+  planning: { provider: anthropic, model: claude-sonnet-5-5 }
+  implementation: { provider: anthropic, model: claude-sonnet-5-5 }
+  verification: { provider: openai, model: gpt-5.2 }
+  delivery: { provider: anthropic, model: claude-haiku-4-5 }
+"#,
+    )
+    .expect("the layer parses; the reference fails on the merged view");
+    let error =
+        relay_config::load::validate_effective_config(&error, "the effective configuration", None)
+            .expect_err("the removed connection cannot be referenced");
+    assert_eq!(
+        error.issues,
+        vec![
+            "routing.verification.provider: references unknown provider connection \"openai\"; \
+             available connections: anthropic. Define a providers.openai entry."
+                .to_string()
+        ]
+    );
 }

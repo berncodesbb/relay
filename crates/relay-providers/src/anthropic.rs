@@ -9,6 +9,44 @@
 //! roles, so consecutive tool results are merged into a single user message.
 //! Wire types stay private to this module.
 //!
+//! # Stream normalization
+//!
+//! Block-bearing events are emitted in the true order the model produced
+//! them: text deltas stream as [`ProviderStreamEvent::TextDelta`] fragments,
+//! and each tool-use or thinking block is emitted as one complete, validated
+//! [`ProviderStreamEvent::ToolCall`] / [`ProviderStreamEvent::Continuation`]
+//! event the moment its `content_block_stop` arrives, so text → tool → text
+//! survives as ordered blocks. The terminal
+//! [`ProviderStreamEvent::Completed`] fires on `message_stop` only.
+//!
+//! The stream fails closed — it ends with a typed
+//! [`ProviderErrorKind::InvalidResponse`] error event instead of a
+//! permissive fallback — on:
+//!
+//! - a duplicate `content_block_start` index, or a delta/stop for an index
+//!   that was never announced or has already closed;
+//! - a delta of a known kind applied to a block of the wrong kind (for
+//!   example `input_json_delta` on a text block);
+//! - a `tool_use` block missing its `id` or `name`;
+//! - a tool block whose accumulated `partial_json` is non-empty and not
+//!   valid JSON at block stop (an empty buffer maps to `{}`);
+//! - a stream that ends (EOF) without `message_stop`;
+//! - a text block, tool-argument buffer, or thinking/redacted-thinking
+//!   continuation payload above the contract bounds.
+//!
+//! Unknown *event types* (and `ping`) stay tolerated, mirroring the
+//! reference adapter's default branch.
+//!
+//! # Thinking continuations
+//!
+//! `thinking` and `redacted_thinking` blocks are captured as bounded opaque
+//! [`AssistantContent::Continuation`] blocks (discriminators `thinking` and
+//! `redacted-thinking`) and never contribute visible text. When those blocks
+//! reappear in the request transcript they are mapped back onto the wire so a
+//! compatible endpoint can continue the conversation; unknown discriminators
+//! or undecodable payloads fail the request before any HTTP call rather than
+//! being silently dropped.
+//!
 //! # Capability enforcement
 //!
 //! The connection's [`AdapterCapabilities`] (adapter defaults, then an
@@ -38,14 +76,14 @@ use std::collections::HashMap;
 use std::sync::mpsc::{Receiver as StdReceiver, RecvTimeoutError};
 use std::time::Duration;
 
-use crate::contract::TokenUsage;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::contract::{
     AdapterCapabilities, AdapterKind, AssistantContent, CancelToken, FeatureSupport, FinishReason,
+    MAX_CONTINUATION_DATA_BYTES, MAX_CONTINUATION_DISCRIMINATOR_CHARS, MAX_TEXT_BLOCK_BYTES,
     ModelMessage, ModelProvider, ModelRequest, ProviderErrorKind, ProviderEventStream,
-    ProviderFailure, ProviderStreamEvent, StructuredOutputMode, ToolCall, ToolSpec,
+    ProviderFailure, ProviderStreamEvent, StructuredOutputMode, TokenUsage, ToolCall, ToolSpec,
 };
 use crate::errors::to_provider_failure;
 use crate::sse::{FetchItem, fetch_sse};
@@ -64,6 +102,17 @@ const API_VERSION: &str = "2023-06-01";
 
 /// Anthropic requires max_tokens on every request.
 const DEFAULT_MAX_TOKENS: u64 = 8192;
+
+/// Continuation discriminator for `thinking` blocks.
+const CONTINUATION_THINKING: &str = "thinking";
+
+/// Continuation discriminator for `redacted_thinking` blocks.
+const CONTINUATION_REDACTED_THINKING: &str = "redacted-thinking";
+
+/// Backstop on the accumulated `partial_json` of one streamed tool block.
+/// Far above any legitimate argument payload Relay's tool schemas accept; a
+/// stream above it fails closed instead of being retained unbounded.
+const MAX_TOOL_ARGUMENT_BYTES: usize = 512 * 1024;
 
 /// Options for constructing an [`AnthropicProvider`].
 #[derive(Debug, Clone, Default)]
@@ -120,7 +169,7 @@ enum WireUserContent {
     Blocks(Vec<WireContentBlock>),
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, PartialEq, Debug)]
 #[serde(tag = "type")]
 enum WireContentBlock {
     #[serde(rename = "text")]
@@ -135,7 +184,15 @@ enum WireContentBlock {
     ToolResult {
         tool_use_id: String,
         content: String,
+        // The protocol treats `is_error` as optional (absent means success),
+        // so only error results carry it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        is_error: Option<bool>,
     },
+    #[serde(rename = "thinking")]
+    Thinking { thinking: String, signature: String },
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking { data: String },
 }
 
 #[derive(Serialize)]
@@ -163,7 +220,25 @@ struct WireMessageBody {
 #[serde(tag = "type")]
 enum WireContentBlockStart {
     #[serde(rename = "tool_use")]
-    ToolUse { id: String, name: String },
+    ToolUse {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    #[serde(rename = "thinking")]
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+    },
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking {
+        #[serde(default)]
+        data: String,
+    },
+    // Announced `text` blocks (and any future unknown block kinds) carry no
+    // start payload; unknown kinds keep the reference adapter's permissive
+    // text-compatible handling.
     #[serde(other)]
     Other,
 }
@@ -177,6 +252,16 @@ enum WireDelta {
     InputJson {
         #[serde(default)]
         partial_json: String,
+    },
+    #[serde(rename = "thinking_delta")]
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+    },
+    #[serde(rename = "signature_delta")]
+    Signature {
+        #[serde(default)]
+        signature: String,
     },
     #[serde(other)]
     Other,
@@ -248,7 +333,7 @@ impl AnthropicProvider {
     /// with the redacted missing-variable auth error.
     pub fn new(options: AnthropicProviderOptions) -> Result<Self, ProviderFailure> {
         let env_name = options.api_key_env.as_deref().unwrap_or(API_KEY_ENV);
-        let api_key = crate::openai::resolve_api_key_for(
+        let api_key = crate::errors::resolve_api_key_for(
             env_name,
             options.api_key,
             std::env::var(env_name).ok().as_deref(),
@@ -326,8 +411,7 @@ impl AnthropicProvider {
 }
 
 /// An actionable preflight failure for a Relay feature the connection's
-/// capability profile does not allow, in the same shape the OpenAI-compatible
-/// adapter emits.
+/// capability profile does not allow.
 fn unsupported_capability(capability: &str, detail: &str) -> ProviderFailure {
     ProviderFailure::new(
         ProviderErrorKind::UnsupportedCapability,
@@ -342,11 +426,91 @@ fn map_stop_reason(reason: &str) -> FinishReason {
     match reason {
         "tool_use" => FinishReason::ToolCalls,
         "max_tokens" => FinishReason::Length,
+        // `end_turn`, `stop_sequence`, `pause_turn`, `refusal`, and future
+        // reasons all normalize to the neutral Stop.
         _ => FinishReason::Stop,
     }
 }
 
-fn assistant_blocks(content: &[AssistantContent]) -> Vec<WireContentBlock> {
+/// The internal encoding of a `thinking` continuation payload: compact JSON
+/// of the signature and reasoning text. Opaque to everything outside this
+/// module; round-trips through [`encode_thinking_continuation`] and
+/// [`decode_thinking_continuation`] byte-stably.
+#[derive(Serialize, Deserialize)]
+struct ThinkingContinuationPayload {
+    signature: String,
+    thinking: String,
+}
+
+fn encode_thinking_continuation(signature: &str, thinking: &str) -> Result<String, String> {
+    serde_json::to_string(&ThinkingContinuationPayload {
+        signature: signature.to_owned(),
+        thinking: thinking.to_owned(),
+    })
+    .map_err(|error| format!("thinking continuation payload could not be encoded: {error}"))
+}
+
+fn decode_thinking_continuation(data: &str) -> Result<ThinkingContinuationPayload, String> {
+    serde_json::from_str(data).map_err(|error| {
+        format!("stored thinking continuation payload could not be decoded: {error}")
+    })
+}
+
+/// Map one transcript continuation block back onto its wire block for replay
+/// to the same compatible endpoint. Unknown discriminators, undecodable
+/// payloads, and payloads above the continuation bounds fail closed: the
+/// endpoint needs the exact block to continue the conversation, so dropping
+/// or truncating it would silently corrupt the turn.
+fn continuation_to_wire(
+    discriminator: &str,
+    data: &str,
+) -> Result<WireContentBlock, ProviderFailure> {
+    if discriminator.chars().count() > MAX_CONTINUATION_DISCRIMINATOR_CHARS {
+        return Err(ProviderFailure::new(
+            ProviderErrorKind::InvalidResponse,
+            crate::errors::normalized_message(&format!(
+                "cannot replay a continuation block whose discriminator exceeds the \
+                 {MAX_CONTINUATION_DISCRIMINATOR_CHARS}-character bound"
+            )),
+        ));
+    }
+    if data.len() > MAX_CONTINUATION_DATA_BYTES {
+        return Err(ProviderFailure::new(
+            ProviderErrorKind::InvalidResponse,
+            crate::errors::normalized_message(&format!(
+                "cannot replay a continuation block above the \
+                 {MAX_CONTINUATION_DATA_BYTES}-byte bound"
+            )),
+        ));
+    }
+    match discriminator {
+        CONTINUATION_THINKING => {
+            let payload = decode_thinking_continuation(data).map_err(|detail| {
+                ProviderFailure::new(
+                    ProviderErrorKind::InvalidResponse,
+                    crate::errors::normalized_message(&detail),
+                )
+            })?;
+            Ok(WireContentBlock::Thinking {
+                thinking: payload.thinking,
+                signature: payload.signature,
+            })
+        }
+        CONTINUATION_REDACTED_THINKING => Ok(WireContentBlock::RedactedThinking {
+            data: data.to_owned(),
+        }),
+        other => Err(ProviderFailure::new(
+            ProviderErrorKind::InvalidResponse,
+            crate::errors::normalized_message(&format!(
+                "cannot replay a continuation block with unknown discriminator \"{other}\""
+            )),
+        )),
+    }
+}
+
+fn assistant_blocks(
+    content: &[AssistantContent],
+) -> Result<Vec<WireContentBlock>, ProviderFailure> {
     let mut blocks = Vec::new();
     for block in content {
         match block {
@@ -366,32 +530,43 @@ fn assistant_blocks(content: &[AssistantContent]) -> Vec<WireContentBlock> {
                     },
                 });
             }
+            // Opaque continuation blocks replay only to the same compatible
+            // route; an un-replayable one fails the request below rather
+            // than being silently dropped.
+            AssistantContent::Continuation {
+                discriminator,
+                data,
+            } => blocks.push(continuation_to_wire(discriminator, data)?),
         }
     }
-    blocks
+    Ok(blocks)
 }
 
-fn to_wire_messages(messages: &[ModelMessage]) -> Vec<WireMessage> {
+fn to_wire_messages(messages: &[ModelMessage]) -> Result<Vec<WireMessage>, ProviderFailure> {
     let mut mapped: Vec<WireMessage> = Vec::new();
     for message in messages {
         match message {
             ModelMessage::User { content } => {
                 mapped.push(WireMessage::User {
-                    content: WireUserContent::Text(content.clone()),
+                    content: WireUserContent::Text(
+                        content.iter().map(|block| block.text()).collect(),
+                    ),
                 });
             }
             ModelMessage::Assistant { content } => {
                 mapped.push(WireMessage::Assistant {
-                    content: assistant_blocks(content),
+                    content: assistant_blocks(content)?,
                 });
             }
             ModelMessage::ToolResult {
                 tool_call_id,
                 content,
+                is_error,
             } => {
                 let block = WireContentBlock::ToolResult {
                     tool_use_id: tool_call_id.clone(),
                     content: content.clone(),
+                    is_error: is_error.then_some(true),
                 };
                 // Anthropic requires alternating roles: merge consecutive tool
                 // results into one user message with multiple tool_result
@@ -411,7 +586,7 @@ fn to_wire_messages(messages: &[ModelMessage]) -> Vec<WireMessage> {
             }
         }
     }
-    mapped
+    Ok(mapped)
 }
 
 fn to_wire_tools(tools: &[ToolSpec]) -> Vec<WireTool> {
@@ -425,33 +600,62 @@ fn to_wire_tools(tools: &[ToolSpec]) -> Vec<WireTool> {
         .collect()
 }
 
+/// A bounded, redacted invalid-response terminal event.
+fn invalid_response(message: String) -> ProviderStreamEvent {
+    ProviderStreamEvent::Error {
+        error: ProviderFailure::new(
+            ProviderErrorKind::InvalidResponse,
+            crate::errors::normalized_message(&message),
+        ),
+    }
+}
+
 /// One tracked content block in the incoming stream.
 #[derive(Clone)]
 enum BlockState {
-    Text,
+    /// A text block (or an announced kind the adapter does not know, which
+    /// keeps the reference adapter's text-compatible tolerance). `bytes`
+    /// accumulates the block's size for the fail-closed bound.
+    Text {
+        bytes: usize,
+    },
     Tool {
         id: String,
         name: String,
         json: String,
+    },
+    Thinking {
+        signature: String,
+        data: String,
+    },
+    RedactedThinking {
+        data: String,
     },
 }
 
 struct AnthropicStream {
     receiver: StdReceiver<FetchItem>,
     signal: Option<CancelToken>,
+    /// All visible text across blocks, kept for structured-output parsing.
     text: String,
     input_tokens: i64,
     output_tokens: i64,
     stop_reason: Option<FinishReason>,
+    /// Currently open blocks by announced index; a block leaves the map when
+    /// its `content_block_stop` arrives, so deltas for a closed index fail.
     blocks: HashMap<i64, BlockState>,
-    /// Tool blocks in stream order; emitted when each block closes.
-    closed_tool_blocks: Vec<(String, String, String)>,
     structured_output: Option<crate::contract::StructuredOutputRequest>,
     pending: std::collections::VecDeque<ProviderStreamEvent>,
     finished: bool,
 }
 
 impl AnthropicStream {
+    /// End the stream with a typed invalid-response failure.
+    fn fail(&mut self, message: String) -> Vec<ProviderStreamEvent> {
+        self.finished = true;
+        vec![invalid_response(message)]
+    }
+
     fn absorb_event(&mut self, event: WireStreamEvent) -> Vec<ProviderStreamEvent> {
         match event {
             WireStreamEvent::MessageStart { message } => {
@@ -469,37 +673,9 @@ impl AnthropicStream {
             WireStreamEvent::ContentBlockStart {
                 index,
                 content_block,
-            } => {
-                let state = match content_block {
-                    WireContentBlockStart::ToolUse { id, name } => BlockState::Tool {
-                        id,
-                        name,
-                        json: String::new(),
-                    },
-                    WireContentBlockStart::Other => BlockState::Text,
-                };
-                self.blocks.insert(index, state);
-                Vec::new()
-            }
-            WireStreamEvent::ContentBlockDelta { index, delta } => match delta {
-                WireDelta::Text { text } => {
-                    self.text.push_str(&text);
-                    vec![ProviderStreamEvent::TextDelta { text }]
-                }
-                WireDelta::InputJson { partial_json } => {
-                    if let Some(BlockState::Tool { json, .. }) = self.blocks.get_mut(&index) {
-                        json.push_str(&partial_json);
-                    }
-                    Vec::new()
-                }
-                WireDelta::Other => Vec::new(),
-            },
-            WireStreamEvent::ContentBlockStop { index } => {
-                if let Some(BlockState::Tool { id, name, json }) = self.blocks.remove(&index) {
-                    self.closed_tool_blocks.push((id, name, json));
-                }
-                Vec::new()
-            }
+            } => self.absorb_block_start(index, content_block),
+            WireStreamEvent::ContentBlockDelta { index, delta } => self.absorb_delta(index, delta),
+            WireStreamEvent::ContentBlockStop { index } => self.absorb_block_stop(index),
             WireStreamEvent::MessageDelta { delta, usage } => {
                 self.output_tokens = usage
                     .and_then(|usage| usage.output_tokens)
@@ -511,9 +687,8 @@ impl AnthropicStream {
                 }
                 Vec::new()
             }
-            WireStreamEvent::MessageStop | WireStreamEvent::Ping | WireStreamEvent::Unknown => {
-                Vec::new()
-            }
+            WireStreamEvent::MessageStop => self.absorb_message_stop(),
+            WireStreamEvent::Ping | WireStreamEvent::Unknown => Vec::new(),
             WireStreamEvent::Error { error } => {
                 // The SDK throws an APIError for mid-stream error events, which
                 // aborts the stream: the normalizer classifies it (no status
@@ -527,26 +702,212 @@ impl AnthropicStream {
         }
     }
 
-    /// Terminal events: closed tool blocks, structured output, completion.
-    fn closing_events(&mut self) -> Vec<ProviderStreamEvent> {
-        let mut events = Vec::new();
-        for (id, name, json_text) in self.closed_tool_blocks.clone() {
-            let input = if json_text.is_empty() {
-                json!({})
-            } else {
-                serde_json::from_str(&json_text).unwrap_or(Value::String(json_text.clone()))
-            };
-            events.push(ProviderStreamEvent::ToolCall {
-                call: ToolCall {
+    fn absorb_block_start(
+        &mut self,
+        index: i64,
+        content_block: WireContentBlockStart,
+    ) -> Vec<ProviderStreamEvent> {
+        if index < 0 {
+            return self.fail(format!(
+                "content_block_start announced a negative block index ({index})"
+            ));
+        }
+        if self.blocks.contains_key(&index) {
+            return self.fail(format!(
+                "content_block_start announced block index {index}, which is already open"
+            ));
+        }
+        let state = match content_block {
+            WireContentBlockStart::ToolUse { id, name } => {
+                let id = id.filter(|value| !value.is_empty());
+                let name = name.filter(|value| !value.is_empty());
+                let missing_field = if id.is_none() { "id" } else { "name" };
+                let (Some(id), Some(name)) = (id, name) else {
+                    return self.fail(format!(
+                        "tool_use content block at index {index} is missing its {missing_field}"
+                    ));
+                };
+                BlockState::Tool {
                     id,
                     name,
-                    arguments: input,
-                },
-            });
-        }
+                    json: String::new(),
+                }
+            }
+            // The protocol sends the reasoning text only through deltas; the
+            // start payload's `thinking` field is normally empty.
+            WireContentBlockStart::Thinking { thinking } => BlockState::Thinking {
+                signature: String::new(),
+                data: thinking,
+            },
+            // A redacted block arrives complete at start; it streams no
+            // deltas.
+            WireContentBlockStart::RedactedThinking { data } => {
+                BlockState::RedactedThinking { data }
+            }
+            WireContentBlockStart::Other => BlockState::Text { bytes: 0 },
+        };
+        self.blocks.insert(index, state);
+        Vec::new()
+    }
 
+    fn absorb_delta(&mut self, index: i64, delta: WireDelta) -> Vec<ProviderStreamEvent> {
+        let Some(state) = self.blocks.get_mut(&index) else {
+            return self.fail(format!(
+                "content_block_delta arrived for block index {index}, which is not open"
+            ));
+        };
+        // Compute the outcome while only the block state is borrowed; the
+        // failure path needs `&mut self` afterwards.
+        let outcome = match (delta, state) {
+            (WireDelta::Text { text }, BlockState::Text { bytes }) => {
+                if *bytes + text.len() > MAX_TEXT_BLOCK_BYTES {
+                    Err(format!(
+                        "text content block at index {index} exceeded the \
+                         {MAX_TEXT_BLOCK_BYTES}-byte bound"
+                    ))
+                } else {
+                    *bytes += text.len();
+                    self.text.push_str(&text);
+                    Ok(vec![ProviderStreamEvent::TextDelta { text }])
+                }
+            }
+            (WireDelta::Text { .. }, _) => Err(format!(
+                "text_delta arrived for block index {index}, which is not a text block"
+            )),
+            (WireDelta::InputJson { partial_json }, BlockState::Tool { json, .. }) => {
+                if json.len() + partial_json.len() > MAX_TOOL_ARGUMENT_BYTES {
+                    Err(format!(
+                        "tool_use input at block index {index} exceeded the \
+                         {MAX_TOOL_ARGUMENT_BYTES}-byte bound"
+                    ))
+                } else {
+                    json.push_str(&partial_json);
+                    Ok(Vec::new())
+                }
+            }
+            (WireDelta::InputJson { .. }, _) => Err(format!(
+                "input_json_delta arrived for block index {index}, which is not a tool_use block"
+            )),
+            (WireDelta::Thinking { thinking }, BlockState::Thinking { data, .. }) => {
+                // Mid-stream guard on the raw payload parts; the exact bound
+                // is re-checked on the encoded payload at block stop.
+                if data.len() + thinking.len() > MAX_CONTINUATION_DATA_BYTES {
+                    Err(format!(
+                        "thinking content block at index {index} exceeded the \
+                         {MAX_CONTINUATION_DATA_BYTES}-byte continuation bound"
+                    ))
+                } else {
+                    data.push_str(&thinking);
+                    Ok(Vec::new())
+                }
+            }
+            (WireDelta::Thinking { .. }, _) => Err(format!(
+                "thinking_delta arrived for block index {index}, which is not a thinking block"
+            )),
+            (
+                WireDelta::Signature { signature },
+                BlockState::Thinking {
+                    signature: accumulated,
+                    ..
+                },
+            ) => {
+                if accumulated.len() + signature.len() > MAX_CONTINUATION_DATA_BYTES {
+                    Err(format!(
+                        "thinking content block at index {index} exceeded the \
+                         {MAX_CONTINUATION_DATA_BYTES}-byte continuation bound"
+                    ))
+                } else {
+                    accumulated.push_str(&signature);
+                    Ok(Vec::new())
+                }
+            }
+            (WireDelta::Signature { .. }, _) => Err(format!(
+                "signature_delta arrived for block index {index}, which is not a thinking block"
+            )),
+            // Unknown delta kinds stay tolerated, like unknown event types.
+            (WireDelta::Other, _) => Ok(Vec::new()),
+        };
+        match outcome {
+            Ok(events) => events,
+            Err(message) => self.fail(message),
+        }
+    }
+
+    fn absorb_block_stop(&mut self, index: i64) -> Vec<ProviderStreamEvent> {
+        let Some(state) = self.blocks.remove(&index) else {
+            return self.fail(format!(
+                "content_block_stop arrived for block index {index}, which is not open"
+            ));
+        };
+        match state {
+            BlockState::Text { .. } => Vec::new(),
+            BlockState::Tool { id, name, json } => {
+                // An empty argument buffer is a call with no arguments; any
+                // non-empty buffer must parse, or the turn fails closed
+                // instead of handing the executor a raw string.
+                let arguments = if json.is_empty() {
+                    json!({})
+                } else {
+                    match serde_json::from_str(&json) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return self.fail(format!(
+                                "tool_use block \"{name}\" (call {id}) accumulated input that \
+                                 is not valid JSON: {error}"
+                            ));
+                        }
+                    }
+                };
+                vec![ProviderStreamEvent::ToolCall {
+                    call: ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    },
+                }]
+            }
+            BlockState::Thinking { signature, data } => {
+                let encoded = match encode_thinking_continuation(&signature, &data) {
+                    Ok(encoded) => encoded,
+                    Err(detail) => return self.fail(detail),
+                };
+                if encoded.len() > MAX_CONTINUATION_DATA_BYTES {
+                    return self.fail(format!(
+                        "thinking content block at index {index} produced a continuation \
+                         payload above the {MAX_CONTINUATION_DATA_BYTES}-byte bound"
+                    ));
+                }
+                vec![ProviderStreamEvent::Continuation {
+                    discriminator: CONTINUATION_THINKING.to_owned(),
+                    data: encoded,
+                }]
+            }
+            BlockState::RedactedThinking { data } => {
+                if data.len() > MAX_CONTINUATION_DATA_BYTES {
+                    return self.fail(format!(
+                        "redacted_thinking content block at index {index} exceeded the \
+                         {MAX_CONTINUATION_DATA_BYTES}-byte continuation bound"
+                    ));
+                }
+                vec![ProviderStreamEvent::Continuation {
+                    discriminator: CONTINUATION_REDACTED_THINKING.to_owned(),
+                    data,
+                }]
+            }
+        }
+    }
+
+    /// Terminal events on `message_stop`: structured output (when requested),
+    /// then completion with the authoritative usage pair.
+    fn absorb_message_stop(&mut self) -> Vec<ProviderStreamEvent> {
+        if !self.blocks.is_empty() {
+            return self
+                .fail("message_stop arrived while content blocks are still open".to_owned());
+        }
+        self.finished = true;
+        let mut events = Vec::new();
         if let Some(requested) = self.structured_output.clone() {
-            match crate::openai::parse_jsonish(&self.text) {
+            match crate::errors::parse_jsonish(&self.text) {
                 Some(value) => {
                     events.push(ProviderStreamEvent::StructuredOutput {
                         name: requested.name,
@@ -555,20 +916,14 @@ impl AnthropicStream {
                 }
                 None => {
                     let excerpt: String = self.text.chars().take(200).collect();
-                    events.push(ProviderStreamEvent::Error {
-                        error: ProviderFailure::new(
-                            ProviderErrorKind::InvalidResponse,
-                            format!(
-                                "Anthropic structured output was not valid JSON for \"{}\": {excerpt}",
-                                requested.name
-                            ),
-                        ),
-                    });
+                    events.push(invalid_response(format!(
+                        "Anthropic structured output was not valid JSON for \"{}\": {excerpt}",
+                        requested.name
+                    )));
                     return events;
                 }
             }
         }
-
         events.push(ProviderStreamEvent::Completed {
             finish_reason: self.stop_reason.unwrap_or(FinishReason::Stop),
             usage: TokenUsage {
@@ -616,10 +971,12 @@ impl Iterator for AnthropicStream {
                     }
                 }
                 Ok(FetchItem::Eof) | Err(RecvTimeoutError::Disconnected) => {
-                    let closing = self.closing_events();
-                    self.pending.extend(closing);
+                    // EOF without message_stop is an incomplete response:
+                    // fail closed instead of synthesizing completion.
                     self.finished = true;
-                    return self.pending.pop_front();
+                    return Some(invalid_response(
+                        "stream ended without a message_stop event".to_owned(),
+                    ));
                 }
                 Ok(FetchItem::Failed(failure)) => {
                     self.finished = true;
@@ -708,11 +1065,22 @@ impl ModelProvider for AnthropicProvider {
             };
         }
 
+        // An un-replayable continuation block in the transcript fails here,
+        // before any HTTP request: the endpoint needs the exact block.
+        let messages = match to_wire_messages(&request.messages) {
+            Ok(messages) => messages,
+            Err(failure) => {
+                return Box::new(std::iter::once(ProviderStreamEvent::Error {
+                    error: failure,
+                }));
+            }
+        };
+
         let tools = request.tools.as_deref().map(to_wire_tools);
         let wire = WireRequest {
             model: request.model.clone(),
             max_tokens: request.max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
-            messages: to_wire_messages(&request.messages),
+            messages,
             system: if system.is_empty() {
                 None
             } else {
@@ -752,10 +1120,88 @@ impl ModelProvider for AnthropicProvider {
             output_tokens: 0,
             stop_reason: None,
             blocks: HashMap::new(),
-            closed_tool_blocks: Vec::new(),
             structured_output: request.structured_output.clone(),
             pending: std::collections::VecDeque::new(),
             finished: false,
         })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_reasons_map_to_the_neutral_finish_reasons() {
+        assert_eq!(map_stop_reason("tool_use"), FinishReason::ToolCalls);
+        assert_eq!(map_stop_reason("max_tokens"), FinishReason::Length);
+        assert_eq!(map_stop_reason("end_turn"), FinishReason::Stop);
+        assert_eq!(map_stop_reason("stop_sequence"), FinishReason::Stop);
+        assert_eq!(map_stop_reason("pause_turn"), FinishReason::Stop);
+        assert_eq!(map_stop_reason("refusal"), FinishReason::Stop);
+    }
+
+    #[test]
+    fn thinking_continuation_payloads_round_trip_byte_stably() {
+        let encoded = encode_thinking_continuation("sig-123", "pondering deeply").expect("encodes");
+        assert_eq!(
+            encoded,
+            "{\"signature\":\"sig-123\",\"thinking\":\"pondering deeply\"}"
+        );
+        let decoded = decode_thinking_continuation(&encoded).expect("decodes");
+        assert_eq!(decoded.signature, "sig-123");
+        assert_eq!(decoded.thinking, "pondering deeply");
+        // The decoded payload maps back onto the wire block exactly.
+        assert_eq!(
+            continuation_to_wire(CONTINUATION_THINKING, &encoded).expect("replayable"),
+            WireContentBlock::Thinking {
+                thinking: "pondering deeply".into(),
+                signature: "sig-123".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn redacted_continuations_replay_their_bytes_verbatim() {
+        let block = continuation_to_wire(CONTINUATION_REDACTED_THINKING, "opaque-blob")
+            .expect("replayable");
+        assert_eq!(
+            block,
+            WireContentBlock::RedactedThinking {
+                data: "opaque-blob".into()
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_or_malformed_continuations_fail_closed_without_echoing_the_payload() {
+        let failure =
+            continuation_to_wire("vendor-x", "secret-opaque-payload").expect_err("unknown");
+        assert_eq!(failure.kind, ProviderErrorKind::InvalidResponse);
+        assert!(failure.message.contains("vendor-x"), "{}", failure.message);
+        assert!(
+            !failure.message.contains("secret-opaque-payload"),
+            "{}",
+            failure.message
+        );
+
+        let failure =
+            continuation_to_wire(CONTINUATION_THINKING, "not-json{secret").expect_err("malformed");
+        assert_eq!(failure.kind, ProviderErrorKind::InvalidResponse);
+        assert!(!failure.message.contains("secret"), "{}", failure.message);
+
+        let oversized = continuation_to_wire(
+            CONTINUATION_REDACTED_THINKING,
+            &"x".repeat(MAX_CONTINUATION_DATA_BYTES + 1),
+        )
+        .expect_err("oversized");
+        assert_eq!(oversized.kind, ProviderErrorKind::InvalidResponse);
+        assert!(oversized.message.contains("bound"), "{}", oversized.message);
+
+        let long_discriminator =
+            continuation_to_wire(&"d".repeat(MAX_CONTINUATION_DISCRIMINATOR_CHARS + 1), "x")
+                .expect_err("long discriminator");
+        assert_eq!(long_discriminator.kind, ProviderErrorKind::InvalidResponse);
     }
 }

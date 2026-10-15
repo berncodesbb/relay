@@ -144,16 +144,12 @@ pub fn connection(adapter: AdapterKind, api_key_env: Option<&str>) -> ProviderCo
     }
 }
 
-/// The three connections most hand-built test configurations need: the
-/// offline fake plus the two legacy live keys.
+/// The connections most hand-built test configurations need: the offline
+/// fake plus the default anthropic connection.
 pub fn test_providers() -> Providers {
     Providers(
         [
             ("fake".to_string(), connection(AdapterKind::Fake, None)),
-            (
-                "openai".to_string(),
-                connection(AdapterKind::OpenaiChat, Some("OPENAI_API_KEY")),
-            ),
             (
                 "anthropic".to_string(),
                 connection(AdapterKind::Anthropic, Some("ANTHROPIC_API_KEY")),
@@ -171,7 +167,7 @@ pub fn config_with(
     models: Option<Vec<(&str, ModelRoleConfig)>>,
 ) -> RelayConfig {
     RelayConfig {
-        version: 1,
+        version: relay_config::CONFIG_SCHEMA_VERSION,
         providers: test_providers(),
         models: models.map(|entries| {
             entries
@@ -197,7 +193,7 @@ pub fn inline_routes() -> Vec<(&'static str, RoutingValue)> {
         ("technical-design", inline("anthropic", "claude-opus-5-5")),
         ("planning", inline("anthropic", "claude-sonnet-5-5")),
         ("implementation", inline("anthropic", "claude-sonnet-5-5")),
-        ("verification", inline("openai", "gpt-5.2")),
+        ("verification", inline("anthropic", "claude-haiku-4-5")),
         ("delivery", inline("anthropic", "claude-haiku-4-5")),
     ]
 }
@@ -230,8 +226,8 @@ models:
     provider: anthropic
     model: claude-sonnet-5-5
   review:
-    provider: openai
-    model: gpt-5.2
+    provider: anthropic
+    model: claude-haiku-4-5
     fallbacks: [reasoning]
   fast:
     provider: anthropic
@@ -256,9 +252,9 @@ routing:
   discovery: { provider: anthropic, model: claude-sonnet-5-5 }
   specification: { provider: anthropic, model: claude-sonnet-5-5 }
   technical-design: { provider: anthropic, model: claude-opus-5-5 }
-  planning: { provider: openai, model: gpt-5-mini, fallbacks: [{ provider: anthropic, model: claude-sonnet-5-5 }] }
+  planning: { provider: anthropic, model: claude-sonnet-5-5, fallbacks: [{ provider: anthropic, model: claude-haiku-4-5 }] }
   implementation: { provider: anthropic, model: claude-sonnet-5-5 }
-  verification: { provider: openai, model: gpt-5.2 }
+  verification: { provider: anthropic, model: claude-haiku-4-5 }
   delivery: { provider: anthropic, model: claude-haiku-4-5 }
 "#;
 
@@ -267,7 +263,7 @@ pub const USER_LAYER_YAML: &str = r#"
 version: 1
 budgets: {}
 models:
-  reasoning: { provider: openai, model: gpt-5.2 }
+  reasoning: { provider: anthropic, model: claude-sonnet-5-5 }
 routing:
   discovery: reasoning
   specification: reasoning
@@ -278,23 +274,23 @@ routing:
   delivery: fast
 "#;
 
-/// A named-connection layer: GLM through its OpenAI-compatible endpoint plus
-/// a second `openai-chat` connection, with a role using each.
+/// A named-connection layer: two Anthropic Messages-compatible endpoints, a
+/// hosted one with its own credential variable and a local gateway, with a
+/// role using each.
 pub const NAMED_CONNECTIONS_YAML: &str = r#"
 version: 1
 budgets: {}
 providers:
-  glm:
-    adapter: openai-chat
-    baseUrl: https://api.z.ai/api/paas/v4
-    apiKeyEnv: GLM_API_KEY
-    preset: glm
-  local:
-    adapter: openai-chat
-    baseUrl: http://localhost:8080/v1
+  claude-pro:
+    adapter: anthropic
+    baseUrl: https://api.anthropic.com
+    apiKeyEnv: CLAUDE_PRO_API_KEY
+  claude-local:
+    adapter: anthropic
+    baseUrl: http://localhost:8080
 models:
-  reasoning: { provider: glm, model: glm-4.7 }
-  coding: { provider: local, model: qwen3-coder }
+  reasoning: { provider: claude-pro, model: claude-sonnet-5-5 }
+  coding: { provider: claude-local, model: claude-sonnet-5-5 }
 routing:
   intent: fast
   discovery: reasoning

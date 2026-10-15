@@ -37,7 +37,7 @@ pub enum RuntimeSelection {
     /// Resolve production wiring from the effective configuration. The
     /// optional provider-connection override is the `--provider` flag: a
     /// configured connection name that every route is forced onto (the
-    /// legacy `fake`, `openai`, and `anthropic` spellings are the default
+    /// legacy `fake` and `anthropic` spellings are the default
     /// connection names). `None` routes through configuration as-is.
     Production {
         /// The `--provider <connection>` override, when given.

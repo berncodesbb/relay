@@ -10,8 +10,8 @@
 //! `--role` replaces the whole chain with one catalog role's expanded chain;
 //! `--provider` filters the chain to routes on that provider *connection*
 //! (a `providers.<name>` key of the effective configuration, so the legacy
-//! `fake`/`openai`/`anthropic` spellings and any user-defined connection
-//! name all work); `--model` rewrites the model id on every surviving route.
+//! `fake`/`anthropic` spellings and any user-defined connection name all
+//! work); `--model` rewrites the model id on every surviving route.
 //! Provider *registration* (credential variables present in the environment)
 //! is a provider-time concern and is deliberately not modeled here.
 

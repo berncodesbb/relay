@@ -4,6 +4,8 @@
 
 Relay is a local-first, model-agnostic CLI that carries product intent through discovery, specification, technical design, implementation, verification, and delivery. Models are replaceable workers; Relay owns workflow state, artifacts, permissions, and transition policy.
 
+Model protocol direction: Anthropic Messages is the strategic and sole supported live external model protocol; the deterministic in-process `fake` provider remains the offline default. The `openai-chat` adapter, its implicit `providers.openai` default connection, and its capability presets (including `glm`) were removed on 2026-10-15 by `docs/plans/2026-10-15-anthropic-messages-native-tool-loop.md`; configurations naming them fail before network access or project-state mutation with migration guidance, and no OpenAI runtime variant, feature flag, or dormant adapter may be reintroduced. Relay owns the conversation transcript and the tool loop: provider-hosted tools, stored conversations, and provider-side agent state are never authoritative workflow state.
+
 ## Implementation status
 
 Rust is the sole implementation. The authoritative architecture plan is `docs/plans/2026-10-13-intent-first-rust-work-graph.md`; `docs/plans/2026-10-13-rust-rewrite-architecture.md` and `docs/plans/2026-10-13-rust-rewrite-implementation.md` are historical references for the stopped compatibility port:

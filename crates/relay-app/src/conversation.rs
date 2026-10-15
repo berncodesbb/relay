@@ -717,13 +717,11 @@ pub(crate) fn build_context(
     // 4. Assemble: context block, transcript in chronological order, prompt.
     let mut messages = Vec::with_capacity(entries.len() + 2);
     if !block.is_empty() {
-        messages.push(ModelMessage::User { content: block });
+        messages.push(ModelMessage::user_text(block));
     }
     for entry in entries {
         match entry.role {
-            ContextRole::User => messages.push(ModelMessage::User {
-                content: entry.text,
-            }),
+            ContextRole::User => messages.push(ModelMessage::user_text(entry.text)),
             ContextRole::Assistant => messages.push(ModelMessage::Assistant {
                 content: vec![relay_providers::contract::AssistantContent::Text {
                     text: entry.text,
@@ -731,9 +729,7 @@ pub(crate) fn build_context(
             }),
         }
     }
-    messages.push(ModelMessage::User {
-        content: prompt_text,
-    });
+    messages.push(ModelMessage::user_text(prompt_text));
     BuiltContext { messages, trim }
 }
 
@@ -1048,7 +1044,7 @@ pub fn start_turn(
     //    answer (zero proposals); structured output that does not decode is
     //    a failed turn — the model broke the contract it was given, and the
     //    failure is reported truthfully instead of silently dropping intent.
-    let assistant_text = sanitize_for_record(&collected.text, message_cap);
+    let assistant_text = sanitize_for_record(&collected.text(), message_cap);
     let proposals = match collected.structured_output {
         Some(output) if output.name == STRUCTURED_OUTPUT_NAME => {
             match decode_proposals(&output.value, limits) {
@@ -1682,19 +1678,7 @@ mod tests {
     }
 
     fn text_of(message: &ModelMessage) -> String {
-        match message {
-            ModelMessage::User { content } => content.clone(),
-            ModelMessage::Assistant { content } => content
-                .iter()
-                .filter_map(|block| match block {
-                    relay_providers::contract::AssistantContent::Text { text } => {
-                        Some(text.clone())
-                    }
-                    _ => None,
-                })
-                .collect(),
-            ModelMessage::ToolResult { content, .. } => content.clone(),
-        }
+        message.text()
     }
 
     // -- limits --------------------------------------------------------------

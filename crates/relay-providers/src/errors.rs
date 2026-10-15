@@ -11,6 +11,8 @@
 use regex::Regex;
 use std::sync::OnceLock;
 
+use serde_json::Value;
+
 use crate::contract::{ProviderErrorKind, ProviderFailure};
 
 /// Maximum length of a preserved error message.
@@ -302,6 +304,63 @@ pub fn failure_from_reqwest(error: &reqwest::Error) -> ProviderFailure {
     to_provider_failure(signal)
 }
 
+// ---------------------------------------------------------------------------
+// Shared adapter helpers
+// ---------------------------------------------------------------------------
+//
+// Small utilities every wire adapter needs. They live here — next to the
+// bounded/redacted message helpers the adapters already share — so adapters
+// never depend on each other.
+
+/// Resolve a provider credential: an explicit value wins, then the named
+/// variable's value, mirroring the SDK constructors' failure when neither is
+/// available. The resolved key is never logged, echoed, or embedded in the
+/// error (only the variable *name* appears).
+pub(crate) fn resolve_api_key_for(
+    env_name: &str,
+    explicit: Option<String>,
+    from_env: Option<&str>,
+) -> Result<String, ProviderFailure> {
+    if let Some(explicit) = explicit.filter(|key| !key.is_empty()) {
+        return Ok(explicit);
+    }
+    if let Some(from_env) = from_env.filter(|key| !key.is_empty()) {
+        return Ok(from_env.to_owned());
+    }
+    Err(ProviderFailure::new(
+        ProviderErrorKind::Auth,
+        format!("The {env_name} environment variable is missing"),
+    ))
+}
+
+/// Parse JSON that models sometimes wrap in markdown fences.
+pub(crate) fn parse_jsonish(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    if let Ok(value) = serde_json::from_str(trimmed) {
+        return Some(value);
+    }
+    let unfenced = strip_code_fence(trimmed);
+    serde_json::from_str(&unfenced).ok()
+}
+
+/// Remove a leading ```` ```json ````/```` ``` ```` fence and trailing fence,
+/// mirroring the TypeScript `^```(?:json)?\s*` / `\s*```$` (case-insensitive)
+/// replacement pair.
+fn strip_code_fence(trimmed: &str) -> String {
+    let Some(after_open) = trimmed.strip_prefix("```") else {
+        return trimmed.to_owned();
+    };
+    let after_tag = if after_open.len() >= 4 && after_open[..4].eq_ignore_ascii_case("json") {
+        &after_open[4..]
+    } else {
+        after_open
+    };
+    let stripped_start = after_tag.trim_start();
+    let trimmed_end = stripped_start.trim_end();
+    let without_close = trimmed_end.strip_suffix("```").unwrap_or(trimmed_end);
+    without_close.trim_end().to_owned()
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
@@ -553,5 +612,43 @@ mod tests {
             ..ErrorSignal::default()
         };
         assert_eq!(to_provider_failure(deep).kind, ProviderErrorKind::Unknown);
+    }
+
+    #[test]
+    fn resolves_explicit_keys_before_named_environment_keys() {
+        assert_eq!(
+            resolve_api_key_for("GLM_API_KEY", Some("explicit".into()), Some("from-env"))
+                .as_deref(),
+            Ok("explicit")
+        );
+        assert_eq!(
+            resolve_api_key_for("GLM_API_KEY", None, Some("from-env")).as_deref(),
+            Ok("from-env")
+        );
+        let error = resolve_api_key_for("GLM_API_KEY", None, None).expect_err("missing key");
+        assert_eq!(error.kind, ProviderErrorKind::Auth);
+        assert!(
+            error
+                .message
+                .contains("The GLM_API_KEY environment variable is missing"),
+            "{}",
+            error.message
+        );
+        let error =
+            resolve_api_key_for("GLM_API_KEY", Some(String::new()), None).expect_err("empty key");
+        assert_eq!(error.kind, ProviderErrorKind::Auth);
+    }
+
+    #[test]
+    fn code_fences_are_stripped_before_parsing() {
+        assert_eq!(strip_code_fence("```json\n{}\n```"), "{}");
+        assert_eq!(strip_code_fence("```JSON {\"a\":1} ```"), "{\"a\":1}");
+        assert_eq!(strip_code_fence("```\n[1,2]\n```"), "[1,2]");
+        assert_eq!(strip_code_fence("{\"a\":1}"), "{\"a\":1}");
+        assert_eq!(
+            parse_jsonish("```json\n{\"mode\":\"planning\"}\n```"),
+            Some(serde_json::json!({ "mode": "planning" }))
+        );
+        assert_eq!(parse_jsonish("plain"), None);
     }
 }

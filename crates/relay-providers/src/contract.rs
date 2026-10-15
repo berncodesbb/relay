@@ -17,6 +17,36 @@ use serde_json::Value;
 /// A JSON Schema object: an unordered set of string keys to JSON values.
 pub type JsonSchemaObject = serde_json::Map<String, Value>;
 
+// ---------------------------------------------------------------------------
+// Bounds
+// ---------------------------------------------------------------------------
+
+/// Maximum size, in bytes, of one assistant text block accumulated from a
+/// provider stream. This is a fail-closed backstop far above any legitimate
+/// single block Relay expects (final structured proposals are bounded to a
+/// few tens of thousands of characters by the executor): a stream whose open
+/// text block exceeds it fails with [`ProviderErrorKind::InvalidResponse`]
+/// instead of being silently truncated or retained unbounded.
+pub const MAX_TEXT_BLOCK_BYTES: usize = 512 * 1024;
+
+/// Maximum size, in bytes, of one tool-result content string. Tool results
+/// are Relay-produced (never provider-produced), so they are bounded at
+/// creation by the caller — [`ModelMessage::tool_result`] enforces this
+/// constant as the deterministic backstop. It sits above the tool layer's
+/// own per-tool output bounds so legitimate bounded results always pass.
+pub const MAX_TOOL_RESULT_CONTENT_BYTES: usize = 64 * 1024;
+
+/// Maximum size, in bytes, of the opaque payload of one continuation block
+/// (see [`AssistantContent::Continuation`]). A provider stream carrying a
+/// larger continuation fails with [`ProviderErrorKind::InvalidResponse`].
+pub const MAX_CONTINUATION_DATA_BYTES: usize = 16 * 1024;
+
+/// Maximum length, in characters, of a continuation block's provider
+/// discriminator (see [`AssistantContent::Continuation`]). A provider
+/// stream carrying a longer discriminator fails with
+/// [`ProviderErrorKind::InvalidResponse`].
+pub const MAX_CONTINUATION_DISCRIMINATOR_CHARS: usize = 64;
+
 /// Token usage reported by a provider. Provider-owned and neutral: no
 /// crate above `relay-providers` needs to know where usage came from, and
 /// `relay-providers` itself no longer depends on the frozen reference
@@ -54,7 +84,32 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
-/// One block of assistant message content.
+/// One block of user-authored conversation content.
+///
+/// User turns are ordered block lists (`Vec<UserContent>`) so additional
+/// input kinds — images, documents — can be added later without changing
+/// the transcript shape. The variant set is deliberately minimal today:
+/// plain text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum UserContent {
+    /// User prose.
+    Text {
+        /// The text.
+        text: String,
+    },
+}
+
+impl UserContent {
+    /// The visible text of this block (empty for non-text blocks).
+    pub fn text(&self) -> &str {
+        match self {
+            UserContent::Text { text } => text,
+        }
+    }
+}
+
+/// One block of assistant message content, in true production order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum AssistantContent {
@@ -68,18 +123,42 @@ pub enum AssistantContent {
         /// The call.
         call: ToolCall,
     },
+    /// Opaque, provider-specific continuation state (for example signed or
+    /// redacted reasoning) that a compatible endpoint requires to be
+    /// round-tripped on a later turn of the same conversation.
+    ///
+    /// This is the one deliberately non-neutral block in the contract, and
+    /// it is firewalled:
+    ///
+    /// - Relay never interprets, renders, logs, or persists it as domain
+    ///   truth; it never enters JSONL facts, SQLite projections, artifacts,
+    ///   receipts, or user-facing output.
+    /// - It is bounded ([`MAX_CONTINUATION_DATA_BYTES`] payload,
+    ///   [`MAX_CONTINUATION_DISCRIMINATOR_CHARS`] discriminator).
+    /// - It is excluded from the visible-text accessors
+    ///   ([`ModelTurnResult::text`], [`ModelMessage::text`]).
+    /// - It is replayed only to the same compatible route; routing must
+    ///   never carry it across providers or conversations.
+    Continuation {
+        /// Provider-specific discriminator naming the continuation kind
+        /// (bounded; used only to match the block back to its route).
+        discriminator: String,
+        /// The opaque bounded payload, carried as text.
+        data: String,
+    },
 }
 
 /// One message in a model conversation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "kebab-case")]
 pub enum ModelMessage {
-    /// A user turn.
+    /// A user turn (ordered content blocks).
     User {
-        /// The message text.
-        content: String,
+        /// Ordered content blocks.
+        content: Vec<UserContent>,
     },
-    /// An assistant turn (text and/or tool calls in order).
+    /// An assistant turn (text, tool calls, and opaque continuation blocks
+    /// in true order).
     Assistant {
         /// Ordered content blocks.
         content: Vec<AssistantContent>,
@@ -89,17 +168,73 @@ pub enum ModelMessage {
         /// Id of the answered tool call.
         #[serde(rename = "toolCallId")]
         tool_call_id: String,
-        /// Tool output text.
+        /// Tool output text, bounded at creation (see
+        /// [`ModelMessage::tool_result`] and
+        /// [`MAX_TOOL_RESULT_CONTENT_BYTES`]).
         content: String,
+        /// Whether this result reports a failed, denied, or otherwise
+        /// erroneous execution rather than success. Providers surface the
+        /// flag to the model so an error result is never mistaken for a
+        /// successful observation.
+        #[serde(rename = "isError")]
+        is_error: bool,
     },
 }
 
 impl ModelMessage {
-    /// The message text for user messages (empty string otherwise).
-    pub fn text(&self) -> &str {
+    /// A user message with a single text block (the common prompt-shaped
+    /// turn).
+    pub fn user_text(text: impl Into<String>) -> Self {
+        ModelMessage::User {
+            content: vec![UserContent::Text { text: text.into() }],
+        }
+    }
+
+    /// A tool result, bounded at creation. Tool results are Relay-produced,
+    /// never provider-produced: callers bound the content before sending,
+    /// and this constructor is the deterministic backstop, rejecting
+    /// content above [`MAX_TOOL_RESULT_CONTENT_BYTES`] with an actionable
+    /// message instead of truncating a result the model would then act on
+    /// as complete.
+    pub fn tool_result(
+        tool_call_id: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+    ) -> Result<Self, String> {
+        let content = content.into();
+        if content.len() > MAX_TOOL_RESULT_CONTENT_BYTES {
+            return Err(format!(
+                "tool result for call \"{}\" is {} bytes, above the {}-byte bound; bound the \
+                 output before returning it to the model",
+                tool_call_id.into(),
+                content.len(),
+                MAX_TOOL_RESULT_CONTENT_BYTES
+            ));
+        }
+        Ok(ModelMessage::ToolResult {
+            tool_call_id: tool_call_id.into(),
+            content,
+            is_error,
+        })
+    }
+
+    /// The visible text of this message: concatenated text blocks for user
+    /// and assistant turns (opaque continuation blocks excluded), and the
+    /// content for tool results. Empty string when there is nothing
+    /// visible.
+    pub fn text(&self) -> String {
         match self {
-            ModelMessage::User { content } => content,
-            _ => "",
+            ModelMessage::User { content } => {
+                content.iter().map(|block| block.text()).collect::<String>()
+            }
+            ModelMessage::Assistant { content } => content
+                .iter()
+                .filter_map(|block| match block {
+                    AssistantContent::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            ModelMessage::ToolResult { content, .. } => content.clone(),
         }
     }
 }
@@ -229,14 +364,12 @@ pub struct ModelRequest {
 }
 
 impl ModelRequest {
-    /// A minimal request to `model` with one user message.
+    /// A minimal request to `model` with one user text message.
     pub fn simple(model: impl Into<String>, user_text: impl Into<String>) -> Self {
         ModelRequest {
             model: model.into(),
             system: None,
-            messages: vec![ModelMessage::User {
-                content: user_text.into(),
-            }],
+            messages: vec![ModelMessage::user_text(user_text)],
             tools: None,
             structured_output: None,
             max_output_tokens: None,
@@ -254,19 +387,48 @@ impl ModelRequest {
 }
 
 /// One normalized event from a provider turn.
+///
+/// # Ordering contract
+///
+/// Adapters must emit block-bearing events (`TextDelta`, `ToolCall`,
+/// `Continuation`) in the true order the model produced the blocks, because
+/// [`collect`](crate::collect_turn) reconstructs the ordered block list from
+/// them alone:
+///
+/// - consecutive `TextDelta` fragments accumulate into one open text block;
+/// - a complete `ToolCall` or `Continuation` event closes any open text
+///   block first, so text → call → text survives as three ordered blocks;
+/// - `Completed` and `Error` are terminal: nothing may follow them, and a
+///   stream that ends without one of them is an invalid response (see
+///   [`collect_turn`](crate::collect_turn)).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProviderStreamEvent {
-    /// A fragment of assistant text.
+    /// A fragment of assistant text; consecutive fragments join one open
+    /// text block until a `ToolCall`, `Continuation`, or terminal event
+    /// closes it.
     TextDelta {
         /// The text fragment.
         text: String,
     },
-    /// A tool call (complete; adapters accumulate fragments first).
+    /// A complete, validated, atomic tool call. Adapters accumulate argument
+    /// fragments themselves and emit one event per call, in arrival order,
+    /// only once the call is complete (never partial JSON that callers would
+    /// have to parse).
     ToolCall {
         /// The call.
         call: ToolCall,
     },
-    /// Reported token usage (may arrive more than once).
+    /// A complete, bounded, opaque provider continuation block (see
+    /// [`AssistantContent::Continuation`]). Closes any open text block, so
+    /// surrounding text keeps its true position around it.
+    Continuation {
+        /// Provider-specific discriminator naming the continuation kind.
+        discriminator: String,
+        /// The opaque bounded payload.
+        data: String,
+    },
+    /// Reported token usage (may arrive more than once; the terminal
+    /// `Completed` event carries the authoritative final usage).
     Usage {
         /// The usage snapshot.
         usage: TokenUsage,
@@ -385,42 +547,40 @@ impl std::error::Error for ProviderFailure {}
 /// The wire-protocol adapter kinds Relay ships.
 ///
 /// Adapter identity is which *protocol* a provider connection speaks, not
-/// which vendor it reaches: `openai-chat` covers every OpenAI-compatible
-/// Chat Completions endpoint (OpenAI, GLM, Groq, OpenRouter, local
-/// gateways). The user-facing *connection* identity is a configurable name
-/// (`providers.<name>` in Relay configuration); this enum never grows one
-/// variant per vendor.
+/// which vendor it reaches: `anthropic` covers every Anthropic
+/// Messages-compatible endpoint. The user-facing *connection* identity is a
+/// configurable name (`providers.<name>` in Relay configuration); this enum
+/// never grows one variant per vendor.
+///
+/// The historical `openai-chat` adapter (every OpenAI-compatible Chat
+/// Completions endpoint) was intentionally removed; configuration carrying
+/// that spelling fails at the configuration boundary with migration
+/// guidance, and no runtime variant remains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdapterKind {
-    /// OpenAI-compatible Chat Completions (`/chat/completions`).
-    OpenaiChat,
-    /// The native Anthropic Messages API.
+    /// The native Anthropic Messages API (the sole live external protocol).
     Anthropic,
     /// The deterministic in-process fake.
     Fake,
 }
 
 /// The adapter kinds Relay ships, in stable order.
-pub const ADAPTER_KINDS: [AdapterKind; 3] = [
-    AdapterKind::OpenaiChat,
-    AdapterKind::Anthropic,
-    AdapterKind::Fake,
-];
+pub const ADAPTER_KINDS: [AdapterKind; 2] = [AdapterKind::Anthropic, AdapterKind::Fake];
 
 impl AdapterKind {
     /// The wire/configuration spelling of this adapter kind.
     pub fn as_str(self) -> &'static str {
         match self {
-            AdapterKind::OpenaiChat => "openai-chat",
             AdapterKind::Anthropic => "anthropic",
             AdapterKind::Fake => "fake",
         }
     }
 
-    /// Parse the wire/configuration spelling of an adapter kind.
+    /// Parse the wire/configuration spelling of an adapter kind. The removed
+    /// `openai-chat` spelling (like every other unknown value) does not
+    /// parse; configuration surfaces the migration diagnostic instead.
     pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "openai-chat" => Some(AdapterKind::OpenaiChat),
             "anthropic" => Some(AdapterKind::Anthropic),
             "fake" => Some(AdapterKind::Fake),
             _ => None,
@@ -437,11 +597,14 @@ impl fmt::Display for AdapterKind {
 /// How an adapter represents Relay's system/developer instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InstructionStyle {
-    /// Sent as the protocol's developer-role message.
+    /// Historical: the developer-role spelling of the removed `openai-chat`
+    /// adapter. No shipped adapter constructs it and configuration rejects
+    /// the spelling with the removal diagnostic; retained only so the
+    /// deserialized shape of in-flight values stays defined.
     #[serde(rename = "developer")]
     Developer,
-    /// Translated to a system-role message (documented safe fallback for
-    /// compatibility endpoints that do not recognize a developer role).
+    /// Instructions travel in the protocol's system parameter — the only
+    /// style the shipped adapters use.
     #[serde(rename = "system-instruction")]
     SystemInstruction,
 }
@@ -479,12 +642,16 @@ pub enum OutputTokenParam {
     /// Always `max_tokens`.
     #[serde(rename = "max-tokens")]
     MaxTokens,
-    /// Always `max_completion_tokens`.
+    /// Always `max_completion_tokens`. Historical: this spelling and the
+    /// per-model heuristic below existed only for OpenAI-compatible
+    /// endpoints and were removed with the `openai-chat` adapter; no shipped
+    /// adapter selects them, and configuration rejects the spellings with
+    /// migration guidance.
     #[serde(rename = "max-completion-tokens")]
     MaxCompletionTokens,
-    /// Choose per model with the adapter's documented heuristic (the
-    /// OpenAI-compatible default: `gpt-5*`/`o<digit>*` models use
-    /// `max_completion_tokens`, others `max_tokens`).
+    /// Choose per model with the adapter's documented heuristic. Historical:
+    /// removed with the `openai-chat` adapter (see
+    /// [`OutputTokenParam::MaxCompletionTokens`]).
     #[serde(rename = "model-default")]
     ModelDefault,
 }
@@ -523,16 +690,6 @@ impl AdapterCapabilities {
     /// The conservative adapter defaults for a kind.
     pub fn defaults_for(kind: AdapterKind) -> Self {
         match kind {
-            AdapterKind::OpenaiChat => AdapterCapabilities {
-                instructions: InstructionStyle::Developer,
-                tool_calls: FeatureSupport::Supported,
-                streamed_tool_arguments: FeatureSupport::Supported,
-                parallel_tool_calls: FeatureSupport::Unsupported,
-                structured_output: StructuredOutputMode::JsonSchema,
-                streamed_usage: FeatureSupport::Supported,
-                output_token_param: OutputTokenParam::ModelDefault,
-                image_input: FeatureSupport::Unsupported,
-            },
             AdapterKind::Anthropic => AdapterCapabilities {
                 instructions: InstructionStyle::SystemInstruction,
                 tool_calls: FeatureSupport::Supported,
@@ -589,25 +746,18 @@ impl CapabilityOverrides {
 
 /// The named capability presets Relay knows, in stable order. Presets are
 /// complete profiles layered over the adapter defaults before explicit
-/// overrides; the first is `glm` (OpenAI-compatible Chat Completions with
-/// conservative compatibility behavior).
-pub const PRESET_NAMES: [&str; 1] = ["glm"];
+/// overrides. The list is currently empty: the historical `glm` preset
+/// (OpenAI-compatible Chat Completions) was removed with the `openai-chat`
+/// adapter, and configuration rejects that spelling with migration guidance.
+/// The mechanism stays so a future preset can land without another contract
+/// change.
+pub const PRESET_NAMES: [&str; 0] = [];
 
 /// The named preset profile, or `None` for an unknown preset name.
-pub fn preset_capabilities(name: &str) -> Option<AdapterCapabilities> {
-    match name {
-        // GLM's OpenAI-compatible endpoint: system instructions rather than
-        // the developer role, json-object structured output, no streamed
-        // usage guarantee, and plain max_tokens.
-        "glm" => Some(AdapterCapabilities {
-            instructions: InstructionStyle::SystemInstruction,
-            structured_output: StructuredOutputMode::JsonObject,
-            streamed_usage: FeatureSupport::Unsupported,
-            output_token_param: OutputTokenParam::MaxTokens,
-            ..AdapterCapabilities::defaults_for(AdapterKind::OpenaiChat)
-        }),
-        _ => None,
-    }
+pub fn preset_capabilities(_name: &str) -> Option<AdapterCapabilities> {
+    // No presets are currently defined (see [`PRESET_NAMES`]); every name is
+    // unknown and callers surface the actionable unknown-preset error.
+    None
 }
 
 /// An invalid capability/preset combination, with an actionable message.
@@ -626,9 +776,15 @@ pub fn resolve_capabilities(
     let mut capabilities = AdapterCapabilities::defaults_for(kind);
     if let Some(preset) = preset {
         let profile = preset_capabilities(preset).ok_or_else(|| {
+            let available = if PRESET_NAMES.is_empty() {
+                "no capability presets are currently defined; set explicit \
+                 capability overrides instead"
+                    .to_owned()
+            } else {
+                format!("available presets: {}", PRESET_NAMES.join(", "))
+            };
             CapabilityError(format!(
-                "unknown capability preset \"{preset}\" (available presets: {})",
-                PRESET_NAMES.join(", ")
+                "unknown capability preset \"{preset}\" ({available})"
             ))
         })?;
         // A preset only refines the profile when the adapter kind matches
@@ -669,12 +825,12 @@ pub fn resolve_capabilities(
     Ok(capabilities)
 }
 
-/// The adapter kind a named preset is defined against.
-pub fn preset_adapter(name: &str) -> AdapterKind {
-    match name {
-        "glm" => AdapterKind::OpenaiChat,
-        _ => AdapterKind::Fake,
-    }
+/// The adapter kind a named preset is defined against. No presets are
+/// currently defined (see [`PRESET_NAMES`]), so this is only reachable for a
+/// name [`preset_capabilities`] already accepted; the fake adapter is the
+/// inert placeholder until a real preset exists.
+pub fn preset_adapter(_name: &str) -> AdapterKind {
+    AdapterKind::Fake
 }
 
 /// A provider turn is a lazy stream of normalized events.
@@ -701,24 +857,57 @@ pub trait ModelProvider: Send + Sync {
 }
 
 /// Aggregated result of one model turn, produced from a stream.
+///
+/// [`blocks`](Self::blocks) is the authoritative output: the assistant's
+/// text, tool calls, and opaque continuation blocks in the true order the
+/// model produced them. The accessors are conveniences over that order and
+/// never replace it: [`text`](Self::text) concatenates the visible text
+/// blocks, and [`tool_calls`](Self::tool_calls) collects the calls in
+/// arrival order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelTurnResult {
-    /// Concatenated text deltas.
-    pub text: String,
-    /// Tool calls in arrival order.
-    pub tool_calls: Vec<ToolCall>,
+    /// Ordered assistant content blocks (authoritative).
+    pub blocks: Vec<AssistantContent>,
     /// Captured structured output, when the turn produced one.
     pub structured_output: Option<StructuredOutput>,
     /// Why the turn ended.
     pub finish_reason: FinishReason,
-    /// Token usage.
+    /// Token usage; the terminal `Completed` event's usage is authoritative.
     pub usage: TokenUsage,
+}
+
+impl ModelTurnResult {
+    /// Concatenated visible text across all text blocks. Tool calls and
+    /// opaque continuation blocks are excluded, so text before and after a
+    /// tool call joins without a separator exactly like a folded stream of
+    /// deltas.
+    pub fn text(&self) -> String {
+        self.blocks
+            .iter()
+            .filter_map(|block| match block {
+                AssistantContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Tool calls in arrival order.
+    pub fn tool_calls(&self) -> Vec<ToolCall> {
+        self.blocks
+            .iter()
+            .filter_map(|block| match block {
+                AssistantContent::ToolCall { call } => Some(call.clone()),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn finish_reason_round_trips_wire_spellings() {
@@ -739,54 +928,60 @@ mod tests {
         for kind in ADAPTER_KINDS {
             assert_eq!(AdapterKind::parse(kind.as_str()), Some(kind));
         }
+        // Negative spellings stay negative, including the removed protocol's
+        // vendor name and its historical adapter spelling.
         assert_eq!(AdapterKind::parse("openai"), None);
+        assert_eq!(AdapterKind::parse("openai-chat"), None);
         assert_eq!(AdapterKind::parse("bedrock"), None);
     }
 
     #[test]
-    fn capabilities_resolve_defaults_preset_then_overrides() {
+    fn capabilities_resolve_defaults_then_overrides() {
         let base = resolve_capabilities(
-            AdapterKind::OpenaiChat,
+            AdapterKind::Anthropic,
             None,
             &CapabilityOverrides::default(),
         )
         .expect("defaults resolve");
-        assert_eq!(base.instructions, InstructionStyle::Developer);
-        assert_eq!(base.structured_output, StructuredOutputMode::JsonSchema);
-
-        let glm = resolve_capabilities(
-            AdapterKind::OpenaiChat,
-            Some("glm"),
-            &CapabilityOverrides::default(),
-        )
-        .expect("preset resolves");
-        assert_eq!(glm.instructions, InstructionStyle::SystemInstruction);
-        assert_eq!(glm.structured_output, StructuredOutputMode::JsonObject);
-        assert_eq!(glm.streamed_usage, FeatureSupport::Unsupported);
-        assert_eq!(glm.output_token_param, OutputTokenParam::MaxTokens);
+        assert_eq!(base.instructions, InstructionStyle::SystemInstruction);
+        assert_eq!(base.structured_output, StructuredOutputMode::JsonObject);
 
         let overrides = CapabilityOverrides {
             structured_output: Some(StructuredOutputMode::JsonSchema),
             ..CapabilityOverrides::default()
         };
-        let forced = resolve_capabilities(AdapterKind::OpenaiChat, Some("glm"), &overrides)
-            .expect("overrides win");
+        let forced =
+            resolve_capabilities(AdapterKind::Anthropic, None, &overrides).expect("overrides win");
         assert_eq!(forced.structured_output, StructuredOutputMode::JsonSchema);
         assert_eq!(forced.instructions, InstructionStyle::SystemInstruction);
+    }
 
-        let error = resolve_capabilities(AdapterKind::OpenaiChat, Some("grok"), &overrides)
-            .expect_err("unknown preset");
-        assert!(
-            error.to_string().contains("unknown capability preset"),
-            "{error}"
-        );
+    #[test]
+    fn unknown_presets_fail_actionably_and_the_preset_list_is_empty() {
+        assert!(PRESET_NAMES.is_empty());
+        assert!(preset_capabilities("glm").is_none());
+        assert!(preset_capabilities("anything").is_none());
 
-        let error = resolve_capabilities(AdapterKind::Anthropic, Some("glm"), &overrides)
-            .expect_err("preset/adapter mismatch");
+        let error = resolve_capabilities(
+            AdapterKind::Anthropic,
+            Some("glm"),
+            &CapabilityOverrides::default(),
+        )
+        .expect_err("the removed preset no longer resolves");
         assert!(
             error
                 .to_string()
-                .contains("applies to the openai-chat adapter"),
+                .contains("unknown capability preset \"glm\""),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("no capability presets are currently defined"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("explicit capability overrides"),
             "{error}"
         );
     }
@@ -805,14 +1000,149 @@ mod tests {
 
     #[test]
     fn model_message_serializes_with_reference_field_names() {
-        let message = ModelMessage::ToolResult {
-            tool_call_id: "call_1".into(),
-            content: "file body".into(),
-        };
+        let message = ModelMessage::tool_result("call_1", "file body", false).expect("bounded");
         let value = serde_json::to_value(&message).expect("serializable");
         assert_eq!(value["role"], "tool-result");
         assert_eq!(value["toolCallId"], "call_1");
         assert_eq!(value["content"], "file body");
+        assert_eq!(value["isError"], false);
+        // and the explicit error flag round-trips through the same names
+        let error_result =
+            ModelMessage::tool_result("call_2", "denied by grant", true).expect("bounded");
+        let value = serde_json::to_value(&error_result).expect("serializable");
+        assert_eq!(value["isError"], true);
+        let round: ModelMessage = serde_json::from_value(value).expect("deserializable");
+        assert_eq!(round, error_result);
+    }
+
+    #[test]
+    fn user_messages_carry_ordered_blocks_with_stable_field_names() {
+        let message = ModelMessage::User {
+            content: vec![
+                UserContent::Text {
+                    text: "first".into(),
+                },
+                UserContent::Text {
+                    text: "second".into(),
+                },
+            ],
+        };
+        let value = serde_json::to_value(&message).expect("serializable");
+        assert_eq!(
+            value,
+            json!({
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "first" },
+                    { "type": "text", "text": "second" },
+                ],
+            })
+        );
+        let round: ModelMessage = serde_json::from_value(value).expect("deserializable");
+        assert_eq!(round, message);
+        assert_eq!(round.text(), "firstsecond");
+    }
+
+    #[test]
+    fn user_text_builds_a_single_block_and_reads_back() {
+        let message = ModelMessage::user_text("the prompt");
+        assert_eq!(
+            message,
+            ModelMessage::User {
+                content: vec![UserContent::Text {
+                    text: "the prompt".into()
+                }]
+            }
+        );
+        assert_eq!(message.text(), "the prompt");
+    }
+
+    #[test]
+    fn tool_results_are_bounded_at_creation() {
+        let ok =
+            ModelMessage::tool_result("call_1", "x".repeat(MAX_TOOL_RESULT_CONTENT_BYTES), false);
+        assert!(ok.is_ok(), "the bound itself is allowed");
+
+        let oversized = "x".repeat(MAX_TOOL_RESULT_CONTENT_BYTES + 1);
+        let error = ModelMessage::tool_result("call_1", oversized, true).expect_err("oversized");
+        assert!(error.contains("above the"), "{error}");
+        assert!(error.contains("call_1"), "{error}");
+    }
+
+    #[test]
+    fn continuation_blocks_serialize_with_neutral_names_and_hide_from_text() {
+        let message = ModelMessage::Assistant {
+            content: vec![
+                AssistantContent::Text {
+                    text: "visible".into(),
+                },
+                AssistantContent::Continuation {
+                    discriminator: "thinking".into(),
+                    data: "opaque-payload".into(),
+                },
+            ],
+        };
+        let value = serde_json::to_value(&message).expect("serializable");
+        assert_eq!(
+            value["content"][1],
+            json!({
+                "type": "continuation",
+                "discriminator": "thinking",
+                "data": "opaque-payload",
+            })
+        );
+        let round: ModelMessage = serde_json::from_value(value).expect("deserializable");
+        assert_eq!(round, message);
+        // Visible text accessors skip the opaque block entirely.
+        assert_eq!(round.text(), "visible");
+    }
+
+    #[test]
+    fn turn_result_accessors_expose_order_without_replacing_it() {
+        let result = ModelTurnResult {
+            blocks: vec![
+                AssistantContent::Text {
+                    text: "before ".into(),
+                },
+                AssistantContent::ToolCall {
+                    call: ToolCall {
+                        id: "c1".into(),
+                        name: "read-file".into(),
+                        arguments: json!({ "path": "a" }),
+                    },
+                },
+                AssistantContent::Text {
+                    text: "after".into(),
+                },
+                AssistantContent::Continuation {
+                    discriminator: "thinking".into(),
+                    data: "opaque".into(),
+                },
+            ],
+            structured_output: None,
+            finish_reason: FinishReason::ToolCalls,
+            usage: TokenUsage::default(),
+        };
+        assert_eq!(result.text(), "before after");
+        assert_eq!(
+            result
+                .tool_calls()
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>(),
+            ["c1"]
+        );
+        // The authoritative block list keeps the interleaved order.
+        let kinds: Vec<&str> = result
+            .blocks
+            .iter()
+            .map(|block| match block {
+                AssistantContent::Text { .. } => "text",
+                AssistantContent::ToolCall { .. } => "tool-call",
+                AssistantContent::Continuation { .. } => "continuation",
+            })
+            .collect();
+        assert_eq!(kinds, ["text", "tool-call", "text", "continuation"]);
     }
 
     #[test]

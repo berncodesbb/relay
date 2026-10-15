@@ -70,22 +70,18 @@ fn defaults_define_the_five_default_roles_and_route_every_mode_plus_intent() {
 
 #[test]
 fn defaults_are_an_explicit_offline_fake_profile_with_zero_credentials() {
-    // The offline default is effective configuration: three connections in
+    // The offline default is effective configuration: two connections in
     // order, every role on the fake connection, and no credential variable
     // on the fake connection itself.
     let workspace = workspace_with_project_config(None);
     let config = load_workspace(workspace.path(), None, None).unwrap();
     assert_eq!(
         config.providers.names().collect::<Vec<_>>(),
-        ["fake", "openai", "anthropic"]
+        ["fake", "anthropic"]
     );
     assert_eq!(
         config.providers.get("fake").unwrap(),
         &common::connection(AdapterKind::Fake, None)
-    );
-    assert_eq!(
-        config.providers.get("openai").unwrap(),
-        &common::connection(AdapterKind::OpenaiChat, Some("OPENAI_API_KEY"))
     );
     assert_eq!(
         config.providers.get("anthropic").unwrap(),
@@ -106,7 +102,7 @@ fn a_user_layer_replaces_one_complete_role_while_other_roles_and_intent_survive(
     let models = config.models.as_ref().unwrap();
     assert_eq!(
         models.get("reasoning"),
-        Some(&model_role("openai", "gpt-5.2"))
+        Some(&model_role("anthropic", "claude-sonnet-5-5"))
     );
     assert_eq!(
         models.get("fast"),
@@ -141,7 +137,7 @@ models:
 version: 1
 budgets: {}
 models:
-  reasoning: { provider: openai, model: gpt-5.2 }
+  reasoning: { provider: anthropic, model: claude-sonnet-5-5 }
   product: { provider: fake, model: demo-product }
 routing:
   intent: product
@@ -208,7 +204,7 @@ routing:
   technical-design: { provider: anthropic, model: claude-opus-5-5 }
   planning: { provider: anthropic, model: claude-sonnet-5-5 }
   implementation: { provider: anthropic, model: claude-sonnet-5-5 }
-  verification: { provider: openai, model: gpt-5.2 }
+  verification: { provider: anthropic, model: claude-haiku-4-5 }
   delivery: { provider: anthropic, model: claude-haiku-4-5 }
 "#,
     );
@@ -216,7 +212,7 @@ routing:
     assert_eq!(config.models, defaults().models);
     assert_eq!(
         config.routing.get("verification"),
-        Some(&inline("openai", "gpt-5.2"))
+        Some(&inline("anthropic", "claude-haiku-4-5"))
     );
     // The default intent entry still routes through the role catalog.
     assert_eq!(config.routing.get("intent"), Some(&role("fast")));
@@ -229,13 +225,12 @@ fn merges_provider_connections_by_name_with_complete_replacement() {
 version: 1
 budgets: {}
 providers:
-  glm:
-    adapter: openai-chat
-    baseUrl: https://api.z.ai/api/paas/v4
-    apiKeyEnv: GLM_API_KEY
-    preset: glm
+  claude-pro:
+    adapter: anthropic
+    baseUrl: https://api.anthropic.com
+    apiKeyEnv: CLAUDE_PRO_API_KEY
 models:
-  reasoning: { provider: glm, model: glm-4.7 }
+  reasoning: { provider: claude-pro, model: claude-sonnet-5-5 }
 routing:
   discovery: reasoning
   specification: reasoning
@@ -251,14 +246,14 @@ routing:
 version: 1
 budgets: {}
 providers:
-  glm:
-    adapter: openai-chat
-    baseUrl: https://user.example/glm
-    apiKeyEnv: USER_GLM_KEY
-  openrouter:
-    adapter: openai-chat
-    baseUrl: https://openrouter.ai/api/v1
-    apiKeyEnv: OPENROUTER_API_KEY
+  claude-pro:
+    adapter: anthropic
+    baseUrl: https://user.example/claude
+    apiKeyEnv: USER_CLAUDE_KEY
+  claude-alt:
+    adapter: anthropic
+    baseUrl: https://alt.example
+    apiKeyEnv: CLAUDE_ALT_API_KEY
 routing:
   discovery: reasoning
   specification: reasoning
@@ -270,33 +265,32 @@ routing:
 "#,
     );
     let config = load_workspace(workspace.path(), Some(&user_path), None).unwrap();
-    // The project layer replaced the complete glm connection...
-    let glm = config.providers.get("glm").unwrap();
+    // The project layer replaced the complete claude-pro connection...
+    let claude_pro = config.providers.get("claude-pro").unwrap();
     assert_eq!(
-        glm.base_url.as_deref(),
-        Some("https://api.z.ai/api/paas/v4")
+        claude_pro.base_url.as_deref(),
+        Some("https://api.anthropic.com")
     );
-    assert_eq!(glm.api_key_env.as_deref(), Some("GLM_API_KEY"));
-    assert_eq!(glm.preset.as_deref(), Some("glm"));
+    assert_eq!(
+        claude_pro.api_key_env.as_deref(),
+        Some("CLAUDE_PRO_API_KEY")
+    );
     // ...while the unrelated user-defined connection survived.
-    let openrouter = config.providers.get("openrouter").unwrap();
-    assert_eq!(openrouter.adapter, AdapterKind::OpenaiChat);
-    assert_eq!(
-        openrouter.base_url.as_deref(),
-        Some("https://openrouter.ai/api/v1")
-    );
+    let claude_alt = config.providers.get("claude-alt").unwrap();
+    assert_eq!(claude_alt.adapter, AdapterKind::Anthropic);
+    assert_eq!(claude_alt.base_url.as_deref(), Some("https://alt.example"));
     // Effective order is deterministic: defaults order first, new names in
     // the order their introducing layers were applied; redefining an
     // existing name keeps its position.
     assert_eq!(
         config.providers.names().collect::<Vec<_>>(),
-        ["fake", "openai", "anthropic", "glm", "openrouter"]
+        ["fake", "anthropic", "claude-pro", "claude-alt"]
     );
     drop(user_dir);
 }
 
 #[test]
-fn multiple_openai_chat_connections_can_coexist_and_route_distinct_roles() {
+fn multiple_anthropic_connections_can_coexist_and_route_distinct_roles() {
     let workspace = workspace_with_project_config(common::NAMED_CONNECTIONS_YAML);
     let config = load_workspace(workspace.path(), None, None).unwrap();
     let routing = normalize_routing(&config);
@@ -305,8 +299,8 @@ fn multiple_openai_chat_connections_can_coexist_and_route_distinct_roles() {
         chain_of("discovery"),
         vec![relay_config::normalized::NormalizedRoute {
             role: Some("reasoning".to_string()),
-            provider: "glm".to_string(),
-            model: "glm-4.7".to_string(),
+            provider: "claude-pro".to_string(),
+            model: "claude-sonnet-5-5".to_string(),
             limits: None,
         }]
     );
@@ -314,8 +308,8 @@ fn multiple_openai_chat_connections_can_coexist_and_route_distinct_roles() {
         chain_of("implementation"),
         vec![relay_config::normalized::NormalizedRoute {
             role: Some("coding".to_string()),
-            provider: "local".to_string(),
-            model: "qwen3-coder".to_string(),
+            provider: "claude-local".to_string(),
+            model: "claude-sonnet-5-5".to_string(),
             limits: None,
         }]
     );
@@ -329,19 +323,19 @@ version: 1
 budgets: {}
 models:
   reasoning:
-    provider: openai
-    model: gpt-5.2
+    provider: anthropic
+    model: claude-haiku-4-5
     limits: { maxOutputTokens: 4096 }
   review:
-    provider: openai
-    model: gpt-5.2
+    provider: anthropic
+    model: claude-haiku-4-5
     fallbacks: [reasoning]
 routing:
   intent: fast
   discovery: reasoning
   specification: reasoning
   technical-design: architect
-  planning: { provider: anthropic, model: claude-sonnet-5-5, fallbacks: [{ provider: openai, model: gpt-5.2 }] }
+  planning: { provider: anthropic, model: claude-sonnet-5-5, fallbacks: [{ provider: anthropic, model: claude-haiku-4-5 }] }
   implementation: coding
   verification: review
   delivery: fast
@@ -364,7 +358,7 @@ routing:
         config.models.as_ref().unwrap().get("reasoning"),
         Some(&relay_config::schema::ModelRoleConfig {
             provider: "fake".to_string(),
-            model: "gpt-5.2".to_string(),
+            model: "claude-haiku-4-5".to_string(),
             fallbacks: None,
             limits: common::limits(Some(4096), None),
         })
@@ -395,7 +389,7 @@ routing:
             model: "claude-sonnet-5-5".to_string(),
             fallbacks: Some(vec![InlineFallback {
                 provider: "fake".to_string(),
-                model: "gpt-5.2".to_string(),
+                model: "claude-haiku-4-5".to_string(),
             }]),
             limits: None,
         }))
@@ -409,9 +403,9 @@ fn force_provider_accepts_any_configured_connection_name() {
 version: 1
 budgets: {}
 providers:
-  glm:
-    adapter: openai-chat
-    apiKeyEnv: GLM_API_KEY
+  claude-proxy:
+    adapter: anthropic
+    apiKeyEnv: CLAUDE_PROXY_API_KEY
 routing:
   intent: fast
   discovery: reasoning
@@ -428,12 +422,12 @@ routing:
         None,
         Some(ConfigOverrides {
             autonomy: None,
-            force_provider: Some("glm".to_string()),
+            force_provider: Some("claude-proxy".to_string()),
         }),
     )
     .unwrap();
     for definition in config.models.as_ref().unwrap().values() {
-        assert_eq!(definition.provider, "glm");
+        assert_eq!(definition.provider, "claude-proxy");
     }
 }
 
@@ -454,7 +448,7 @@ fn rejects_a_forced_provider_that_is_not_a_configured_connection() {
     assert_eq!(
         error.issues[0],
         "provider override \"grok\" is not a configured provider connection; available \
-         connections: fake, openai, anthropic"
+         connections: fake, anthropic"
     );
 }
 
@@ -512,8 +506,8 @@ version: 1
 budgets: {}
 models:
   review:
-    provider: glm
-    model: glm-4.7
+    provider: claude-pro
+    model: claude-sonnet-5-5
 routing:
   discovery: reasoning
   specification: reasoning
@@ -537,8 +531,8 @@ routing:
     );
     assert_eq!(
         error.issues[0],
-        "models.review.provider: references unknown provider connection \"glm\"; available \
-         connections: fake, openai, anthropic. Define a providers.glm entry."
+        "models.review.provider: references unknown provider connection \"claude-pro\"; available \
+         connections: fake, anthropic. Define a providers.claude-pro entry."
     );
 }
 
@@ -576,7 +570,7 @@ routing:
   discovery: reasoning
   specification: reasoning
   technical-design: architect
-  planning: { provider: openai, model: m1, fallbacks: [{ provider: also-ghost, model: m2 }] }
+  planning: { provider: anthropic, model: m1, fallbacks: [{ provider: also-ghost, model: m2 }] }
   implementation: coding
   verification: review
   delivery: fast
@@ -600,8 +594,8 @@ fn rejects_unknown_presets_and_preset_adapter_mismatches_on_the_effective_config
 version: 1
 budgets: {}
 providers:
-  glm:
-    adapter: openai-chat
+  gateway:
+    adapter: anthropic
     preset: grok
 routing:
   discovery: reasoning
@@ -616,7 +610,8 @@ routing:
     let error = catch_validation(|| load_workspace(workspace.path(), None, None));
     assert_eq!(
         error.issues[0],
-        "providers.glm: unknown capability preset \"grok\" (available presets: glm)"
+        "providers.gateway: unknown capability preset \"grok\" (no capability presets are \
+         currently defined; set explicit capability overrides instead)"
     );
     assert_eq!(
         error.source,
@@ -633,7 +628,7 @@ routing:
 version: 1
 budgets: {}
 providers:
-  glm:
+  gateway:
     adapter: anthropic
     preset: glm
 routing:
@@ -649,18 +644,45 @@ routing:
     let error = catch_validation(|| load_workspace(workspace.path(), None, None));
     assert_eq!(
         error.issues[0],
-        "providers.glm: capability preset \"glm\" applies to the openai-chat adapter, not \
-         anthropic"
+        "providers.gateway: the glm preset was removed with the openai-chat adapter; configure \
+         an Anthropic Messages-compatible connection instead"
     );
 }
 
 #[test]
-fn accepts_a_valid_preset_and_capability_combination() {
-    let workspace = workspace_with_project_config(common::NAMED_CONNECTIONS_YAML);
+fn accepts_valid_capability_overrides_on_anthropic_connections() {
+    // The `system-instruction` and `max-tokens` spellings remain accepted
+    // and resolve on the effective configuration.
+    let workspace = workspace_with_project_config(
+        r#"
+version: 1
+budgets: {}
+providers:
+  claude-proxy:
+    adapter: anthropic
+    apiKeyEnv: CLAUDE_PROXY_API_KEY
+    capabilities:
+      instructions: system-instruction
+      outputTokenParam: max-tokens
+routing:
+  discovery: reasoning
+  specification: reasoning
+  technical-design: architect
+  planning: reasoning
+  implementation: coding
+  verification: review
+  delivery: fast
+"#,
+    );
     let config = load_workspace(workspace.path(), None, None).unwrap();
+    let capabilities = &config.providers.get("claude-proxy").unwrap().capabilities;
     assert_eq!(
-        config.providers.get("glm").unwrap().preset.as_deref(),
-        Some("glm")
+        capabilities.instructions,
+        Some(relay_providers::contract::InstructionStyle::SystemInstruction)
+    );
+    assert_eq!(
+        capabilities.output_token_param,
+        Some(relay_providers::contract::OutputTokenParam::MaxTokens)
     );
 }
 
@@ -673,8 +695,8 @@ version: 1
 budgets: {{}}
 models:
   review:
-    provider: openai
-    model: gpt-5.2
+    provider: anthropic
+    model: claude-haiku-4-5
     fallbacks: [ghost]
 {ROLE_ROUTING_YAML}"
         )
@@ -698,8 +720,8 @@ version: 1
 budgets: {{}}
 models:
   review:
-    provider: openai
-    model: gpt-5.2
+    provider: anthropic
+    model: claude-haiku-4-5
     fallbacks: [review]
 {ROLE_ROUTING_YAML}"
         )
@@ -895,8 +917,8 @@ fn attributes_provider_diagnostics_to_the_layer_that_introduced_the_connection()
 version: 1
 budgets: {}
 providers:
-  glm:
-    adapter: openai-chat
+  gateway:
+    adapter: anthropic
     preset: grok
 routing:
   discovery: reasoning
@@ -911,7 +933,7 @@ routing:
     let error = catch_validation(|| load_workspace(workspace.path(), Some(&user_path), None));
     assert_eq!(error.source, user_path.display().to_string());
     assert!(
-        error.issues[0].starts_with("providers.glm: unknown capability preset"),
+        error.issues[0].starts_with("providers.gateway: unknown capability preset"),
         "{:?}",
         error.issues
     );
@@ -950,7 +972,7 @@ fn resolves_dotted_lookups_over_the_provider_connection_map() {
     let config = load_workspace(workspace.path(), None, None).unwrap();
     // `providers` is the whole ordered map...
     let providers = inspect::lookup_dotted(&config, "providers").unwrap();
-    assert_eq!(providers.as_mapping().unwrap().len(), 3);
+    assert_eq!(providers.as_mapping().unwrap().len(), 2);
     // ...`providers.<name>` one connection (with its inferred/effective
     // adapter)...
     assert_eq!(
@@ -958,12 +980,8 @@ fn resolves_dotted_lookups_over_the_provider_connection_map() {
         Some(serde_yaml::Value::String("fake".to_string()))
     );
     assert_eq!(
-        inspect::lookup_dotted(&config, "providers.openai.adapter"),
-        Some(serde_yaml::Value::String("openai-chat".to_string()))
-    );
-    assert_eq!(
-        inspect::lookup_dotted(&config, "providers.openai.apiKeyEnv"),
-        Some(serde_yaml::Value::String("OPENAI_API_KEY".to_string()))
+        inspect::lookup_dotted(&config, "providers.anthropic.adapter"),
+        Some(serde_yaml::Value::String("anthropic".to_string()))
     );
     // ...and `providers.<name>.<field>` any single field.
     assert_eq!(
@@ -974,9 +992,12 @@ fn resolves_dotted_lookups_over_the_provider_connection_map() {
         inspect::lookup_dotted(&config, "providers.anthropic.apiKeyEnv"),
         Some(serde_yaml::Value::String("ANTHROPIC_API_KEY".to_string()))
     );
-    assert_eq!(inspect::lookup_dotted(&config, "providers.glm"), None);
     assert_eq!(
-        inspect::lookup_dotted(&config, "providers.glm.baseUrl"),
+        inspect::lookup_dotted(&config, "providers.claude-pro"),
+        None
+    );
+    assert_eq!(
+        inspect::lookup_dotted(&config, "providers.claude-pro.baseUrl"),
         None
     );
 }
@@ -1021,7 +1042,7 @@ fn the_effective_dump_renders_the_offline_default_profile_unambiguously() {
             other => format!("{other:?}"),
         })
         .collect();
-    assert_eq!(connection_names, vec!["fake", "openai", "anthropic"]);
+    assert_eq!(connection_names, vec!["fake", "anthropic"]);
     let fake = providers
         .get(serde_yaml::Value::String("fake".to_string()))
         .unwrap()
@@ -1035,22 +1056,22 @@ fn the_effective_dump_renders_the_offline_default_profile_unambiguously() {
         })
         .collect();
     assert_eq!(fake_fields, vec!["adapter"]);
-    let openai = providers
-        .get(serde_yaml::Value::String("openai".to_string()))
+    let anthropic = providers
+        .get(serde_yaml::Value::String("anthropic".to_string()))
         .unwrap()
         .as_mapping()
         .unwrap();
     assert_eq!(
-        openai
+        anthropic
             .get(serde_yaml::Value::String("adapter".to_string()))
             .unwrap(),
-        &serde_yaml::Value::String("openai-chat".to_string())
+        &serde_yaml::Value::String("anthropic".to_string())
     );
     assert_eq!(
-        openai
+        anthropic
             .get(serde_yaml::Value::String("apiKeyEnv".to_string()))
             .unwrap(),
-        &serde_yaml::Value::String("OPENAI_API_KEY".to_string())
+        &serde_yaml::Value::String("ANTHROPIC_API_KEY".to_string())
     );
 
     let catalog = mapping
@@ -1104,41 +1125,43 @@ routing:
 "#,
     );
     let config = load_workspace(workspace.path(), None, None).unwrap();
-    // The present-but-empty anthropic object keeps the field-level quirk and
-    // its inferred adapter; the default fake connection still renders.
+    // The present-but-empty anthropic object keeps its inferred adapter and
+    // the adapter's credential-variable default; the fake connection from
+    // the defaults layer still renders.
     assert_eq!(
         inspect::lookup_dotted(&config, "providers.anthropic.adapter"),
         Some(serde_yaml::Value::String("anthropic".to_string()))
     );
     assert_eq!(
         inspect::lookup_dotted(&config, "providers.anthropic.apiKeyEnv"),
-        Some(serde_yaml::Value::String("OPENAI_API_KEY".to_string()))
+        Some(serde_yaml::Value::String("ANTHROPIC_API_KEY".to_string()))
     );
     assert_eq!(
         inspect::lookup_dotted(&config, "providers.fake.adapter"),
         Some(serde_yaml::Value::String("fake".to_string()))
     );
 
-    // A configured GLM connection renders completely: adapter, credential
-    // variable name, endpoint, preset, and capability overrides.
+    // A configured named connection renders completely: adapter, credential
+    // variable name, and endpoint; unset optional fields stay absent.
     let workspace = workspace_with_project_config(common::NAMED_CONNECTIONS_YAML);
     let config = load_workspace(workspace.path(), None, None).unwrap();
-    let glm = inspect::lookup_dotted(&config, "providers.glm").unwrap();
-    let glm = glm.as_mapping().unwrap();
+    let claude_pro = inspect::lookup_dotted(&config, "providers.claude-pro").unwrap();
+    let claude_pro = claude_pro.as_mapping().unwrap();
     assert_eq!(
-        glm.get(serde_yaml::Value::String("baseUrl".to_string())),
+        claude_pro.get(serde_yaml::Value::String("baseUrl".to_string())),
         Some(&serde_yaml::Value::String(
-            "https://api.z.ai/api/paas/v4".to_string()
+            "https://api.anthropic.com".to_string()
         ))
     );
-    assert_eq!(
-        glm.get(serde_yaml::Value::String("preset".to_string())),
-        Some(&serde_yaml::Value::String("glm".to_string()))
-    );
-    let local = inspect::lookup_dotted(&config, "providers.local").unwrap();
-    let local = local.as_mapping().unwrap();
     assert!(
-        local
+        claude_pro
+            .get(serde_yaml::Value::String("preset".to_string()))
+            .is_none()
+    );
+    let claude_local = inspect::lookup_dotted(&config, "providers.claude-local").unwrap();
+    let claude_local = claude_local.as_mapping().unwrap();
+    assert!(
+        claude_local
             .get(serde_yaml::Value::String("preset".to_string()))
             .is_none()
     );

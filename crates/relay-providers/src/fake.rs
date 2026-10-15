@@ -3,9 +3,11 @@
 //! Ported from `src/providers/fake.ts` (retired TypeScript tree, removed from
 //! the repository 2026-10-14). The fake provider never touches the
 //! network. Callers script per-purpose responses (with optional ordered
-//! failures for retry tests); unmatched calls fall back to a simple echo. It
-//! records a call log so tests can assert routing, retries, and cancellation
-//! behavior deterministically.
+//! failures for retry tests); unmatched calls fall back to a simple echo —
+//! the last user message, or, for a transcript ending in tool results (a
+//! native tool loop between calls), a bounded reflection of those results.
+//! It records a call log so tests can assert routing, retries, and
+//! cancellation behavior deterministically.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -228,7 +230,7 @@ impl FakeProvider {
             return (**fallback).clone();
         }
         FakeResponse {
-            text: Some(last_user_text(request)),
+            text: Some(echo_text(request)),
             ..FakeResponse::default()
         }
     }
@@ -399,10 +401,69 @@ fn last_user_text(request: &ModelRequest) -> String {
         .iter()
         .rev()
         .find_map(|message| match message {
-            crate::contract::ModelMessage::User { content } => Some(content.clone()),
+            crate::contract::ModelMessage::User { .. } => Some(message.text()),
             _ => None,
         })
         .unwrap_or_default()
+}
+
+/// What the default echo serves for a request. A transcript that ends with
+/// tool results (a native tool loop between calls) echoes a bounded
+/// reflection of those results, so tests can assert exactly which
+/// tool-result messages reached the provider — call id, error flag, and a
+/// content head, newest last. The budget is spent newest-first, so the
+/// oldest results are dropped first and the reflection never exceeds the
+/// whole-echo bound. Any other transcript echoes the last user message as
+/// before.
+fn echo_text(request: &ModelRequest) -> String {
+    use crate::contract::ModelMessage;
+    let mut lines: Vec<String> = Vec::new();
+    let mut budget = ECHO_TOOL_RESULT_TOTAL_CHARS;
+    for message in request
+        .messages
+        .iter()
+        .rev()
+        .take_while(|message| matches!(message, ModelMessage::ToolResult { .. }))
+    {
+        if lines.len() >= ECHO_TOOL_RESULT_LIMIT {
+            break;
+        }
+        let ModelMessage::ToolResult {
+            tool_call_id,
+            content,
+            is_error,
+        } = message
+        else {
+            break;
+        };
+        let line = format!(
+            "tool-result {tool_call_id} error={is_error}: {}",
+            head_chars(content, ECHO_TOOL_RESULT_HEAD_CHARS)
+        );
+        let cost = line.chars().count() + 1; // the joining newline
+        if cost > budget {
+            break;
+        }
+        budget -= cost;
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        return last_user_text(request);
+    }
+    lines.reverse();
+    lines.join("\n")
+}
+
+/// How many trailing tool results the echo reflects (oldest dropped first).
+const ECHO_TOOL_RESULT_LIMIT: usize = 8;
+/// Per-result content head in the echo reflection.
+const ECHO_TOOL_RESULT_HEAD_CHARS: usize = 120;
+/// Whole-echo bound.
+const ECHO_TOOL_RESULT_TOTAL_CHARS: usize = 400;
+
+/// The first `limit` characters of a text.
+fn head_chars(text: &str, limit: usize) -> String {
+    text.chars().take(limit).collect()
 }
 
 /// Split text into at most `parts` similarly sized chunks.
@@ -466,8 +527,8 @@ mod tests {
 
         let intent = collect_turn(provider.stream(&request_for("intent"))).expect("ok");
         let mode = collect_turn(provider.stream(&request_for("mode:discovery"))).expect("ok");
-        assert_eq!(intent.text, "intent response");
-        assert_eq!(mode.text, "mode response");
+        assert_eq!(intent.text(), "intent response");
+        assert_eq!(mode.text(), "mode response");
         let calls = provider.calls_by_purpose();
         assert_eq!(calls.get("intent"), Some(&1));
         assert_eq!(calls.get("mode:discovery"), Some(&1));
@@ -511,9 +572,9 @@ mod tests {
         third_request.model = "fake-mini".into();
         let third = collect_turn(provider.stream(&third_request)).expect("ok");
 
-        assert_eq!(first.text, "fallback");
-        assert_eq!(second.text, "second-plus call");
-        assert_eq!(third.text, "from mini");
+        assert_eq!(first.text(), "fallback");
+        assert_eq!(second.text(), "second-plus call");
+        assert_eq!(third.text(), "from mini");
         assert_eq!(provider.calls_by_purpose().get("p"), Some(&3));
     }
 
@@ -554,7 +615,7 @@ mod tests {
         let mut results = Vec::new();
         for _ in 0..3 {
             let turn = collect_turn(provider.stream(&request_for("seq"))).expect("ok");
-            results.push(turn.text);
+            results.push(turn.text());
         }
         assert_eq!(results, ["first only", "second only", "later"]);
     }
@@ -580,14 +641,14 @@ mod tests {
         let result = collect_turn(provider.stream(&request_for("x"))).expect("ok");
         assert_eq!(
             result
-                .tool_calls
+                .tool_calls()
                 .iter()
                 .map(|call| call.name.as_str())
                 .collect::<Vec<_>>(),
             ["read-file", "read-file"]
         );
         let ids: std::collections::HashSet<_> =
-            result.tool_calls.iter().map(|c| c.id.clone()).collect();
+            result.tool_calls().iter().map(|c| c.id.clone()).collect();
         assert_eq!(ids.len(), 2);
         assert_eq!(result.finish_reason, FinishReason::ToolCalls);
         assert_eq!(result.usage.input_tokens, 100);
@@ -651,7 +712,7 @@ mod tests {
             assert_eq!(error.message, "boom");
         }
         let third = collect_turn(provider.stream(&request_for("flaky"))).expect("ok");
-        assert_eq!(third.text, "finally ok");
+        assert_eq!(third.text(), "finally ok");
         assert_eq!(provider.calls_by_purpose().get("flaky"), Some(&3));
     }
 
@@ -732,24 +793,81 @@ mod tests {
         let provider = FakeProvider::new(vec![step("other", "nope")]);
         let mut request = request_for("x");
         request.messages = vec![
-            ModelMessage::User {
-                content: "first".into(),
-            },
+            ModelMessage::user_text("first"),
             ModelMessage::Assistant {
                 content: vec![crate::contract::AssistantContent::Text {
                     text: "middle".into(),
                 }],
             },
-            ModelMessage::User {
-                content: "last question".into(),
-            },
+            ModelMessage::user_text("last question"),
         ];
         let result = collect_turn(provider.stream(&request)).expect("ok");
-        assert_eq!(result.text, "last question");
+        assert_eq!(result.text(), "last question");
 
         let echo = FakeProvider::echo();
         let echoed = collect_turn(echo.stream(&request_for("y"))).expect("ok");
-        assert_eq!(echoed.text, "hello");
+        assert_eq!(echoed.text(), "hello");
+    }
+
+    #[test]
+    fn echoes_trailing_tool_results_for_tool_loop_transcripts() {
+        // A native tool loop sends assistant tool-use turns followed by
+        // tool results; the echo reflects exactly what reached the
+        // provider — ids, error flags, content heads, newest last.
+        let provider = FakeProvider::new(Vec::new());
+        let mut request = request_for("x");
+        request.messages = vec![
+            ModelMessage::user_text("opening"),
+            ModelMessage::Assistant {
+                content: vec![crate::contract::AssistantContent::ToolCall {
+                    call: ToolCall {
+                        id: "fake_1_1".into(),
+                        name: "write-file".into(),
+                        arguments: serde_json::json!({ "path": "src/a.rs" }),
+                    },
+                }],
+            },
+            ModelMessage::tool_result("fake_1_1", "wrote src/a.rs", false).expect("bounded"),
+            ModelMessage::tool_result("fake_1_2", "denied by capability grant", true)
+                .expect("bounded"),
+        ];
+        let result = collect_turn(provider.stream(&request)).expect("ok");
+        assert_eq!(
+            result.text(),
+            "tool-result fake_1_1 error=false: wrote src/a.rs\n\
+             tool-result fake_1_2 error=true: denied by capability grant"
+        );
+    }
+
+    #[test]
+    fn the_tool_result_echo_is_bounded() {
+        let provider = FakeProvider::new(Vec::new());
+        let mut request = request_for("x");
+        let mut messages = vec![ModelMessage::user_text("opening")];
+        for index in 0..12 {
+            messages.push(
+                ModelMessage::tool_result(
+                    format!("fake_9_{index}"),
+                    format!("{} output for call {index}", "x".repeat(500)),
+                    false,
+                )
+                .expect("bounded"),
+            );
+        }
+        request.messages = messages;
+        let result = collect_turn(provider.stream(&request)).expect("ok");
+        let text = result.text();
+        assert!(
+            text.chars().count() <= ECHO_TOOL_RESULT_TOTAL_CHARS,
+            "{text}"
+        );
+        // The budget is spent newest-first: the oldest results drop out
+        // and each reflected content is headed.
+        assert!(text.contains("fake_9_11"), "{text}");
+        assert!(text.contains("fake_9_10"), "{text}");
+        assert!(!text.contains("fake_9_0"), "{text}");
+        assert!(!text.contains("fake_9_9"), "{text}");
+        assert!(!text.contains("output for call"), "{text}");
     }
 
     #[test]

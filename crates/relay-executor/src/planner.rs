@@ -6,16 +6,19 @@
 //! budget, and the cancellation signal before the tool body runs. Scripted
 //! planners produce calls up front; the model-guided planners
 //! ([`ModelGuidedWorkspacePlanner`], [`ModelGuidedVerifierPlanner`]) drive
-//! a real model/tool loop — model turns see only the grant-visible tool
-//! specs, requested calls execute through the same kernel, iterations stay
-//! bounded by the budget and a turn cap, and the final turn's structured
-//! proposals ([`OutputProposal`], [`Evidence`],
-//! [`GraphChangeProposal`]) are schema-validated. Malformed model output
-//! becomes a `Failed` receipt with actionable reasons — never silently
-//! coerced.
+//! a Relay-owned native tool loop — model turns see only the grant-visible
+//! [`ToolSpec`] definitions (built from the same registry the runtime
+//! validates against), every native tool call executes through the same
+//! kernel and is answered by a correlated [`ModelMessage::ToolResult`],
+//! iterations stay bounded by the budget and a turn cap, and the final
+//! turn's structured proposals ([`OutputProposal`], [`Evidence`],
+//! [`GraphChangeProposal`]) are schema-validated. Malformed final output
+//! becomes an actionable remediation turn and, failing that, a `Failed`
+//! receipt — never silently coerced.
 //!
 //! Prompts are plain-data builder methods on the planners (strings in,
-//! strings out); no provider type appears anywhere in this module.
+//! strings out); tool definitions travel as [`ToolSpec`] values, never as
+//! prompt prose.
 
 use std::sync::Arc;
 
@@ -24,6 +27,7 @@ use relay_domain::{
     ArtifactContent, ArtifactDigest, ArtifactId, ArtifactVersionRef, Evidence, EvidenceId,
     EvidenceKind, EvidenceOutcome, EvidenceTarget, GraphChangeProposal, OutputProposal,
 };
+use relay_providers::contract::{ModelMessage, ToolSpec};
 use relay_tools::GrantGate;
 use serde::Deserialize;
 use serde_json::Value;
@@ -32,9 +36,22 @@ use crate::budget::BudgetGuard;
 use crate::model::ModelTurnRequest;
 use crate::spec::{AttemptSpec, RunContext};
 
+/// How much of a tool's (already bounded and redacted) output is returned
+/// to the model as tool-result content. The tool layer bounds output per
+/// tool (tens of thousands of characters), which can exceed the provider
+/// contract's tool-result ceiling once multibyte characters are involved;
+/// 16_000 characters is at most 64_000 bytes, safely below the 65_536-byte
+/// [`ModelMessage::tool_result`] bound, and far above the 400-character
+/// evidence heads.
+const MAX_TOOL_RESULT_TO_MODEL_CHARS: usize = 16_000;
+
 /// One executed tool call, as recorded for the receipt.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CallRecord {
+    /// The provider-assigned id of the native tool call this record
+    /// answers, for correlating records with the transcript's tool
+    /// results. `None` for scripted (non-model-driven) calls.
+    pub call_id: Option<String>,
     /// The tool that was called.
     pub tool: String,
     /// The arguments that were passed.
@@ -80,38 +97,63 @@ impl ToolRunner {
         }
     }
 
-    /// Execute one call through every enforcement layer, recording it.
+    /// Execute one scripted call through every enforcement layer, recording
+    /// it. Native (model-requested) calls go through [`Self::run_native`],
+    /// which additionally correlates the record with the provider call id.
     pub fn run(&mut self, call: ToolCallRequest) -> CallRecord {
+        self.execute(None, call).0
+    }
+
+    /// Execute one native (model-requested) tool call through every
+    /// enforcement layer — cancellation, budget, unknown-tool rejection,
+    /// grant, argument validation, execution — recording it and returning
+    /// the bounded output to hand back to the model as the call's tool
+    /// result. Unknown tools are never executed; the returned message
+    /// names the tool and the grant-visible surface so the model can
+    /// correct itself.
+    pub fn run_native(&mut self, call_id: &str, call: ToolCallRequest) -> (CallRecord, String) {
+        self.execute(Some(call_id), call)
+    }
+
+    /// The shared enforcement chain for scripted and native calls.
+    fn execute(&mut self, call_id: Option<&str>, call: ToolCallRequest) -> (CallRecord, String) {
         if self.signal.is_cancelled() {
-            let record = CallRecord {
-                tool: call.tool,
-                args: call.args,
-                ok: false,
-                output_head: "canceled before the call ran".to_owned(),
-                affected_files: Vec::new(),
-                canceled: true,
-                denied_by_grant: false,
-            };
-            self.records.push(record.clone());
-            return record;
+            return self.stopped(call_id, call, "canceled before the call ran".to_owned());
         }
         if let Err(exhausted) = self.budget.record_attempt() {
+            return self.stopped(
+                call_id,
+                call,
+                format!("budget stopped the batch: {exhausted}"),
+            );
+        }
+        // Unknown tools are rejected before the grant: they are never
+        // executed, and the error names the visible surface so a model
+        // that hallucinated a name can correct itself.
+        if self.tools.get(&call.tool).is_err() {
+            let output = format!(
+                "unknown tool \"{}\"; the tools visible to this attempt are: {}",
+                call.tool,
+                self.visible_tool_names().join(", ")
+            );
             let record = CallRecord {
+                call_id: call_id.map(str::to_owned),
                 tool: call.tool,
                 args: call.args,
                 ok: false,
-                output_head: format!("budget stopped the batch: {exhausted}"),
+                output_head: head_of(&output, 400),
                 affected_files: Vec::new(),
-                canceled: true,
+                canceled: false,
                 denied_by_grant: false,
             };
             self.records.push(record.clone());
-            return record;
+            return (record, output);
         }
         let result = self
             .gate
             .call(&self.tools, &call.tool, &call.args, &self.tool_context);
         let record = CallRecord {
+            call_id: call_id.map(str::to_owned),
             denied_by_grant: result.output.starts_with("denied by capability grant"),
             tool: call.tool,
             args: call.args,
@@ -120,8 +162,31 @@ impl ToolRunner {
             affected_files: result.affected_files,
             canceled: false,
         };
+        let content = head_of(&result.output, MAX_TOOL_RESULT_TO_MODEL_CHARS);
         self.records.push(record.clone());
-        record
+        (record, content)
+    }
+
+    /// Record a call that never ran because the attempt was canceled or
+    /// the budget fired, and return its model-facing output.
+    fn stopped(
+        &mut self,
+        call_id: Option<&str>,
+        call: ToolCallRequest,
+        output: String,
+    ) -> (CallRecord, String) {
+        let record = CallRecord {
+            call_id: call_id.map(str::to_owned),
+            tool: call.tool,
+            args: call.args,
+            ok: false,
+            output_head: output.clone(),
+            affected_files: Vec::new(),
+            canceled: true,
+            denied_by_grant: false,
+        };
+        self.records.push(record.clone());
+        (record, output)
     }
 
     /// Execute a scripted batch.
@@ -132,24 +197,29 @@ impl ToolRunner {
         self.records.clone()
     }
 
-    /// The grant-visible tool surface as JSON for model prompts:
-    /// name, description, and parameters schema — nothing else.
-    pub fn visible_tool_specs(&self) -> String {
-        let specs: Vec<Value> = self
-            .gate
+    /// The grant-visible tool surface as native tool definitions: name,
+    /// description, and parameters schema straight from the registry the
+    /// runtime validates against — the same definitions, never a parallel
+    /// serialization for prompts.
+    pub fn visible_tools(&self) -> Vec<ToolSpec> {
+        self.gate
             .visible_tools(&self.tools)
-            .iter()
-            .map(|tool| {
-                serde_json::json!({
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": serde_json::Value::Object(
-                        relay_tools::tool_json_schema(tool)
-                    ),
-                })
+            .into_iter()
+            .map(|tool| ToolSpec {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: relay_tools::tool_json_schema(&tool),
             })
-            .collect();
-        serde_json::to_string(&specs).unwrap_or_else(|_| "[]".to_owned())
+            .collect()
+    }
+
+    /// The names of the grant-visible tools, for unknown-tool errors.
+    fn visible_tool_names(&self) -> Vec<String> {
+        self.gate
+            .visible_tools(&self.tools)
+            .into_iter()
+            .map(|tool| tool.name.clone())
+            .collect()
     }
 
     /// The records collected so far.
@@ -261,16 +331,11 @@ impl ModelGuidedWorkspacePlanner {
         workspace_system_prompt()
     }
 
-    /// The opening turn prompt: objective, inputs, and the visible tool
-    /// surface (plain data).
-    pub fn opening_prompt(&self, objective: &str, inputs: &[String], tools: &str) -> String {
-        opening_prompt(objective, inputs, tools)
-    }
-
-    /// A follow-up turn prompt carrying the observations so far (plain
-    /// data).
-    pub fn observation_prompt(&self, observations: &[String], tools: &str) -> String {
-        observation_prompt(observations, tools)
+    /// The opening turn prompt: objective and inputs (plain data). Tool
+    /// definitions travel as native tool definitions on the request, never
+    /// as prompt text.
+    pub fn opening_prompt(&self, objective: &str, inputs: &[String]) -> String {
+        opening_prompt(objective, inputs)
     }
 }
 
@@ -354,13 +419,8 @@ impl ModelGuidedVerifierPlanner {
     }
 
     /// The opening turn prompt (plain data).
-    pub fn opening_prompt(&self, objective: &str, inputs: &[String], tools: &str) -> String {
-        opening_prompt(objective, inputs, tools)
-    }
-
-    /// A follow-up turn prompt carrying observations (plain data).
-    pub fn observation_prompt(&self, observations: &[String], tools: &str) -> String {
-        observation_prompt(observations, tools)
+    pub fn opening_prompt(&self, objective: &str, inputs: &[String]) -> String {
+        opening_prompt(objective, inputs)
     }
 }
 
@@ -433,23 +493,27 @@ impl Guidance {
     }
 }
 
-/// The workspace session system prompt: the bounded-grant preamble plus the
-/// shared turn protocol.
+/// The workspace session system prompt: the bounded-grant and native-tool
+/// preamble plus the shared final-object protocol.
 fn workspace_system_prompt() -> String {
     format!(
         "You are a careful workspace agent working inside a bounded capability \
-         grant. Use only the provided tools; every call is checked against the \
-         grant before it runs. Work step by step, then stop with the final \
+         grant. Tools are provided as native tool definitions alongside this \
+         instruction: call them directly when you need them, and never \
+         describe or encode a tool call in your text. Every call is checked \
+         against the grant before it runs, and its result returns to you as a \
+         tool result. Work step by step, then stop with the final \
          object.\n\n{}",
         protocol_contract()
     )
 }
 
-/// The textual turn protocol shared by both planners.
+/// The final-object protocol shared by every model session (workspace,
+/// verifier, and model-class): how to finish. Tool calling is native and
+/// needs no textual instructions.
 pub(crate) fn protocol_contract() -> String {
-    "Reply with EXACTLY ONE JSON object per turn, nothing else:\n\
-     - to run tools: {\"tool_calls\":[{\"tool\":\"<name>\",\"args\":{...}}]}\n\
-     - to finish: {\"outputs\":[{\"artifact\":\"art_…\",\"title\":\"…\",\"content\":{…}}],\n\
+    "To finish, reply with EXACTLY ONE JSON object as your entire visible reply:\n\
+     {\"outputs\":[{\"artifact\":\"art_…\",\"title\":\"…\",\"content\":{…}}],\n\
      \x20              \"evidence\":[{\"kind\":\"inspection|test_run|command_output|static_analysis|review|human_statement\",\n\
      \x20                          \"target\":{\"work_item\":\"work_…\"}|{\"artifact_version\":{\"artifact\":\"art_…\",\"version\":1}},\n\
      \x20                          \"outcome\":\"pass|fail|info\",\"summary\":\"…\",\"payload\":{…}}],\n\
@@ -459,35 +523,34 @@ pub(crate) fn protocol_contract() -> String {
         .to_owned()
 }
 
-fn opening_prompt(objective: &str, inputs: &[String], tools: &str) -> String {
+fn opening_prompt(objective: &str, inputs: &[String]) -> String {
     let inputs = if inputs.is_empty() {
         "none".to_owned()
     } else {
         inputs.join(", ")
     };
     format!(
-        "Objective: {objective}\nInputs: {inputs}\n\nTools you may use (JSON):\n{tools}\n\n\
-         Begin. Reply with one JSON object per turn."
+        "Objective: {objective}\nInputs: {inputs}\n\n\
+         Begin. Use the provided tools as needed, then reply with the final object."
     )
 }
 
-fn observation_prompt(observations: &[String], tools: &str) -> String {
-    let observations = if observations.is_empty() {
-        "- (none yet)".to_owned()
-    } else {
-        observations
-            .iter()
-            .map(|observation| format!("- {observation}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    format!(
-        "Observations so far:\n{observations}\n\nTools you may use (JSON):\n{tools}\n\n\
-         Continue. Reply with one JSON object per turn."
-    )
-}
-
-/// The model-guided loop shared by both planners.
+/// The model-guided loop shared by both planners: a Relay-owned transcript
+/// of user, assistant, and tool-result turns replayed in full to every
+/// model call.
+///
+/// Per turn: the model receives the system prompt, the whole transcript,
+/// and the grant-visible native tool definitions. Its ordered blocks are
+/// appended verbatim as the assistant turn (opaque continuation blocks
+/// included — they are in-memory transcript state, never persisted). Every
+/// native tool call is answered strictly sequentially in arrival order
+/// through [`ToolRunner`] (cancellation, budget, unknown-tool rejection,
+/// grant, argument validation, execution) with a correlated tool result
+/// marked success or error. A turn that carries tool calls is never a
+/// final candidate: the tools run and the loop continues. A turn with no
+/// tool calls is a candidate final turn — its text must be the final JSON
+/// object, and a parse failure becomes a remediation user turn. The loop
+/// is bounded by the turn cap and the budget.
 fn guided_session(
     spec: &AttemptSpec,
     context: &RunContext,
@@ -502,9 +565,17 @@ fn guided_session(
             .push("the grant carries no model route".to_owned());
         return finalize_session(session, runner);
     };
-    let tools = runner.visible_tool_specs();
-    let mut observations: Vec<String> = Vec::new();
-    for turn in 0..config.max_turns {
+    let tools = runner.visible_tools();
+    let tool_definitions = (!tools.is_empty()).then_some(tools);
+    let mut transcript: Vec<ModelMessage> = vec![ModelMessage::user_text(opening_prompt(
+        &spec.objective,
+        &spec
+            .inputs
+            .iter()
+            .map(|input| input.to_string())
+            .collect::<Vec<_>>(),
+    ))];
+    for _turn in 0..config.max_turns {
         if context.signal.is_cancelled() {
             session.stopped_canceled = true;
             return finalize_session(session, runner);
@@ -516,22 +587,10 @@ fn guided_session(
             session.stopped_canceled = true;
             return finalize_session(session, runner);
         }
-        let prompt = if turn == 0 {
-            opening_prompt(
-                &spec.objective,
-                &spec
-                    .inputs
-                    .iter()
-                    .map(|input| input.to_string())
-                    .collect::<Vec<_>>(),
-                &tools,
-            )
-        } else {
-            observation_prompt(&observations, &tools)
-        };
         let request = ModelTurnRequest {
             system: Some(guidance.system_prompt()),
-            prompt,
+            messages: transcript.clone(),
+            tools: tool_definitions.clone(),
             max_output_tokens: spec.grant.budget.max_output_tokens,
             temperature: None,
         };
@@ -552,41 +611,68 @@ fn guided_session(
             session.stopped_canceled = true;
             return finalize_session(session, runner);
         }
-        let turn_value: Value = match serde_json::from_str(response.text.trim()) {
-            Ok(Value::Object(turn_value)) => Value::Object(turn_value),
-            Ok(_) => {
-                observations = vec![malformed_turn_note("the reply was JSON but not an object")];
-                continue;
-            }
-            Err(error) => {
-                observations = vec![malformed_turn_note(&error.to_string())];
-                continue;
-            }
-        };
-        if let Some(calls) = turn_value.get("tool_calls") {
-            match decode_tool_calls(calls) {
-                Ok(calls) if !calls.is_empty() => {
-                    observations = calls
-                        .into_iter()
-                        .map(|call| {
-                            let record = runner.run(call);
-                            observation_line(&record)
-                        })
-                        .collect();
-                }
-                _ => {
-                    observations = vec![malformed_tool_calls_note()];
-                }
+        // The assistant turn is preserved verbatim — block order, visible
+        // text, and any opaque continuation blocks.
+        transcript.push(ModelMessage::Assistant {
+            content: response.blocks.clone(),
+        });
+        let calls = response.tool_calls();
+        if !calls.is_empty() {
+            // A tool-carrying turn is never a final candidate: the calls
+            // run sequentially in arrival order and every one is answered
+            // by a correlated tool result before the next model turn.
+            for call in calls {
+                let (record, output) = runner.run_native(
+                    &call.id,
+                    ToolCallRequest {
+                        tool: call.name,
+                        args: call.arguments,
+                    },
+                );
+                transcript.push(tool_result_message(&call.id, &output, !record.ok));
             }
             continue;
         }
-        extract_final(spec, context, &turn_value, &guidance, &mut session);
-        return finalize_session(session, runner);
+        // No tool calls: the visible text is the candidate final object.
+        let turn_value: Result<Value, String> = match serde_json::from_str(response.text().trim()) {
+            Ok(Value::Object(turn_value)) => Ok(Value::Object(turn_value)),
+            Ok(_) => Err("the reply was JSON but not an object".to_owned()),
+            Err(error) => Err(error.to_string()),
+        };
+        match turn_value {
+            Ok(turn_value) => {
+                extract_final(spec, context, &turn_value, &guidance, &mut session);
+                return finalize_session(session, runner);
+            }
+            Err(reason) => {
+                transcript.push(ModelMessage::user_text(malformed_final_note(&reason)));
+            }
+        }
     }
     session
         .failures
         .push(format!("no final answer within {} turns", config.max_turns));
     finalize_session(session, runner)
+}
+
+/// The tool-result message answering one native call: bounded content and
+/// an error flag covering every way the call did not succeed (tool
+/// failure, denial, unknown tool, malformed arguments, cancellation,
+/// budget stop).
+fn tool_result_message(call_id: &str, content: &str, is_error: bool) -> ModelMessage {
+    match ModelMessage::tool_result(
+        call_id,
+        head_of(content, MAX_TOOL_RESULT_TO_MODEL_CHARS),
+        is_error,
+    ) {
+        Ok(message) => message,
+        // Unreachable by construction: the head is far below the contract's
+        // tool-result bound. Fail closed with a bounded notice rather than
+        // panicking or dropping the correlation.
+        Err(_) => ModelMessage::user_text(format!(
+            "tool result for call \"{call_id}\" exceeded the bound and was dropped"
+        )),
+    }
 }
 
 /// Attach the runner's records to the session (single exit path).
@@ -595,47 +681,15 @@ fn finalize_session(mut session: ToolSession, runner: &ToolRunner) -> ToolSessio
     session
 }
 
-pub(crate) fn malformed_turn_note(reason: &str) -> String {
+/// The remediation note for a turn whose text was not the final JSON
+/// object. It addresses only the final object: tool calls are native and
+/// never need textual remediation.
+pub(crate) fn malformed_final_note(reason: &str) -> String {
     format!(
-        "your previous reply was not a valid JSON object ({reason}); reply with \
-         either {{\"tool_calls\":[…]}} or the final {{\"outputs\":…,\"evidence\":…,\"graph_changes\":…}} object"
+        "your previous reply was not the final JSON object ({reason}); call tools if \
+         you still need them, otherwise reply with exactly the final \
+         {{\"outputs\":…,\"evidence\":…,\"graph_changes\":…}} object"
     )
-}
-
-fn malformed_tool_calls_note() -> String {
-    "tool_calls must be a non-empty array of {{\"tool\":\"<name>\",\"args\":{{…}}}} objects; \
-     unknown names and non-object args are rejected"
-        .to_owned()
-}
-
-fn observation_line(record: &CallRecord) -> String {
-    if record.canceled {
-        format!("{}: {}", record.tool, record.output_head)
-    } else if record.denied_by_grant {
-        format!("{}: DENIED BY GRANT: {}", record.tool, record.output_head)
-    } else if record.ok {
-        format!("{}: ok: {}", record.tool, record.output_head)
-    } else {
-        format!("{}: failed: {}", record.tool, record.output_head)
-    }
-}
-
-/// Decode the tool_calls array strictly: known shape only.
-fn decode_tool_calls(value: &Value) -> Result<Vec<ToolCallRequest>, String> {
-    #[derive(Deserialize)]
-    struct Draft {
-        tool: String,
-        args: Value,
-    }
-    let drafts: Vec<Draft> =
-        serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
-    Ok(drafts
-        .into_iter()
-        .map(|draft| ToolCallRequest {
-            tool: draft.tool,
-            args: draft.args,
-        })
-        .collect())
 }
 
 /// An output proposal draft; the digest commitment is computed here
@@ -807,43 +861,130 @@ mod tests {
     use relay_providers::contract::CancelToken;
     use relay_tools::create_default_tool_registry;
 
-    /// A model that replays scripted turn texts in order; calls beyond
-    /// the script get the last text again.
-    struct ScriptedModel {
-        turns: Mutex<std::collections::VecDeque<String>>,
+    /// A model that replays scripted turns of ordered blocks in order,
+    /// records every request it served (so tests can assert exactly what
+    /// the loop forwarded), and can cancel the attempt signal while
+    /// serving its first turn. Calls beyond the script repeat the last
+    /// turn.
+    struct TurnsModel {
+        turns: Mutex<std::collections::VecDeque<ModelTurnResponse>>,
+        requests: Mutex<Vec<ModelTurnRequest>>,
+        cancel_on_first_turn: bool,
     }
 
-    impl ScriptedModel {
-        fn new(turns: Vec<String>) -> Self {
-            ScriptedModel {
+    impl TurnsModel {
+        fn new(turns: Vec<ModelTurnResponse>) -> Self {
+            TurnsModel {
                 turns: Mutex::new(turns.into()),
+                requests: Mutex::new(Vec::new()),
+                cancel_on_first_turn: false,
             }
+        }
+
+        fn cancel_on_first_turn(mut turns: Vec<ModelTurnResponse>) -> Self {
+            turns.truncate(1);
+            TurnsModel {
+                turns: Mutex::new(turns.into()),
+                requests: Mutex::new(Vec::new()),
+                cancel_on_first_turn: true,
+            }
+        }
+
+        fn served_requests(&self) -> Vec<ModelTurnRequest> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone()
         }
     }
 
-    impl ModelClient for ScriptedModel {
+    impl ModelClient for TurnsModel {
         fn complete(
             &self,
             _route: &ModelRoute,
-            _request: &ModelTurnRequest,
-            _signal: &CancelToken,
+            request: &ModelTurnRequest,
+            signal: &CancelToken,
         ) -> Result<ModelTurnResponse, ModelClientError> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(request.clone());
+            if self.cancel_on_first_turn
+                && self
+                    .requests
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .len()
+                    == 1
+            {
+                signal.cancel("test canceled between turns");
+            }
             let mut turns = self
                 .turns
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
-            let text = if turns.len() > 1 {
-                turns.pop_front().unwrap_or_default()
+            let response = if turns.len() > 1 {
+                turns
+                    .pop_front()
+                    .unwrap_or_else(|| ModelTurnResponse::from_text(""))
             } else {
-                turns.front().cloned().unwrap_or_default()
+                turns
+                    .front()
+                    .cloned()
+                    .unwrap_or_else(|| ModelTurnResponse::from_text(""))
             };
-            Ok(ModelTurnResponse {
-                text,
-                input_tokens: 1,
-                output_tokens: 1,
-                routes_attempted: Vec::new(),
-            })
+            Ok(response)
         }
+    }
+
+    fn text_block(text: &str) -> relay_providers::contract::AssistantContent {
+        relay_providers::contract::AssistantContent::Text {
+            text: text.to_owned(),
+        }
+    }
+
+    fn call_block(
+        id: &str,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> relay_providers::contract::AssistantContent {
+        relay_providers::contract::AssistantContent::ToolCall {
+            call: relay_providers::contract::ToolCall {
+                id: id.to_owned(),
+                name: tool.to_owned(),
+                arguments: args,
+            },
+        }
+    }
+
+    fn turn(blocks: Vec<relay_providers::contract::AssistantContent>) -> ModelTurnResponse {
+        ModelTurnResponse {
+            blocks,
+            input_tokens: 1,
+            output_tokens: 1,
+            routes_attempted: Vec::new(),
+        }
+    }
+
+    fn final_turn(json: &str) -> ModelTurnResponse {
+        turn(vec![text_block(json)])
+    }
+
+    /// The tool-result messages of a recorded request, in transcript
+    /// order.
+    fn tool_results_of(
+        request: &ModelTurnRequest,
+    ) -> Vec<&relay_providers::contract::ModelMessage> {
+        request
+            .messages
+            .iter()
+            .filter(|message| {
+                matches!(
+                    message,
+                    relay_providers::contract::ModelMessage::ToolResult { .. }
+                )
+            })
+            .collect()
     }
 
     fn spec(grant: CapabilityGrant) -> AttemptSpec {
@@ -859,11 +1000,29 @@ mod tests {
         }
     }
 
-    fn context(model: ScriptedModel) -> (RunContext, Arc<ManualClock>) {
+    fn context(model: Arc<TurnsModel>) -> (RunContext, Arc<ManualClock>) {
+        context_with_model(model)
+    }
+
+    fn context_with_budget(
+        model: Arc<TurnsModel>,
+        budget: Budget,
+    ) -> (RunContext, Arc<ManualClock>) {
+        build_context(model, budget)
+    }
+
+    fn context_with_model(model: Arc<dyn ModelClient>) -> (RunContext, Arc<ManualClock>) {
+        build_context(model, Budget::default())
+    }
+
+    fn build_context(
+        model: Arc<dyn ModelClient>,
+        budget: Budget,
+    ) -> (RunContext, Arc<ManualClock>) {
         let clock = Arc::new(ManualClock::new(1_050));
         let signal = CancelToken::new();
         let budget = Arc::new(BudgetGuard::new(
-            Budget::default(),
+            budget,
             1_000,
             Arc::clone(&clock).into_clock(),
             signal.clone(),
@@ -871,7 +1030,7 @@ mod tests {
         let context = RunContext {
             workspace_root: std::env::temp_dir(),
             signal,
-            model: Arc::new(model),
+            model,
             tools: Arc::new(
                 create_default_tool_registry(&relay_config::ToolSettings::default()).unwrap(),
             ),
@@ -903,21 +1062,31 @@ mod tests {
     }
 
     #[test]
-    fn the_model_guided_loop_executes_gated_calls_and_extracts_proposals() {
-        let model = ScriptedModel::new(vec![
-                r#"{"tool_calls":[{"tool":"write-file","args":{"path":"src/added.rs","content":"pub fn f() {}\n"}}]}"#
-                    .to_owned(),
+    fn native_tool_calls_execute_through_the_gate_and_correlate_results() {
+        let model = Arc::new(TurnsModel::new(vec![
+            turn(vec![
+                text_block("writing the file first"),
+                call_block(
+                    "c1",
+                    "write-file",
+                    serde_json::json!({
+                        "path": "src/added.rs",
+                        "content": "pub fn f() {}\n"
+                    }),
+                ),
+            ]),
+            final_turn(
                 r#"{"outputs":[{"artifact":"art_added","title":"Added","content":{"file":"src/added.rs"}}],
                     "evidence":[{"kind":"inspection","target":{"work_item":"work_planner"},"outcome":"info","summary":"added the file"}],
-                    "graph_changes":[]}"#
-                    .to_owned(),
-            ]);
+                    "graph_changes":[]}"#,
+            ),
+        ]));
         let workspace = tempfile::Builder::new()
             .prefix("relay-planner-")
             .tempdir()
             .expect("temp dir")
             .keep();
-        let (mut context, _clock) = context(model);
+        let (mut context, _clock) = context(Arc::clone(&model));
         context.workspace_root = workspace.clone();
         let executor = WorkspaceExecutor::new(Arc::new(ModelGuidedWorkspacePlanner::new()));
         let receipt = executor.run(&spec(grant(|_| {})), &context);
@@ -926,7 +1095,7 @@ mod tests {
             "{:?}",
             receipt.outcome
         );
-        // The tool call really ran through the gate.
+        // The native call really ran through the gate.
         assert!(workspace.join("src/added.rs").exists());
         // The structured proposals were extracted and validated.
         assert_eq!(receipt.outputs.len(), 1);
@@ -939,17 +1108,123 @@ mod tests {
                 .iter()
                 .any(|evidence| evidence.id.as_str() == "ev_p1-p0")
         );
+
+        // The loop replayed a full transcript and answered the call by id.
+        let requests = model.served_requests();
+        assert_eq!(requests.len(), 2, "one model turn per loop turn");
+        let second = &requests[1];
+        assert_eq!(second.messages.len(), 3, "user + assistant + tool result");
+        // The assistant turn keeps its blocks verbatim, interleaved order
+        // included.
+        assert_eq!(
+            second.messages[1],
+            relay_providers::contract::ModelMessage::Assistant {
+                content: vec![
+                    text_block("writing the file first"),
+                    call_block(
+                        "c1",
+                        "write-file",
+                        serde_json::json!({
+                            "path": "src/added.rs",
+                            "content": "pub fn f() {}\n"
+                        }),
+                    ),
+                ],
+            }
+        );
+        // The tool result matches the call id, is a success, and carries
+        // the bounded tool output.
+        let results = tool_results_of(second);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0],
+            &relay_providers::contract::ModelMessage::tool_result(
+                "c1",
+                "created src/added.rs (14 bytes)",
+                false
+            )
+            .expect("bounded")
+        );
+        // Every model turn carried the grant-visible native tool
+        // definitions, never a tool list in prose.
+        for request in &requests {
+            let tools = request.tools.as_ref().expect("tools are sent natively");
+            assert!(
+                tools.iter().any(|tool| tool.name == "write-file"
+                    && tool.description.contains("Create a NEW text file")),
+                "specs come from the registry definitions"
+            );
+            assert!(!request.last_user_text().contains("write-file"));
+        }
+    }
+
+    #[test]
+    fn unknown_tools_get_error_results_naming_the_visible_surface_and_never_execute() {
+        let model = Arc::new(TurnsModel::new(vec![
+            turn(vec![call_block(
+                "c9",
+                "definitely-not-a-tool",
+                serde_json::json!({ "path": "src/evil.rs" }),
+            )]),
+            final_turn(
+                r#"{"evidence":[{"kind":"inspection","target":{"work_item":"work_planner"},"outcome":"info","summary":"recovered"}]}"#,
+            ),
+        ]));
+        let workspace = tempfile::Builder::new()
+            .prefix("relay-planner-unknown-")
+            .tempdir()
+            .expect("temp dir")
+            .keep();
+        let (mut context, _clock) = context(Arc::clone(&model));
+        context.workspace_root = workspace.clone();
+        let executor = WorkspaceExecutor::new(Arc::new(ModelGuidedWorkspacePlanner::new()));
+        let receipt = executor.run(&spec(grant(|_| {})), &context);
+        // The hallucinated name never executed...
+        assert!(!workspace.join("src/evil.rs").exists());
+        // ...the session continued to a final turn...
+        assert_eq!(model.served_requests().len(), 2);
+        // ...and the error result names the tool and the visible surface.
+        let requests = model.served_requests();
+        let results = tool_results_of(&requests[1]);
+        assert_eq!(results.len(), 1);
+        match results[0] {
+            relay_providers::contract::ModelMessage::ToolResult {
+                tool_call_id,
+                content,
+                is_error,
+            } => {
+                assert_eq!(tool_call_id, "c9");
+                assert!(is_error, "an unknown tool is an error result");
+                assert!(content.contains("unknown tool"), "{content}");
+                assert!(content.contains("definitely-not-a-tool"), "{content}");
+                assert!(content.contains("read-file"), "{content}");
+            }
+            other => panic!("expected a tool result, got {other:?}"),
+        }
+        // The failed record keeps the attempt from ever completing.
+        match receipt.outcome {
+            relay_domain::AttemptOutcome::Failed { reason } => {
+                assert!(reason.contains("unknown tool"), "{reason}");
+            }
+            relay_domain::AttemptOutcome::Completed => {
+                panic!("an unknown tool must not become success")
+            }
+        }
     }
 
     #[test]
     fn grant_denials_fail_the_session_with_the_denial_reason() {
-        let model = ScriptedModel::new(vec![
-                r#"{"tool_calls":[{"tool":"run-command","args":{"command":"/bin/rm","args":["-rf","."]}}]}"#
-                    .to_owned(),
-                r#"{"evidence":[{"kind":"inspection","target":{"work_item":"work_planner"},"outcome":"info","summary":"done"}]}"#
-                    .to_owned(),
-            ]);
-        let (context, _clock) = context(model);
+        let model = Arc::new(TurnsModel::new(vec![
+            turn(vec![call_block(
+                "c1",
+                "run-command",
+                serde_json::json!({ "command": "/bin/rm", "args": ["-rf", "."] }),
+            )]),
+            final_turn(
+                r#"{"evidence":[{"kind":"inspection","target":{"work_item":"work_planner"},"outcome":"info","summary":"done"}]}"#,
+            ),
+        ]));
+        let (context, _clock) = context(Arc::clone(&model));
         let executor = WorkspaceExecutor::new(Arc::new(ModelGuidedWorkspacePlanner::new()));
         let receipt = executor.run(&spec(grant(|_| {})), &context);
         match receipt.outcome {
@@ -961,13 +1236,428 @@ mod tests {
             }
             relay_domain::AttemptOutcome::Completed => panic!("denied calls must fail"),
         }
+        // The denial also reached the model as an error tool result.
+        let requests = model.served_requests();
+        let results = tool_results_of(&requests[1]);
+        match results[0] {
+            relay_providers::contract::ModelMessage::ToolResult {
+                tool_call_id,
+                content,
+                is_error,
+            } => {
+                assert_eq!(tool_call_id, "c1");
+                assert!(is_error, "a denied call is an error result");
+                assert!(content.contains("denied by capability grant"), "{content}");
+            }
+            other => panic!("expected a tool result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_arguments_get_error_results_without_execution() {
+        let model = Arc::new(TurnsModel::new(vec![
+            turn(vec![call_block(
+                "c1",
+                "write-file",
+                // `path` must be a string; a number fails the schema.
+                serde_json::json!({ "path": 123, "content": "nope" }),
+            )]),
+            final_turn(
+                r#"{"evidence":[{"kind":"inspection","target":{"work_item":"work_planner"},"outcome":"info","summary":"recovered"}]}"#,
+            ),
+        ]));
+        let workspace = tempfile::Builder::new()
+            .prefix("relay-planner-args-")
+            .tempdir()
+            .expect("temp dir")
+            .keep();
+        let (mut context, _clock) = context(Arc::clone(&model));
+        context.workspace_root = workspace.clone();
+        let executor = WorkspaceExecutor::new(Arc::new(ModelGuidedWorkspacePlanner::new()));
+        let receipt = executor.run(&spec(grant(|_| {})), &context);
+        // Schema-violating arguments never reach the tool body.
+        assert!(!workspace.join("123").exists());
+        let requests = model.served_requests();
+        let results = tool_results_of(&requests[1]);
+        match results[0] {
+            relay_providers::contract::ModelMessage::ToolResult {
+                content, is_error, ..
+            } => {
+                assert!(is_error, "malformed arguments are an error result");
+                assert!(content.contains("invalid arguments"), "{content}");
+            }
+            other => panic!("expected a tool result, got {other:?}"),
+        }
+        match receipt.outcome {
+            relay_domain::AttemptOutcome::Failed { reason } => {
+                assert!(reason.contains("invalid arguments"), "{reason}");
+            }
+            relay_domain::AttemptOutcome::Completed => panic!("bad arguments must fail"),
+        }
+    }
+
+    #[test]
+    fn multiple_calls_run_sequentially_with_correlated_results() {
+        let model = Arc::new(TurnsModel::new(vec![
+            turn(vec![
+                call_block(
+                    "c1",
+                    "write-file",
+                    serde_json::json!({ "path": "src/one.rs", "content": "one\n" }),
+                ),
+                call_block(
+                    "c2",
+                    "write-file",
+                    serde_json::json!({ "path": "src/two.rs", "content": "two\n" }),
+                ),
+            ]),
+            final_turn(
+                r#"{"evidence":[{"kind":"inspection","target":{"work_item":"work_planner"},"outcome":"info","summary":"both written"}]}"#,
+            ),
+        ]));
+        let workspace = tempfile::Builder::new()
+            .prefix("relay-planner-multi-")
+            .tempdir()
+            .expect("temp dir")
+            .keep();
+        let (mut context, _clock) = context(Arc::clone(&model));
+        context.workspace_root = workspace.clone();
+        let executor = WorkspaceExecutor::new(Arc::new(ModelGuidedWorkspacePlanner::new()));
+        let receipt = executor.run(&spec(grant(|_| {})), &context);
+        assert!(workspace.join("src/one.rs").exists());
+        assert!(workspace.join("src/two.rs").exists());
+        assert_eq!(receipt.usage.tool_calls, 2);
+        // Results preserve arrival order and each matches its own call id.
+        let requests = model.served_requests();
+        let results = tool_results_of(&requests[1]);
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0],
+            &relay_providers::contract::ModelMessage::tool_result(
+                "c1",
+                "created src/one.rs (4 bytes)",
+                false
+            )
+            .expect("bounded")
+        );
+        assert_eq!(
+            results[1],
+            &relay_providers::contract::ModelMessage::tool_result(
+                "c2",
+                "created src/two.rs (4 bytes)",
+                false
+            )
+            .expect("bounded")
+        );
+    }
+
+    #[test]
+    fn guided_sessions_run_against_a_real_provider_stream() {
+        use crate::model::ProviderModelClient;
+        use relay_providers::fake::{
+            FakeMatch, FakeProvider, FakeResponse, FakeStep, FakeToolCallPlan,
+        };
+        // Scripted by call count: the first provider turn requests a
+        // native write-file call (the fake mints the call id and streams
+        // the blocks), the second carries the final object as text.
+        let provider = FakeProvider::new(vec![
+            FakeStep {
+                r#match: FakeMatch {
+                    max_call: Some(1),
+                    ..FakeMatch::default()
+                },
+                response: FakeResponse {
+                    tool_calls: Some(vec![FakeToolCallPlan {
+                        name: "write-file".into(),
+                        args: serde_json::json!({
+                            "path": "src/from-fake.rs",
+                            "content": "from the fake provider\n"
+                        }),
+                    }]),
+                    ..FakeResponse::default()
+                },
+            },
+            FakeStep {
+                r#match: FakeMatch {
+                    min_call: Some(2),
+                    max_call: Some(2),
+                    ..FakeMatch::default()
+                },
+                response: FakeResponse {
+                    text: Some(
+                        r#"{"outputs":[{"artifact":"art_fake","content":{"file":"src/from-fake.rs"}}],"evidence":[],"graph_changes":[]}"#
+                            .into(),
+                    ),
+                    ..FakeResponse::default()
+                },
+            },
+        ]);
+        let workspace = tempfile::Builder::new()
+            .prefix("relay-planner-fake-")
+            .tempdir()
+            .expect("temp dir")
+            .keep();
+        let (mut context, _clock) =
+            context_with_model(Arc::new(ProviderModelClient::new(Arc::new(provider))));
+        context.workspace_root = workspace.clone();
+        let executor = WorkspaceExecutor::new(Arc::new(ModelGuidedWorkspacePlanner::new()));
+        let receipt = executor.run(&spec(grant(|_| {})), &context);
+        assert!(
+            matches!(receipt.outcome, relay_domain::AttemptOutcome::Completed),
+            "{:?}",
+            receipt.outcome
+        );
+        assert!(workspace.join("src/from-fake.rs").exists());
+        assert_eq!(receipt.outputs.len(), 1);
+        assert_eq!(receipt.outputs[0].artifact.as_str(), "art_fake");
+    }
+
+    #[test]
+    fn interleaved_text_and_tool_blocks_are_replayed_verbatim() {
+        let blocks = vec![
+            text_block("before the call "),
+            call_block(
+                "c1",
+                "write-file",
+                serde_json::json!({ "path": "src/kept.rs", "content": "kept\n" }),
+            ),
+            text_block("after the call"),
+            relay_providers::contract::AssistantContent::Continuation {
+                discriminator: "thinking".into(),
+                data: "opaque-payload".into(),
+            },
+        ];
+        let model = Arc::new(TurnsModel::new(vec![
+            turn(blocks.clone()),
+            final_turn(
+                r#"{"evidence":[{"kind":"inspection","target":{"work_item":"work_planner"},"outcome":"info","summary":"done"}]}"#,
+            ),
+        ]));
+        let workspace = tempfile::Builder::new()
+            .prefix("relay-planner-order-")
+            .tempdir()
+            .expect("temp dir")
+            .keep();
+        let (mut context, _clock) = context(Arc::clone(&model));
+        context.workspace_root = workspace.clone();
+        let executor = WorkspaceExecutor::new(Arc::new(ModelGuidedWorkspacePlanner::new()));
+        let receipt = executor.run(&spec(grant(|_| {})), &context);
+        assert!(
+            matches!(receipt.outcome, relay_domain::AttemptOutcome::Completed),
+            "{:?}",
+            receipt.outcome
+        );
+        // The next turn's transcript carries the assistant blocks
+        // verbatim — interleaved order and the opaque continuation
+        // included, with the tool result following the assistant turn.
+        let requests = model.served_requests();
+        let second = &requests[1];
+        assert_eq!(
+            second.messages[1],
+            relay_providers::contract::ModelMessage::Assistant { content: blocks }
+        );
+        assert_eq!(tool_results_of(second).len(), 1);
+    }
+
+    #[test]
+    fn a_turn_mixing_final_text_and_tool_calls_executes_the_tools() {
+        // The turn carries BOTH a valid final object as text and a native
+        // tool call: the calls execute, the text is not treated as final,
+        // and the final object is requested on a later turn.
+        let model = Arc::new(TurnsModel::new(vec![
+            turn(vec![
+                text_block(
+                    r#"{"outputs":[{"artifact":"art_from_text","content":{}}],"evidence":[],"graph_changes":[]}"#,
+                ),
+                call_block(
+                    "c1",
+                    "write-file",
+                    serde_json::json!({ "path": "src/ambig.rs", "content": "ambig\n" }),
+                ),
+            ]),
+            final_turn(
+                r#"{"outputs":[{"artifact":"art_final","content":{"file":"src/ambig.rs"}}],"evidence":[],"graph_changes":[]}"#,
+            ),
+        ]));
+        let workspace = tempfile::Builder::new()
+            .prefix("relay-planner-ambig-")
+            .tempdir()
+            .expect("temp dir")
+            .keep();
+        let (mut context, _clock) = context(model);
+        context.workspace_root = workspace.clone();
+        let executor = WorkspaceExecutor::new(Arc::new(ModelGuidedWorkspacePlanner::new()));
+        let receipt = executor.run(&spec(grant(|_| {})), &context);
+        // The tool really ran and the FINAL turn's proposal won.
+        assert!(workspace.join("src/ambig.rs").exists());
+        assert_eq!(receipt.outputs.len(), 1);
+        assert_eq!(receipt.outputs[0].artifact.as_str(), "art_final");
+    }
+
+    #[test]
+    fn malformed_final_text_gets_a_remediation_turn_and_the_loop_continues() {
+        let model = Arc::new(TurnsModel::new(vec![
+            final_turn("not json at all"),
+            final_turn(
+                r#"{"evidence":[{"kind":"inspection","target":{"work_item":"work_planner"},"outcome":"info","summary":"recovered"}]}"#,
+            ),
+        ]));
+        let (context, _clock) = context(Arc::clone(&model));
+        let executor = WorkspaceExecutor::new(Arc::new(ModelGuidedWorkspacePlanner::new()));
+        let receipt = executor.run(&spec(grant(|_| {})), &context);
+        assert!(
+            matches!(receipt.outcome, relay_domain::AttemptOutcome::Completed),
+            "{:?}",
+            receipt.outcome
+        );
+        // The remediation note rode the transcript as a user turn.
+        let requests = model.served_requests();
+        assert_eq!(requests.len(), 2);
+        let second = &requests[1];
+        assert_eq!(second.messages.len(), 3, "opening + bad assistant + note");
+        match &second.messages[2] {
+            relay_providers::contract::ModelMessage::User { content } => {
+                let note = content[0].text();
+                assert!(note.contains("was not the final JSON object"), "{note}");
+                assert!(!note.contains("tool_calls"), "{note}");
+            }
+            other => panic!("expected a remediation user turn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancellation_between_calls_stops_the_session() {
+        // The model cancels the attempt while serving its first (tool
+        // calling) turn: the pending call is answered with a canceled
+        // error result, no further model turn happens.
+        let model = Arc::new(TurnsModel::cancel_on_first_turn(vec![turn(vec![
+            call_block(
+                "c1",
+                "write-file",
+                serde_json::json!({ "path": "src/gone.rs", "content": "gone\n" }),
+            ),
+        ])]));
+        let workspace = tempfile::Builder::new()
+            .prefix("relay-planner-cancel-")
+            .tempdir()
+            .expect("temp dir")
+            .keep();
+        let (mut context, _clock) = context(Arc::clone(&model));
+        context.workspace_root = workspace.clone();
+        let executor = WorkspaceExecutor::new(Arc::new(ModelGuidedWorkspacePlanner::new()));
+        let receipt = executor.run(&spec(grant(|_| {})), &context);
+        assert!(!workspace.join("src/gone.rs").exists());
+        assert_eq!(
+            model.served_requests().len(),
+            1,
+            "no model turn after cancellation"
+        );
+        match receipt.outcome {
+            relay_domain::AttemptOutcome::Failed { reason } => {
+                assert!(reason.contains("canceled"), "{reason}");
+            }
+            relay_domain::AttemptOutcome::Completed => panic!("canceled work must not complete"),
+        }
+    }
+
+    #[test]
+    fn budget_exhaustion_between_calls_stops_the_session() {
+        let model = Arc::new(TurnsModel::new(vec![
+            turn(vec![call_block(
+                "c1",
+                "write-file",
+                serde_json::json!({ "path": "src/budget.rs", "content": "budget\n" }),
+            )]),
+            final_turn(
+                r#"{"evidence":[{"kind":"inspection","target":{"work_item":"work_planner"},"outcome":"info","summary":"never"}]}"#,
+            ),
+        ]));
+        let (context, _clock) = context_with_budget(
+            model,
+            Budget {
+                max_attempts: Some(1),
+                ..Budget::default()
+            },
+        );
+        let executor = WorkspaceExecutor::new(Arc::new(ModelGuidedWorkspacePlanner::new()));
+        let receipt = executor.run(&spec(grant(|_| {})), &context);
+        match receipt.outcome {
+            relay_domain::AttemptOutcome::Failed { reason } => {
+                assert!(reason.contains("canceled or budget-stopped"), "{reason}");
+            }
+            relay_domain::AttemptOutcome::Completed => {
+                panic!("budget-stopped work must not complete")
+            }
+        }
+    }
+
+    #[test]
+    fn visible_tools_are_grant_filtered_registry_definitions() {
+        let registry =
+            create_default_tool_registry(&relay_config::ToolSettings::default()).expect("registry");
+        let write_definition = registry.get("write-file").expect("write-file");
+        // Full grant: write-file is visible with the registry's own schema.
+        let (full_context, _clock) = context(Arc::new(TurnsModel::new(vec![final_turn("{}")])));
+        let runner = ToolRunner::new(&spec(grant(|_| {})), &full_context);
+        let tools = runner.visible_tools();
+        let write = tools
+            .iter()
+            .find(|tool| tool.name == "write-file")
+            .expect("write-file visible");
+        assert_eq!(write.description, write_definition.description);
+        assert_eq!(
+            write.parameters,
+            relay_tools::tool_json_schema(&write_definition),
+            "the model sees exactly the schema the runtime validates against"
+        );
+        // A read-only grant never even shows write tools.
+        let (read_context, _clock) = context(Arc::new(TurnsModel::new(vec![final_turn("{}")])));
+        let runner = ToolRunner::new(
+            &spec(grant(|value| {
+                value
+                    .operations
+                    .retain(|operation| *operation != Operation::Write);
+            })),
+            &read_context,
+        );
+        assert!(
+            runner
+                .visible_tools()
+                .iter()
+                .all(|tool| tool.name != "write-file"),
+            "write tools must be invisible without the write operation"
+        );
+    }
+
+    #[test]
+    fn tool_result_content_is_bounded_for_the_model() {
+        let message = tool_result_message("c1", &"x".repeat(100_000), false);
+        match message {
+            relay_providers::contract::ModelMessage::ToolResult {
+                content, is_error, ..
+            } => {
+                assert_eq!(content.chars().count(), MAX_TOOL_RESULT_TO_MODEL_CHARS);
+                assert!(!is_error);
+            }
+            other => panic!("expected a tool result, got {other:?}"),
+        }
+        let message = tool_result_message("c2", "failed", true);
+        match message {
+            relay_providers::contract::ModelMessage::ToolResult {
+                content, is_error, ..
+            } => {
+                assert_eq!(content, "failed");
+                assert!(is_error);
+            }
+            other => panic!("expected a tool result, got {other:?}"),
+        }
     }
 
     #[test]
     fn malformed_final_output_fails_with_actionable_reasons() {
-        let model = ScriptedModel::new(vec![
-            r#"{"outputs":[{"artifact":"NOT_AN_ID","content":{}}]}"#.to_owned(),
-        ]);
+        let model = Arc::new(TurnsModel::new(vec![final_turn(
+            r#"{"outputs":[{"artifact":"NOT_AN_ID","content":{}}]}"#,
+        )]));
         let (context, _clock) = context(model);
         let executor = WorkspaceExecutor::new(Arc::new(ModelGuidedWorkspacePlanner::new()));
         let receipt = executor.run(&spec(grant(|_| {})), &context);
@@ -982,8 +1672,8 @@ mod tests {
 
     #[test]
     fn the_loop_is_bounded_and_never_runs_away() {
-        let model = ScriptedModel::new(vec!["not json at all".to_owned()]);
-        let (context, _clock) = context(model);
+        let model = Arc::new(TurnsModel::new(vec![final_turn("not json at all")]));
+        let (context, _clock) = context(Arc::clone(&model));
         let executor = WorkspaceExecutor::new(Arc::new(ModelGuidedWorkspacePlanner::with_config(
             ModelGuidedConfig { max_turns: 3 },
         )));
@@ -997,6 +1687,8 @@ mod tests {
             }
             relay_domain::AttemptOutcome::Completed => panic!("a garbage model must not complete"),
         }
+        // Every remediation retry was a real model turn.
+        assert_eq!(model.served_requests().len(), 3);
     }
 
     #[test]
@@ -1005,10 +1697,9 @@ mod tests {
             relay_domain::ArtifactId::parse("art_criterion").unwrap(),
             relay_domain::ArtifactVersion::FIRST,
         );
-        let model = ScriptedModel::new(vec![
-                r#"{"evidence":[{"kind":"test_run","target":{"work_item":"work_someone-else"},"outcome":"pass","summary":"wrong target"}]}"#
-                    .to_owned(),
-            ]);
+        let model = Arc::new(TurnsModel::new(vec![final_turn(
+            r#"{"evidence":[{"kind":"test_run","target":{"work_item":"work_someone-else"},"outcome":"pass","summary":"wrong target"}]}"#,
+        )]));
         let (wrong_target_context, _clock) = context(model);
         let executor = VerifierExecutor::new(Arc::new(ModelGuidedVerifierPlanner::for_criterion(
             criterion.clone(),
@@ -1021,10 +1712,9 @@ mod tests {
             relay_domain::AttemptOutcome::Completed => panic!("wrong target must fail"),
         }
 
-        let model = ScriptedModel::new(vec![
-                r#"{"evidence":[{"kind":"test_run","target":{"artifact_version":{"artifact":"art_criterion","version":1}},"outcome":"pass","summary":"all green"}]}"#
-                    .to_owned(),
-            ]);
+        let model = Arc::new(TurnsModel::new(vec![final_turn(
+            r#"{"evidence":[{"kind":"test_run","target":{"artifact_version":{"artifact":"art_criterion","version":1}},"outcome":"pass","summary":"all green"}]}"#,
+        )]));
         let (verifier_context, _clock) = context(model);
         let executor = VerifierExecutor::new(Arc::new(ModelGuidedVerifierPlanner::for_criterion(
             criterion,
@@ -1042,9 +1732,9 @@ mod tests {
 
     #[test]
     fn verifier_sessions_cannot_publish_outputs() {
-        let model = ScriptedModel::new(vec![
-            r#"{"outputs":[{"artifact":"art_smuggle","content":{}}]}"#.to_owned(),
-        ]);
+        let model = Arc::new(TurnsModel::new(vec![final_turn(
+            r#"{"outputs":[{"artifact":"art_smuggle","content":{}}]}"#,
+        )]));
         let (context, _clock) = context(model);
         let executor = VerifierExecutor::new(Arc::new(ModelGuidedVerifierPlanner::new()));
         let receipt = executor.run(&spec(grant(|_| {})), &context);
@@ -1060,21 +1750,36 @@ mod tests {
     }
 
     #[test]
-    fn prompts_are_plain_data_mentioning_the_protocol_and_tools() {
+    fn prompts_carry_no_textual_tool_protocol() {
         let planner = ModelGuidedWorkspacePlanner::new();
         let system = planner.system_prompt();
-        assert!(system.contains("tool_calls"));
+        // The final-object protocol stays; the synthetic tool protocol is
+        // gone from every prompt surface.
         assert!(system.contains("graph_changes"));
-        let opening = planner.opening_prompt(
-            "do the thing",
-            &["art_brief@1".to_owned()],
-            r#"[{"name":"read-file"}]"#,
-        );
+        for prompt in [
+            system.as_str(),
+            planner
+                .opening_prompt("do the thing", &["art_brief@1".to_owned()])
+                .as_str(),
+            ModelGuidedVerifierPlanner::new().system_prompt().as_str(),
+            ModelGuidedVerifierPlanner::for_criterion(ArtifactVersionRef::new(
+                relay_domain::ArtifactId::parse("art_c").unwrap(),
+                relay_domain::ArtifactVersion::FIRST,
+            ))
+            .system_prompt()
+            .as_str(),
+            crate::executors::ModelExecutor::system_prompt().as_str(),
+            crate::executors::ModelExecutor::opening_prompt("obj", &[]).as_str(),
+            crate::executors::ModelExecutor::remediation_prompt(&["bad".to_owned()]).as_str(),
+            malformed_final_note("x").as_str(),
+        ] {
+            assert!(!prompt.contains("tool_calls"), "{prompt}");
+            assert!(!prompt.contains("\"parameters\""), "{prompt}");
+            assert!(!prompt.contains("Tools you may use"), "{prompt}");
+        }
+        let opening = planner.opening_prompt("do the thing", &["art_brief@1".to_owned()]);
         assert!(opening.contains("do the thing"));
         assert!(opening.contains("art_brief@1"));
-        assert!(opening.contains("read-file"));
-        let observation = planner.observation_prompt(&["read-file: ok".to_owned()], "[]");
-        assert!(observation.contains("read-file: ok"));
         let verifier = ModelGuidedVerifierPlanner::for_criterion(ArtifactVersionRef::new(
             relay_domain::ArtifactId::parse("art_c").unwrap(),
             relay_domain::ArtifactVersion::FIRST,

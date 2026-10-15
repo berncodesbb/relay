@@ -151,8 +151,8 @@ fn carries_per_role_limits_through_the_chain() {
             (
                 "b",
                 ModelRoleConfig {
-                    provider: "openai".to_string(),
-                    model: "gpt-5.2".to_string(),
+                    provider: "claude-proxy".to_string(),
+                    model: "claude-haiku-4-5".to_string(),
                     fallbacks: None,
                     limits: limits(Some(2048), None),
                 },
@@ -171,8 +171,8 @@ fn carries_per_role_limits_through_the_chain() {
             },
             NormalizedRoute {
                 role: Some("b".to_string()),
-                provider: "openai".to_string(),
-                model: "gpt-5.2".to_string(),
+                provider: "claude-proxy".to_string(),
+                model: "claude-haiku-4-5".to_string(),
                 limits: limits(Some(2048), None),
             },
         ]
@@ -289,11 +289,14 @@ fn resolves_a_role_reference_with_no_fallbacks_to_a_single_route_chain() {
     routing_table.push(("verification", role("review")));
     let config = config_with(
         routing_table,
-        Some(vec![("review", model_role("openai", "gpt-5.2"))]),
+        Some(vec![(
+            "review",
+            model_role("claude-proxy", "claude-haiku-4-5"),
+        )]),
     );
     assert_eq!(
         chain_of(&config, "verification"),
-        vec![route(Some("review"), "openai", "gpt-5.2")]
+        vec![route(Some("review"), "claude-proxy", "claude-haiku-4-5")]
     );
 }
 
@@ -301,8 +304,8 @@ fn resolves_a_role_reference_with_no_fallbacks_to_a_single_route_chain() {
 fn marks_inline_routes_and_their_fallbacks_with_role_null_keeping_limits() {
     let mut routing_table = inline_routes();
     let discovery = inline_route(
-        "openai",
-        "gpt-5.2",
+        "claude-proxy",
+        "claude-haiku-4-5",
         vec![("anthropic", "claude-sonnet-5-5")],
     );
     let discovery = with_limits(&discovery, None, Some(0.1));
@@ -313,8 +316,8 @@ fn marks_inline_routes_and_their_fallbacks_with_role_null_keeping_limits() {
         vec![
             NormalizedRoute {
                 role: None,
-                provider: "openai".to_string(),
-                model: "gpt-5.2".to_string(),
+                provider: "claude-proxy".to_string(),
+                model: "claude-haiku-4-5".to_string(),
                 limits: limits(None, Some(0.1)),
             },
             route(None, "anthropic", "claude-sonnet-5-5"),
@@ -367,22 +370,29 @@ fn deduplicates_identical_provider_model_pairs_keeping_first_occurrence() {
     routing_table.push((
         "discovery",
         inline_route(
-            "openai",
+            "claude-proxy",
             "m1",
-            vec![("openai", "m1"), ("anthropic", "m2"), ("anthropic", "m2")],
+            vec![
+                ("claude-proxy", "m1"),
+                ("anthropic", "m2"),
+                ("anthropic", "m2"),
+            ],
         ),
     ));
     let config = config_with(routing_table, None);
     assert_eq!(
         chain_of(&config, "discovery"),
-        vec![route(None, "openai", "m1"), route(None, "anthropic", "m2")]
+        vec![
+            route(None, "claude-proxy", "m1"),
+            route(None, "anthropic", "m2")
+        ]
     );
 }
 
 #[test]
 fn dedup_across_two_connections_sharing_one_adapter_keeps_both_routes() {
-    // `glm` and `local` are different connections on the same adapter: their
-    // routes are distinct even with the same model id.
+    // `claude-pro` and `claude-local` are different connections on the same
+    // adapter: their routes are distinct even with the same model id.
     let mut routing_table = inline_routes();
     routing_table.push(("discovery", role("a")));
     let config = config_with(
@@ -391,7 +401,7 @@ fn dedup_across_two_connections_sharing_one_adapter_keeps_both_routes() {
             (
                 "a",
                 ModelRoleConfig {
-                    provider: "glm".to_string(),
+                    provider: "claude-pro".to_string(),
                     model: "shared-model".to_string(),
                     fallbacks: Some(vec!["b".to_string()]),
                     limits: None,
@@ -400,7 +410,7 @@ fn dedup_across_two_connections_sharing_one_adapter_keeps_both_routes() {
             (
                 "b",
                 ModelRoleConfig {
-                    provider: "local".to_string(),
+                    provider: "claude-local".to_string(),
                     model: "shared-model".to_string(),
                     fallbacks: None,
                     limits: None,
@@ -411,8 +421,8 @@ fn dedup_across_two_connections_sharing_one_adapter_keeps_both_routes() {
     assert_eq!(
         chain_of(&config, "discovery"),
         vec![
-            route(Some("a"), "glm", "shared-model"),
-            route(Some("b"), "local", "shared-model"),
+            route(Some("a"), "claude-pro", "shared-model"),
+            route(Some("b"), "claude-local", "shared-model"),
         ]
     );
 }
@@ -494,8 +504,8 @@ fn invocation_provider_override_filters_the_chain_by_connection_name() {
             (
                 "review",
                 ModelRoleConfig {
-                    provider: "openai".to_string(),
-                    model: "gpt-5.2".to_string(),
+                    provider: "claude-proxy".to_string(),
+                    model: "claude-haiku-4-5".to_string(),
                     fallbacks: Some(vec!["backup".to_string()]),
                     limits: None,
                 },
@@ -531,10 +541,10 @@ fn invocation_provider_override_filters_the_chain_by_connection_name() {
             ("technical-design", inline("anthropic", "m")),
             ("planning", inline("anthropic", "m")),
             ("implementation", inline("anthropic", "m")),
-            ("verification", inline("openai", "gpt-5.2")),
+            ("verification", inline("claude-proxy", "claude-haiku-4-5")),
             ("delivery", inline("anthropic", "m")),
         ],
-        Some(vec![("a", model_role("glm", "glm-4.7"))]),
+        Some(vec![("a", model_role("claude-proxy", "claude-haiku-4-5"))]),
     );
     let routing = normalize_routing(&config);
     let chain = relay_config::apply_invocation_overrides(
@@ -543,12 +553,15 @@ fn invocation_provider_override_filters_the_chain_by_connection_name() {
         None,
         &relay_config::InvocationOverrides {
             role: None,
-            provider: Some("glm".to_string()),
+            provider: Some("claude-proxy".to_string()),
             model: None,
         },
     )
     .unwrap();
-    assert_eq!(chain, vec![route(Some("a"), "glm", "glm-4.7")]);
+    assert_eq!(
+        chain,
+        vec![route(Some("a"), "claude-proxy", "claude-haiku-4-5")]
+    );
 }
 
 #[test]

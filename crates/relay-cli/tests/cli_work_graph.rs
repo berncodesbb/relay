@@ -195,10 +195,9 @@ impl ModelClient for EchoModel {
         _signal: &CancelToken,
     ) -> Result<ModelTurnResponse, ModelClientError> {
         Ok(ModelTurnResponse {
-            text: format!("echo: {}", request.prompt),
             input_tokens: 1,
             output_tokens: 1,
-            routes_attempted: Vec::new(),
+            ..ModelTurnResponse::from_text(format!("echo: {}", request.last_user_text()))
         })
     }
 }
@@ -779,7 +778,7 @@ fn config_surface_is_preserved() {
     );
     let (code, out, err) = drive(
         root,
-        &["config", "get", "providers.openai.api_key-env"],
+        &["config", "get", "providers.anthropic.apiKeyEnv"],
         false,
         CliDeps::production(None),
     );
@@ -1040,13 +1039,11 @@ fn print_completes_offline_on_the_fake_provider_without_configuration() {
 fn the_offline_default_survives_credential_pollution_in_the_environment() {
     let dir = tempfile::tempdir().ok().unwrap();
     let root = dir.path();
-    let sentinel_openai = "sk-openai-characterization-not-a-real-key";
     let sentinel_anthropic = "sk-ant-characterization-not-a-real-key";
     let invoke = |argv: &[&str]| {
         std::process::Command::new(env!("CARGO_BIN_EXE_relay"))
             .current_dir(root)
             .args(argv)
-            .env("OPENAI_API_KEY", sentinel_openai)
             .env("ANTHROPIC_API_KEY", sentinel_anthropic)
             .output()
             .ok()
@@ -1063,7 +1060,6 @@ fn the_offline_default_survives_credential_pollution_in_the_environment() {
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert_eq!(stdout, "hello from the polluted environment\n", "{stdout}");
     for text in [&stdout, &stderr] {
-        assert!(!text.contains(sentinel_openai), "{text}");
         assert!(!text.contains(sentinel_anthropic), "{text}");
     }
     // And a bare run over the now-existing project completes offline too

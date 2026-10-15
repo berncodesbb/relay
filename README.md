@@ -65,37 +65,41 @@ relay work ready --json
 
 ## Provider setup
 
+**Anthropic Messages is Relay's strategic and only live external model protocol.** Relay owns the conversation transcript and the tool loop; the provider is a replaceable worker, and provider-hosted tools or stored conversations are never authoritative workflow state. Compatible endpoints are supported through per-connection capability profiles — capability is configured and enforced, never assumed.
+
 Relay reads credentials from the environment and never writes them to project state, artifacts, logs, or the fact store. Copy [.env.example](.env.example) to `.env` (already git-ignored) or export the variables:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...   # https://console.anthropic.com/settings/keys
-export OPENAI_API_KEY=sk-...          # https://platform.openai.com/api-keys
-# Connections you define name their own variables, e.g. for the glm example below:
-# export GLM_API_KEY=...
+# Additional Anthropic Messages-compatible connections name their own variables, e.g.:
+# export GATEWAY_API_KEY=...
 ```
 
-Routing is deterministic configuration, never model output: each model call resolves **purpose → model role → provider connection → adapter → model**. Purposes are the workflow phases (discovery … delivery) plus `intent` for conversational turns; roles are user-defined; connections are yours to name in `relay.config.yaml` and are backed by adapter kinds — `openai-chat` (any OpenAI-compatible Chat Completions endpoint), `anthropic`, or `fake` — so several connections can share one adapter:
+Routing is deterministic configuration, never model output: each model call resolves **purpose → model role → provider connection → adapter → model**. Purposes are the workflow phases (discovery … delivery) plus `intent` for conversational turns; roles are user-defined; connections are yours to name in `relay.config.yaml` and are backed by adapter kinds — `anthropic` (the native Messages API, including compatible gateways via `baseUrl`) or `fake` (deterministic, offline) — so several connections can share one adapter:
 
 ```yaml
 providers:
-  openai: { adapter: openai-chat, apiKeyEnv: OPENAI_API_KEY }
-  glm:
-    adapter: openai-chat
-    baseUrl: https://api.z.ai/api/paas/v4
-    apiKeyEnv: GLM_API_KEY
-    preset: glm
+  anthropic: { adapter: anthropic, apiKeyEnv: ANTHROPIC_API_KEY }
+  gateway:
+    adapter: anthropic              # any Anthropic Messages-compatible endpoint
+    baseUrl: https://gateway.example/anthropic
+    apiKeyEnv: GATEWAY_API_KEY
 models:
-  coding: { provider: glm, model: glm-4.6 }
+  coding: { provider: gateway, model: claude-sonnet-5-5 }
 ```
 
-See [docs/configuration.md](docs/configuration.md) for the full annotated configuration, capability presets, fallback and override semantics, and examples.
+Workspace and verifier sessions use native tool definitions: the model requests tools with real `tool_use` calls, Relay validates each call against the attempt's capability grant, executes it through the tool registry, and returns correlated `tool_result` blocks. Tool calls never travel as text.
+
+> **OpenAI Chat was intentionally removed.** Relay shipped `openai-chat` (Chat Completions compatibility) until 2026-10-15. Configuration naming `adapter: openai-chat` or the removed implicit `providers.openai` connection now fails early — before any network call or project-state change — with a migration error telling you to configure an Anthropic Messages-compatible connection instead. No endpoint or model is guessed or translated. See [docs/configuration.md](docs/configuration.md) for the exact diagnostics.
+
+See [docs/configuration.md](docs/configuration.md) for the full annotated configuration, capability profiles, fallback and override semantics, and examples.
 
 The built-in defaults route everything to the offline fake provider, so a fresh checkout runs end to end with no keys, no configuration, and no network:
 
 ```bash
 relay init --goal "demo"
 relay run                       # built-in default: the offline fake connection
-relay run --provider glm        # force every route onto a connection you configured
+relay run --provider anthropic  # force every route onto a connection you configured
 ```
 
 `--provider` keeps models as routed, so point it at a connection your roles use for live work. Configuration mistakes fail loudly and early: invalid files, unknown connection names, and missing credentials are usage errors (exit 2) raised before any project state is created, and the messages name the environment *variable* to set — never a value.
@@ -194,7 +198,7 @@ Options:
   --json                Machine-readable output where supported
   --autonomy <level>    manual | safe | until-decision | bounded:<n>  (default: safe)
   --provider <name>     A configured provider connection name (defaults provide
-                        fake, openai, anthropic; default: fake, offline)
+                        fake, anthropic; default: fake, offline)
   --max-ticks <n>       Scheduling waves per `run` (default: 1)
   -h, --help            Show this help
   -V, --version         Show the version
@@ -247,7 +251,7 @@ Deliberately out of scope for this release:
 - No hosted sync, accounts, collaboration, telemetry, or web interface.
 - No deployment execution, automatic publishing, automatic PR creation, or unattended release actions.
 - Static model routing only — no dynamic benchmarking or cost-optimized routing.
-- `openai-chat` targets Chat Completions compatibility only — no OpenAI Responses API support, and no per-vendor native adapters beyond Anthropic.
+- Anthropic Messages is the only live external model protocol. OpenAI Chat support was intentionally removed (2026-10-15); OpenAI Responses was never added, and provider-hosted tools or provider-side conversation state are not used as Relay authority.
 
 ## License
 

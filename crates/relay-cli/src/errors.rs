@@ -157,9 +157,7 @@ pub fn describe_cli_error(error: &CliError) -> CliErrorReport {
         CliError::UnknownModelRole { .. } => CliErrorReport {
             message,
             code: 2,
-            hint: Some(
-                "Run `relay config show` to list configured model roles.".to_string(),
-            ),
+            hint: Some("Run `relay config show` to list configured model roles.".to_string()),
         },
         CliError::ProjectNotFound { .. } => CliErrorReport {
             message,
@@ -181,7 +179,7 @@ pub fn describe_cli_error(error: &CliError) -> CliErrorReport {
             code: 1,
             hint: Some(
                 if *kind == ProviderFailureKind::Auth {
-                    "Check the provider API key environment variable (OPENAI_API_KEY / ANTHROPIC_API_KEY)."
+                    "Check the provider API key environment variable (ANTHROPIC_API_KEY)."
                 } else {
                     "Workflow state is resumable; fix the issue and rerun `relay run`."
                 }
@@ -191,9 +189,7 @@ pub fn describe_cli_error(error: &CliError) -> CliErrorReport {
         CliError::RouteUnavailable { .. } => CliErrorReport {
             message,
             code: 1,
-            hint: Some(
-                "Set OPENAI_API_KEY / ANTHROPIC_API_KEY or pass --provider fake.".to_string(),
-            ),
+            hint: Some("Set ANTHROPIC_API_KEY or pass --provider fake.".to_string()),
         },
         CliError::PolicyRejection { .. } => CliErrorReport {
             message,
@@ -294,9 +290,7 @@ mod tests {
         });
         assert_eq!(
             report.hint.as_deref(),
-            Some(
-                "Check the provider API key environment variable (OPENAI_API_KEY / ANTHROPIC_API_KEY)."
-            )
+            Some("Check the provider API key environment variable (ANTHROPIC_API_KEY).")
         );
     }
 

@@ -9,8 +9,14 @@
 //! Provider connections are named (`providers.<name>`) and bind a
 //! user-chosen connection identity to one shipped adapter kind
 //! ([`AdapterKind`]); several connections may share one adapter. The legacy
-//! keys `openai`, `anthropic`, and `fake` keep their version-1 spellings and
-//! infer their adapter when it is omitted.
+//! keys `anthropic` and `fake` keep their version-1 spellings and infer their
+//! adapter when it is omitted.
+//!
+//! The `openai-chat` adapter and the implicit `providers.openai` connection
+//! were removed (schema version 2): configuration naming either spelling is
+//! recognized *only* to fail here, before any network call or project state,
+//! with migration guidance toward an Anthropic Messages-compatible
+//! connection. Recognition for that diagnostic is not protocol support.
 //!
 //! Routing entries may reference a named model role from the `models` catalog
 //! (a role-name string such as `reasoning`) or use the legacy inline form (a
@@ -25,17 +31,31 @@ use indexmap::IndexMap;
 use serde::Serialize;
 use std::fmt;
 
-use relay_providers::contract::{
-    ADAPTER_KINDS, FeatureSupport, InstructionStyle, OutputTokenParam, StructuredOutputMode,
-};
 pub use relay_providers::contract::{AdapterKind, CapabilityOverrides};
+use relay_providers::contract::{
+    FeatureSupport, InstructionStyle, OutputTokenParam, StructuredOutputMode,
+};
 
-/// The configuration schema version (still 1 for the backward-compatible
-/// named-connection additions).
-pub const CONFIG_SCHEMA_VERSION: i64 = 1;
+/// The configuration schema version.
+///
+/// Version 2 removes the `openai-chat` adapter, the implicit
+/// `providers.openai` connection, the `glm` capability preset, and the
+/// capability spellings that existed only for OpenAI-compatible endpoints.
+/// Literal version `1` files still parse (see
+/// [`ACCEPTED_SCHEMA_VERSIONS`]); one that contains a removed spelling fails
+/// with the spelling's migration diagnostic, not a version error.
+pub const CONFIG_SCHEMA_VERSION: i64 = 2;
+
+/// The schema versions a configuration layer may declare, in order.
+pub const ACCEPTED_SCHEMA_VERSIONS: [i64; 2] = [1, 2];
 
 /// The canonical role-name rule: lowercase kebab-case, 1-64 characters.
 pub const ROLE_NAME_PATTERN: &str = "^[a-z][a-z0-9-]{0,63}$";
+
+/// The adapter spellings configuration accepts, in stable order. The
+/// `openai-chat` adapter and its [`AdapterKind`] variant are fully removed;
+/// configuration deliberately advertises and accepts only these two.
+const ACCEPTED_ADAPTER_SPELLINGS: [&str; 2] = ["anthropic", "fake"];
 
 /// Diagnostic shown for role names that violate [`ROLE_NAME_PATTERN`].
 pub const ROLE_NAME_MESSAGE: &str =
@@ -43,18 +63,32 @@ pub const ROLE_NAME_MESSAGE: &str =
 
 /// Diagnostic shown for `providers` keys that violate the shared lowercase
 /// kebab-case rule (the same bound as [`ROLE_NAME_PATTERN`]).
-pub const CONNECTION_NAME_MESSAGE: &str = "provider connection names are lowercase kebab-case, 1-64 characters, e.g. openai, glm, local-gateway";
+pub const CONNECTION_NAME_MESSAGE: &str = "provider connection names are lowercase kebab-case, 1-64 characters, e.g. anthropic, claude-proxy, local-gateway";
 
 /// Diagnostic shown for `provider` fields that are not a syntactically valid
 /// connection name. Whether a syntactically valid name references a defined
 /// connection is checked once layers merge (see
 /// [`crate::validate_effective_config`]), not per layer.
-pub const PROVIDER_REFERENCE_MESSAGE: &str =
-    "provider must be a provider connection name (lowercase kebab-case, e.g. openai, glm)";
+pub const PROVIDER_REFERENCE_MESSAGE: &str = "provider must be a provider connection name (lowercase kebab-case, e.g. anthropic, claude-proxy)";
 
 /// Diagnostic shown when `apiKeyEnv` is not an environment-variable name.
 /// The field holds the *name* of a variable, never a credential value.
-pub const API_KEY_ENV_MESSAGE: &str = "apiKeyEnv must name an environment variable (letters, digits, underscores; e.g. GLM_API_KEY), never hold a credential value";
+pub const API_KEY_ENV_MESSAGE: &str = "apiKeyEnv must name an environment variable (letters, digits, underscores; e.g. ANTHROPIC_API_KEY), never hold a credential value";
+
+/// Diagnostic shown when an `adapter` field names the removed
+/// `openai-chat` spelling. Recognition exists only for this migration
+/// error; no runtime OpenAI adapter is constructed.
+const OPENAI_CHAT_ADAPTER_MESSAGE: &str = "openai-chat was removed; configure an Anthropic \
+     Messages-compatible endpoint with adapter: anthropic and select a model supported by that \
+     endpoint";
+
+/// Diagnostic shown for a legacy `providers.openai` entry that omits
+/// `adapter` (which version 1 implicitly bound to the removed OpenAI Chat
+/// adapter). The name itself stays user-choosable; only the implicit
+/// protocol inference is gone.
+const IMPLICIT_OPENAI_CONNECTION_MESSAGE: &str = "the implicit openai connection was removed \
+     with the openai-chat adapter; configure an Anthropic Messages-compatible connection \
+     (adapter: anthropic) and update routes that name openai";
 
 /// Diagnostic shown for routing values that are neither a role name nor a
 /// legacy inline route object.
@@ -105,9 +139,9 @@ pub fn is_valid_role_name(name: &str) -> bool {
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// Serializes an adapter kind in its wire spelling (`openai-chat`,
-/// `anthropic`, `fake`) — the form accepted in YAML — rather than serde's
-/// default variant names, so inspection output matches configuration input.
+/// Serializes an adapter kind in its wire spelling (`anthropic`, `fake`) —
+/// the form accepted in YAML — rather than serde's default variant names, so
+/// inspection output matches configuration input.
 fn serialize_adapter_kind<S>(kind: &AdapterKind, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
@@ -319,7 +353,8 @@ impl Default for ToolSettings {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RelayConfig {
-    /// Schema version (always 1 today).
+    /// Schema version as written in the layer (1 or 2; absent layers carry
+    /// [`CONFIG_SCHEMA_VERSION`]). See [`ACCEPTED_SCHEMA_VERSIONS`].
     pub version: i64,
     /// Named provider connections, in configuration order.
     pub providers: Providers,
@@ -408,37 +443,36 @@ fn invalid_input(expected: &str, received: &str) -> String {
     format!("Invalid input: expected {expected}, received {received}")
 }
 
-/// The legacy live connection keys that keep the version-1 defaulting
-/// quirks: they may omit `adapter`, and a present-but-incomplete object
-/// defaults `apiKeyEnv` to the field-level OPENAI_API_KEY.
-const LEGACY_LIVE_CONNECTION_NAMES: [&str; 2] = ["openai", "anthropic"];
+/// The legacy connection keys that keep the version-1 defaulting quirks:
+/// they may omit `adapter` (inferred from the name). The removed `openai`
+/// key is deliberately absent — a `providers.openai` entry without an
+/// `adapter` fails with [`IMPLICIT_OPENAI_CONNECTION_MESSAGE`] instead of
+/// inferring a protocol.
+const LEGACY_CONNECTION_NAMES: [&str; 1] = ["anthropic"];
 
 /// The adapter inferred for a legacy connection name when `adapter` is
 /// omitted; `None` for every other name.
 fn inferred_adapter(name: &str) -> Option<AdapterKind> {
     match name {
-        "openai" => Some(AdapterKind::OpenaiChat),
         "anthropic" => Some(AdapterKind::Anthropic),
         "fake" => Some(AdapterKind::Fake),
         _ => None,
     }
 }
 
-/// The env-var name used when a legacy key is absent from a present
+/// The env-var name used when the `anthropic` key is absent from a present
 /// `providers` section (the object-level default of the version-1 schema).
 fn absent_default_env(name: &str) -> Option<&'static str> {
     match name {
         "anthropic" => Some("ANTHROPIC_API_KEY"),
-        _ => Some("OPENAI_API_KEY"),
+        _ => None,
     }
 }
 
 /// The env-var name a connection's adapter defaults to when `apiKeyEnv` is
-/// omitted on a non-legacy connection (`None`: the fake adapter needs no
-/// credential).
+/// omitted (`None`: the fake adapter needs no credential).
 fn adapter_default_env(adapter: AdapterKind) -> Option<&'static str> {
     match adapter {
-        AdapterKind::OpenaiChat => Some("OPENAI_API_KEY"),
         AdapterKind::Anthropic => Some("ANTHROPIC_API_KEY"),
         AdapterKind::Fake => None,
     }
@@ -475,11 +509,11 @@ fn string_too_small() -> String {
 }
 
 /// The quoted adapter spellings joined the way the enum diagnostics print
-/// them.
+/// them (the configuration-accepted set, not the full shipped enum).
 fn adapter_spellings() -> String {
-    ADAPTER_KINDS
+    ACCEPTED_ADAPTER_SPELLINGS
         .iter()
-        .map(|kind| format!("\"{}\"", kind.as_str()))
+        .map(|spelling| format!("\"{spelling}\""))
         .collect::<Vec<_>>()
         .join("|")
 }
@@ -675,17 +709,17 @@ fn is_valid_url(value: &str) -> bool {
 }
 
 /// The provider section as filled in when the whole section is absent: the
-/// two legacy live connections with their version-1 defaults.
+/// `anthropic` connection with its version-1 defaults.
 fn default_providers() -> Providers {
-    legacy_live_providers()
+    legacy_default_providers()
 }
 
-/// Both legacy live connections with their object-level defaults (used when
-/// the section is absent and when a present section omits a legacy key).
-fn legacy_live_providers() -> Providers {
+/// The legacy default connection with its object-level defaults (used when
+/// the section is absent and when a present section omits the key).
+fn legacy_default_providers() -> Providers {
     let mut connections = IndexMap::new();
-    for name in LEGACY_LIVE_CONNECTION_NAMES {
-        let adapter = inferred_adapter(name).unwrap_or(AdapterKind::OpenaiChat);
+    for name in LEGACY_CONNECTION_NAMES {
+        let adapter = inferred_adapter(name).unwrap_or(AdapterKind::Fake);
         connections.insert(
             name.to_string(),
             ProviderConnection {
@@ -703,7 +737,7 @@ fn legacy_live_providers() -> Providers {
 /// Parses the `providers` section as an order-preserving record of named
 /// connections. Malformed connection names, unknown adapter spellings, and
 /// non-name `apiKeyEnv` values fail here with `providers.<name>...` paths.
-/// The legacy live keys are re-added with their object-level defaults when
+/// The legacy `anthropic` key is re-added with its object-level default when
 /// absent, preserving the version-1 shape of an always-complete section.
 fn parse_providers_section(raw: &RawValue, issues: &mut Vec<Issue>) -> Providers {
     let Some(mapping) = raw.as_mapping() else {
@@ -730,13 +764,13 @@ fn parse_providers_section(raw: &RawValue, issues: &mut Vec<Issue>) -> Providers
             ));
         }
     }
-    // Version-1 quirk: an absent legacy live key keeps its object-level
-    // default so the parsed section stays complete.
-    for name in LEGACY_LIVE_CONNECTION_NAMES {
+    // Version-1 quirk: an absent legacy key keeps its object-level default so
+    // the parsed section stays complete.
+    for name in LEGACY_CONNECTION_NAMES {
         if connections.contains_key(name) {
             continue;
         }
-        let adapter = inferred_adapter(name).unwrap_or(AdapterKind::OpenaiChat);
+        let adapter = inferred_adapter(name).unwrap_or(AdapterKind::Fake);
         connections.insert(
             name.to_string(),
             ProviderConnection {
@@ -752,7 +786,9 @@ fn parse_providers_section(raw: &RawValue, issues: &mut Vec<Issue>) -> Providers
 }
 
 /// Parses the `adapter` field: required for new connection names, inferred
-/// for the legacy `openai`, `anthropic`, and `fake` keys when omitted.
+/// for the legacy `anthropic` and `fake` keys when omitted. The removed
+/// `openai-chat` spelling is recognized only to fail with migration
+/// guidance.
 fn parse_adapter_field(
     name: &str,
     mapping: &RawMapping,
@@ -760,17 +796,27 @@ fn parse_adapter_field(
     issues: &mut Vec<Issue>,
 ) -> AdapterKind {
     match mapping.get("adapter") {
-        Some(RawValue::String(text)) => match AdapterKind::parse(text) {
-            Some(kind) => kind,
-            None => {
+        Some(RawValue::String(text)) => {
+            if text == "openai-chat" {
                 issues.push(Issue::new(
                     format!("{path}.adapter"),
-                    adapter_option(),
+                    OPENAI_CHAT_ADAPTER_MESSAGE,
                     true,
                 ));
-                AdapterKind::Fake
+                return AdapterKind::Fake;
             }
-        },
+            match AdapterKind::parse(text) {
+                Some(kind) => kind,
+                None => {
+                    issues.push(Issue::new(
+                        format!("{path}.adapter"),
+                        adapter_option(),
+                        true,
+                    ));
+                    AdapterKind::Fake
+                }
+            }
+        }
         Some(other) => {
             issues.push(Issue::new(
                 format!("{path}.adapter"),
@@ -779,27 +825,41 @@ fn parse_adapter_field(
             ));
             AdapterKind::Fake
         }
-        None => match inferred_adapter(name) {
-            Some(kind) => kind,
-            None => {
+        None => {
+            if name == "openai" {
+                // A legacy implicit-openai entry: version 1 silently bound it
+                // to the removed OpenAI Chat adapter. Fail with migration
+                // guidance instead of guessing a protocol (an explicit
+                // `adapter` on a user-chosen `openai` name remains valid).
                 issues.push(Issue::new(
-                    format!("{path}.adapter"),
-                    format!(
-                        "provider connections require an adapter ({spellings}); \
-                         only the legacy keys openai, anthropic, and fake may omit it",
-                        spellings = adapter_spellings()
-                    ),
+                    format!("providers.{name}"),
+                    IMPLICIT_OPENAI_CONNECTION_MESSAGE,
                     true,
                 ));
-                AdapterKind::Fake
+                return AdapterKind::Fake;
             }
-        },
+            match inferred_adapter(name) {
+                Some(kind) => kind,
+                None => {
+                    issues.push(Issue::new(
+                        format!("{path}.adapter"),
+                        format!(
+                            "provider connections require an adapter ({spellings}); \
+                             only the legacy keys anthropic and fake may omit it",
+                            spellings = adapter_spellings()
+                        ),
+                        true,
+                    ));
+                    AdapterKind::Fake
+                }
+            }
+        }
     }
 }
 
 /// Parses one named connection object. `name` selects the version-1 legacy
-/// quirks (adapter inference and the field-level OPENAI_API_KEY default);
-/// `path` is the `providers.<name>` dotted prefix for diagnostics.
+/// quirks (adapter inference); `path` is the `providers.<name>` dotted
+/// prefix for diagnostics.
 fn parse_provider_connection(
     name: &str,
     value: &RawValue,
@@ -826,14 +886,9 @@ fn parse_provider_connection(
 
     let adapter = parse_adapter_field(name, mapping, path, issues);
 
-    // Version-1 quirk: within a present object, an omitted (or rejected)
-    // apiKeyEnv defaults to OPENAI_API_KEY for BOTH legacy live keys; new
-    // names default per adapter.
-    let default_env = if LEGACY_LIVE_CONNECTION_NAMES.contains(&name) {
-        Some("OPENAI_API_KEY")
-    } else {
-        adapter_default_env(adapter)
-    };
+    // An omitted (or rejected) apiKeyEnv defaults per adapter; the fake
+    // adapter needs no credential.
+    let default_env = adapter_default_env(adapter);
     let api_key_env = match mapping.get("apiKeyEnv") {
         None => default_env.map(str::to_string),
         Some(RawValue::String(text)) if !text.is_empty() => {
@@ -975,19 +1030,34 @@ fn parse_capabilities(
         ));
         return overrides;
     };
-    capability_field(
-        mapping,
-        "instructions",
-        path,
-        &["developer", "system-instruction"],
-        |text| match text {
-            "developer" => Some(InstructionStyle::Developer),
-            "system-instruction" => Some(InstructionStyle::SystemInstruction),
-            _ => None,
+    // `instructions`: `system-instruction` is accepted; the `developer`
+    // style existed only for OpenAI-compatible endpoints and was removed
+    // with the `openai-chat` adapter, so it is recognized only to explain
+    // the removal.
+    match mapping.get("instructions") {
+        None => {}
+        Some(RawValue::String(text)) => match text.as_str() {
+            "system-instruction" => {
+                overrides.instructions = Some(InstructionStyle::SystemInstruction);
+            }
+            "developer" => issues.push(Issue::new(
+                format!("{path}.instructions"),
+                "developer was removed with the openai-chat adapter; anthropic connections use \
+                 system-instruction",
+                true,
+            )),
+            _ => issues.push(Issue::new(
+                format!("{path}.instructions"),
+                invalid_option(&["system-instruction"]),
+                true,
+            )),
         },
-        &mut overrides.instructions,
-        issues,
-    );
+        Some(other) => issues.push(Issue::new(
+            format!("{path}.instructions"),
+            invalid_input("string", other.type_name()),
+            true,
+        )),
+    }
     capability_field(
         mapping,
         "toolCalls",
@@ -1038,20 +1108,36 @@ fn parse_capabilities(
         &mut overrides.streamed_usage,
         issues,
     );
-    capability_field(
-        mapping,
-        "outputTokenParam",
-        path,
-        &["max-tokens", "max-completion-tokens", "model-default"],
-        |text| match text {
-            "max-tokens" => Some(OutputTokenParam::MaxTokens),
-            "max-completion-tokens" => Some(OutputTokenParam::MaxCompletionTokens),
-            "model-default" => Some(OutputTokenParam::ModelDefault),
-            _ => None,
+    // `outputTokenParam`: `max-tokens` is accepted; the other spellings
+    // existed only for OpenAI-compatible endpoints and were removed with the
+    // `openai-chat` adapter, so they are recognized only to explain the
+    // removal.
+    match mapping.get("outputTokenParam") {
+        None => {}
+        Some(RawValue::String(text)) => match text.as_str() {
+            "max-tokens" => {
+                overrides.output_token_param = Some(OutputTokenParam::MaxTokens);
+            }
+            "max-completion-tokens" | "model-default" => issues.push(Issue::new(
+                format!("{path}.outputTokenParam"),
+                format!(
+                    "{text} was removed with the openai-chat adapter; anthropic connections use \
+                     max-tokens"
+                ),
+                true,
+            )),
+            _ => issues.push(Issue::new(
+                format!("{path}.outputTokenParam"),
+                invalid_option(&["max-tokens"]),
+                true,
+            )),
         },
-        &mut overrides.output_token_param,
-        issues,
-    );
+        Some(other) => issues.push(Issue::new(
+            format!("{path}.outputTokenParam"),
+            invalid_input("string", other.type_name()),
+            true,
+        )),
+    }
     capability_field(
         mapping,
         "imageInput",
@@ -1392,10 +1478,23 @@ pub fn parse_relay_config(
 
     let version = match root.get("version") {
         None => CONFIG_SCHEMA_VERSION,
-        Some(RawValue::Int(1)) => 1,
-        Some(RawValue::Float(number)) if *number == 1.0 => 1,
+        Some(RawValue::Int(number)) if ACCEPTED_SCHEMA_VERSIONS.contains(number) => *number,
+        Some(RawValue::Float(number))
+            if number.fract() == 0.0 && ACCEPTED_SCHEMA_VERSIONS.contains(&(*number as i64)) =>
+        {
+            *number as i64
+        }
         Some(_) => {
-            issues.push(Issue::new("version", "Invalid input: expected 1", true));
+            let accepted = ACCEPTED_SCHEMA_VERSIONS
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(" or ");
+            issues.push(Issue::new(
+                "version",
+                format!("Invalid input: expected {accepted}"),
+                true,
+            ));
             CONFIG_SCHEMA_VERSION
         }
     };

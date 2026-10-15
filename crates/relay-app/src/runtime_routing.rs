@@ -56,7 +56,7 @@ impl RuntimeRouting {
     /// route plan.
     ///
     /// `provider_override` (the `--provider` flag) must name a configured
-    /// connection — the legacy `fake`/`openai`/`anthropic` spellings are
+    /// connection — the legacy `fake` and `anthropic` spellings are
     /// the default connection names — and forces every route onto that
     /// connection, exactly the historical flag behavior. Unknown names fail
     /// with the configured names listed. Every failure here is
@@ -288,8 +288,8 @@ mod tests {
     }
 
     /// A fresh workspace with no configuration resolves the offline default:
-    /// every purpose on the fake connection, fake ready, openai/anthropic
-    /// present but not required.
+    /// every purpose on the fake connection, fake ready, anthropic present
+    /// but not required.
     #[test]
     fn a_fresh_workspace_resolves_the_offline_default() {
         let dir = workspace(None);
@@ -297,7 +297,7 @@ mod tests {
             RuntimeRouting::resolve(dir.path(), None).expect("the default profile resolves");
         assert_eq!(
             routing.registry.names(),
-            ["fake", "openai", "anthropic"],
+            ["fake", "anthropic"],
             "the default connections register"
         );
         assert!(routing.registry.ready("fake").is_some());
@@ -336,7 +336,7 @@ mod tests {
             "{}",
             error.message()
         );
-        for name in ["fake", "openai", "anthropic"] {
+        for name in ["fake", "anthropic"] {
             assert!(error.message().contains(name), "{}", error.message());
         }
     }
@@ -350,10 +350,10 @@ mod tests {
 version: 1
 budgets: {}
 providers:
-  glm:
-    adapter: openai-chat
-    baseUrl: https://example.invalid/glm
-    apiKeyEnv: RELAY_APP_TEST_GLM_NEVER_SET_KEY
+  claude-proxy:
+    adapter: anthropic
+    baseUrl: https://example.invalid/claude
+    apiKeyEnv: RELAY_APP_TEST_ANTHROPIC_NEVER_SET_KEY
 routing:
   intent: fast
   discovery: reasoning
@@ -371,15 +371,17 @@ routing:
             let planned = routing.plan.primary(purpose).expect("purpose resolves");
             assert_eq!(planned.route.provider, "fake", "{purpose}");
         }
-        // Without the override the configured glm connection is present but
+        // Without the override the configured proxy connection is present but
         // unavailable (its variable is never set) — and that is not an error
         // until a route needs it.
         let routing = RuntimeRouting::resolve(dir.path(), None).expect("resolves");
         assert!(matches!(
-            routing.registry.connection("glm"),
+            routing.registry.connection("claude-proxy"),
             Some(ConnectionState::Unavailable { .. })
         ));
-        routing.preflight_purposes().expect("glm is not a primary");
+        routing
+            .preflight_purposes()
+            .expect("claude-proxy is not a primary");
     }
 
     /// A missing credential on a route's *primary* connection fails the
@@ -390,12 +392,12 @@ routing:
 version: 1
 budgets: {}
 providers:
-  glm:
-    adapter: openai-chat
-    baseUrl: https://example.invalid/glm
-    apiKeyEnv: RELAY_APP_TEST_GLM_NEVER_SET_KEY
+  claude-proxy:
+    adapter: anthropic
+    baseUrl: https://example.invalid/claude
+    apiKeyEnv: RELAY_APP_TEST_ANTHROPIC_NEVER_SET_KEY
 models:
-  fast: { provider: glm, model: glm-4.6 }
+  fast: { provider: claude-proxy, model: claude-sonnet-5-5 }
 routing:
   intent: fast
   discovery: reasoning
@@ -408,10 +410,14 @@ routing:
 ";
         let dir = workspace(Some(config));
         let routing = RuntimeRouting::resolve(dir.path(), None).expect("resolves");
-        let error = routing.intent_route().expect_err("glm has no credential");
+        let error = routing
+            .intent_route()
+            .expect_err("claude-proxy has no credential");
         assert!(matches!(error, AppError::Configuration(_)), "{error}");
         assert!(
-            error.message().contains("RELAY_APP_TEST_GLM_NEVER_SET_KEY"),
+            error
+                .message()
+                .contains("RELAY_APP_TEST_ANTHROPIC_NEVER_SET_KEY"),
             "{}",
             error.message()
         );

@@ -51,10 +51,10 @@ pub use normalized::{
 };
 pub use raw::{RawMapping, RawValue, YamlError};
 pub use schema::{
-    ALLOWED_ROUTING_KEYS, API_KEY_ENV_MESSAGE, AUTONOMY_MESSAGE, AdapterKind, BudgetLimits,
-    CONFIG_SCHEMA_VERSION, CONNECTION_NAME_MESSAGE, CapabilityOverrides, ConfigValidationError,
-    InlineFallback, ModelRoleConfig, PROVIDER_REFERENCE_MESSAGE, ProviderConnection, Providers,
-    ROLE_NAME_MESSAGE, ROLE_NAME_PATTERN, ROUTING_VALUE_MESSAGE, RelayConfig, RouteConfig,
-    RouteLimits, RoutingValue, ToolSettings, WORKFLOW_MODES, is_valid_role_name,
-    parse_relay_config,
+    ACCEPTED_SCHEMA_VERSIONS, ALLOWED_ROUTING_KEYS, API_KEY_ENV_MESSAGE, AUTONOMY_MESSAGE,
+    AdapterKind, BudgetLimits, CONFIG_SCHEMA_VERSION, CONNECTION_NAME_MESSAGE, CapabilityOverrides,
+    ConfigValidationError, InlineFallback, ModelRoleConfig, PROVIDER_REFERENCE_MESSAGE,
+    ProviderConnection, Providers, ROLE_NAME_MESSAGE, ROLE_NAME_PATTERN, ROUTING_VALUE_MESSAGE,
+    RelayConfig, RouteConfig, RouteLimits, RoutingValue, ToolSettings, WORKFLOW_MODES,
+    is_valid_role_name, parse_relay_config,
 };

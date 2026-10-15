@@ -502,8 +502,8 @@ mod tests {
         let mut requested_review = make_event(
             relay_core::events::RelayEventType::ModelRequested,
             EventPayload::ModelRequested(ModelRequestedPayload {
-                provider: "openai".to_string(),
-                model: "gpt-5.2".to_string(),
+                provider: "anthropic".to_string(),
+                model: "claude-haiku-4-5".to_string(),
                 purpose: "mode:verification".to_string(),
                 mode: None,
                 attempt: 1,
@@ -514,8 +514,8 @@ mod tests {
         let mut failed_review = make_event(
             relay_core::events::RelayEventType::ModelFailed,
             EventPayload::ModelFailed(ModelFailedPayload {
-                provider: "openai".to_string(),
-                model: "gpt-5.2".to_string(),
+                provider: "anthropic".to_string(),
+                model: "claude-haiku-4-5".to_string(),
                 purpose: "mode:verification".to_string(),
                 role: Some("review".to_string()),
                 error_kind: ModelErrorKind::RateLimit,

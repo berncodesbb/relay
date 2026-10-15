@@ -5,7 +5,11 @@
 //! normalized outputs and wire translations originally pinned by the retired
 //! TypeScript suite (`test/unit/providers/anthropic.test.ts`, removed from
 //! the tree 2026-10-14); those recorded fixtures are preserved here as the
-//! frozen goldens. No network access: everything runs against 127.0.0.1.
+//! frozen goldens. The suite also covers the native tool-loop conformance
+//! added with the Anthropic-messages adapter rework: true-order text/tool
+//! blocks, the fail-closed stream matrix, `is_error` tool results, and
+//! opaque thinking/redacted-thinking continuation round-trips. No network
+//! access: everything runs against 127.0.0.1.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -18,9 +22,9 @@ use relay_providers::anthropic::AnthropicProvider;
 use relay_providers::collect_turn;
 use relay_providers::contract::{
     AdapterCapabilities, AdapterKind, AssistantContent, CancelToken, CapabilityOverrides,
-    FeatureSupport, FinishReason, ModelMessage, ModelProvider, ModelRequest, ProviderErrorKind,
-    ProviderStreamEvent, StructuredOutputMode, StructuredOutputRequest, ToolCall, ToolSpec,
-    resolve_capabilities,
+    FeatureSupport, FinishReason, MAX_CONTINUATION_DATA_BYTES, MAX_TEXT_BLOCK_BYTES, ModelMessage,
+    ModelProvider, ModelRequest, ProviderErrorKind, ProviderFailure, ProviderStreamEvent,
+    StructuredOutputMode, StructuredOutputRequest, ToolCall, ToolSpec, resolve_capabilities,
 };
 use serde_json::{Value, json};
 
@@ -96,6 +100,110 @@ fn plain_end_turn_events(stop_reason: &str) -> Vec<Value> {
     ]
 }
 
+/// One stable name per event kind, for ordering assertions.
+fn event_kinds(events: &[ProviderStreamEvent]) -> Vec<&'static str> {
+    events
+        .iter()
+        .map(|event| match event {
+            ProviderStreamEvent::TextDelta { .. } => "text-delta",
+            ProviderStreamEvent::ToolCall { .. } => "tool-call",
+            ProviderStreamEvent::Continuation { .. } => "continuation",
+            ProviderStreamEvent::Usage { .. } => "usage",
+            ProviderStreamEvent::StructuredOutput { .. } => "structured-output",
+            ProviderStreamEvent::Completed { .. } => "completed",
+            ProviderStreamEvent::Error { .. } => "error",
+        })
+        .collect()
+}
+
+/// The first error event in a stream, for fail-closed assertions.
+fn error_event(events: &[ProviderStreamEvent]) -> ProviderFailure {
+    events
+        .iter()
+        .find_map(|event| match event {
+            ProviderStreamEvent::Error { error } => Some(error.clone()),
+            _ => None,
+        })
+        .expect("an error event")
+}
+
+fn assert_no_completed(events: &[ProviderStreamEvent]) {
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ProviderStreamEvent::Completed { .. })),
+        "a fail-closed stream never completes: {:?}",
+        event_kinds(events)
+    );
+}
+
+/// Text before AND after a tool_use block: the true-order fixture.
+fn text_tool_text_events() -> Vec<Value> {
+    vec![
+        json!({ "type": "message_start", "message": { "id": "m1", "usage": { "input_tokens": 12, "output_tokens": 1 } } }),
+        json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
+        json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "Checking " } }),
+        json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "the file." } }),
+        json!({ "type": "content_block_stop", "index": 0 }),
+        json!({ "type": "content_block_start", "index": 1, "content_block": { "type": "tool_use", "id": "tu_9", "name": "read-file", "input": {} } }),
+        json!({ "type": "content_block_delta", "index": 1, "delta": { "type": "input_json_delta", "partial_json": "{\"path\":\"pkg" } }),
+        json!({ "type": "content_block_delta", "index": 1, "delta": { "type": "input_json_delta", "partial_json": ".rs\"}" } }),
+        json!({ "type": "content_block_stop", "index": 1 }),
+        json!({ "type": "content_block_start", "index": 2, "content_block": { "type": "text", "text": "" } }),
+        json!({ "type": "content_block_delta", "index": 2, "delta": { "type": "text_delta", "text": "Now summarizing." } }),
+        json!({ "type": "content_block_stop", "index": 2 }),
+        json!({ "type": "message_delta", "delta": { "stop_reason": "tool_use", "stop_sequence": null }, "usage": { "output_tokens": 20 } }),
+        json!({ "type": "message_stop" }),
+    ]
+}
+
+/// Two tool_use blocks with no text: the tool-only fixture.
+fn two_tool_events() -> Vec<Value> {
+    vec![
+        json!({ "type": "message_start", "message": { "id": "m2", "usage": { "input_tokens": 8, "output_tokens": 1 } } }),
+        json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "tool_use", "id": "tu_a", "name": "read-file", "input": {} } }),
+        json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "input_json_delta", "partial_json": "{\"path\":\"a.ts\"}" } }),
+        json!({ "type": "content_block_stop", "index": 0 }),
+        json!({ "type": "content_block_start", "index": 1, "content_block": { "type": "tool_use", "id": "tu_b", "name": "search", "input": {} } }),
+        json!({ "type": "content_block_delta", "index": 1, "delta": { "type": "input_json_delta", "partial_json": "{\"query\":" } }),
+        json!({ "type": "content_block_delta", "index": 1, "delta": { "type": "input_json_delta", "partial_json": "\"relay\"}" } }),
+        json!({ "type": "content_block_stop", "index": 1 }),
+        json!({ "type": "message_delta", "delta": { "stop_reason": "tool_use", "stop_sequence": null }, "usage": { "output_tokens": 30 } }),
+        json!({ "type": "message_stop" }),
+    ]
+}
+
+/// A thinking block (deltas plus signature) followed by visible text.
+fn thinking_then_text_events() -> Vec<Value> {
+    vec![
+        json!({ "type": "message_start", "message": { "id": "m3", "usage": { "input_tokens": 9, "output_tokens": 1 } } }),
+        json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "thinking", "thinking": "" } }),
+        json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "thinking_delta", "thinking": "Pondering " } }),
+        json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "thinking_delta", "thinking": "deeply." } }),
+        json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "signature_delta", "signature": "sig-abc123" } }),
+        json!({ "type": "content_block_stop", "index": 0 }),
+        json!({ "type": "content_block_start", "index": 1, "content_block": { "type": "text", "text": "" } }),
+        json!({ "type": "content_block_delta", "index": 1, "delta": { "type": "text_delta", "text": "The answer is 42." } }),
+        json!({ "type": "content_block_stop", "index": 1 }),
+        json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn", "stop_sequence": null }, "usage": { "output_tokens": 40 } }),
+        json!({ "type": "message_stop" }),
+    ]
+}
+
+/// A redacted_thinking block (complete at start, no deltas) followed by text.
+fn redacted_thinking_then_text_events() -> Vec<Value> {
+    vec![
+        json!({ "type": "message_start", "message": { "id": "m4", "usage": { "input_tokens": 7, "output_tokens": 1 } } }),
+        json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "redacted_thinking", "data": "opaque-eNc=" } }),
+        json!({ "type": "content_block_stop", "index": 0 }),
+        json!({ "type": "content_block_start", "index": 1, "content_block": { "type": "text", "text": "" } }),
+        json!({ "type": "content_block_delta", "index": 1, "delta": { "type": "text_delta", "text": "Visible answer." } }),
+        json!({ "type": "content_block_stop", "index": 1 }),
+        json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn", "stop_sequence": null }, "usage": { "output_tokens": 15 } }),
+        json!({ "type": "message_stop" }),
+    ]
+}
+
 #[test]
 fn normalizes_text_tool_use_fragments_usage_and_stop_reason() {
     let server = MockServer::start(CannedResponse::sse(200, &sse_body(&tool_use_events())));
@@ -103,9 +211,9 @@ fn normalizes_text_tool_use_fragments_usage_and_stop_reason() {
 
     let result = collect_turn(provider.stream(&base_request())).expect("turn completes");
 
-    assert_eq!(result.text, "Let me check that file.");
+    assert_eq!(result.text(), "Let me check that file.");
     assert_eq!(
-        result.tool_calls,
+        result.tool_calls(),
         vec![ToolCall {
             id: "tu_1".into(),
             name: "read-file".into(),
@@ -157,9 +265,7 @@ fn merges_tool_results_and_replays_assistant_calls_as_tool_use() {
     request.max_output_tokens = Some(1000);
     request.temperature = Some(0.3);
     request.messages = vec![
-        ModelMessage::User {
-            content: "check both".into(),
-        },
+        ModelMessage::user_text("check both"),
         ModelMessage::Assistant {
             content: vec![
                 AssistantContent::ToolCall {
@@ -178,14 +284,8 @@ fn merges_tool_results_and_replays_assistant_calls_as_tool_use() {
                 },
             ],
         },
-        ModelMessage::ToolResult {
-            tool_call_id: "t1".into(),
-            content: "contents a".into(),
-        },
-        ModelMessage::ToolResult {
-            tool_call_id: "t2".into(),
-            content: "contents b".into(),
-        },
+        ModelMessage::tool_result("t1", "contents a", false).expect("bounded"),
+        ModelMessage::tool_result("t2", "contents b", false).expect("bounded"),
     ];
     request.tools = Some(vec![ToolSpec {
         name: "read-file".into(),
@@ -299,17 +399,7 @@ fn emits_structured_output_before_completion() {
     });
 
     let events: Vec<ProviderStreamEvent> = provider.stream(&request).collect();
-    let kinds: Vec<&str> = events
-        .iter()
-        .map(|event| match event {
-            ProviderStreamEvent::TextDelta { .. } => "text-delta",
-            ProviderStreamEvent::ToolCall { .. } => "tool-call",
-            ProviderStreamEvent::Usage { .. } => "usage",
-            ProviderStreamEvent::StructuredOutput { .. } => "structured-output",
-            ProviderStreamEvent::Completed { .. } => "completed",
-            ProviderStreamEvent::Error { .. } => "error",
-        })
-        .collect();
+    let kinds = event_kinds(&events);
     let structured = kinds
         .iter()
         .position(|kind| *kind == "structured-output")
@@ -346,9 +436,11 @@ fn emits_invalid_response_when_the_structured_reply_is_not_json() {
 }
 
 #[test]
-fn falls_back_to_the_raw_json_string_when_tool_input_cannot_be_parsed() {
-    // The TypeScript suite replaces the first input delta with '{broken' and
-    // empties the second, so the accumulated JSON text is invalid.
+fn fails_closed_when_tool_input_cannot_be_parsed() {
+    // The TypeScript suite replaced the first input delta with '{broken' and
+    // emptied the second, letting the raw string through; the native
+    // tool-loop adapter fails closed instead of handing the executor a
+    // raw-string argument.
     let mut replaced_first = false;
     let broken: Vec<Value> = tool_use_events()
         .into_iter()
@@ -368,8 +460,18 @@ fn falls_back_to_the_raw_json_string_when_tool_input_cannot_be_parsed() {
     let server = MockServer::start(CannedResponse::sse(200, &sse_body(&broken)));
     let provider = provider(&server.base_url);
 
-    let result = collect_turn(provider.stream(&base_request())).expect("turn completes");
-    assert_eq!(result.tool_calls[0].arguments, json!("{broken"));
+    let events: Vec<ProviderStreamEvent> = provider.stream(&base_request()).collect();
+    let error = error_event(&events);
+    assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
+    assert!(!error.retryable);
+    assert!(
+        error.message.contains("is not valid JSON"),
+        "{}",
+        error.message
+    );
+    assert_no_completed(&events);
+    let error = collect_turn(events.into_iter()).expect_err("fails the turn");
+    assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
 }
 
 #[test]
@@ -544,6 +646,511 @@ fn ignores_unknown_stream_event_types_like_the_reference_default_branch() {
     assert_eq!(result.finish_reason, FinishReason::Stop);
     assert_eq!(result.usage.input_tokens, 6);
     assert_eq!(result.usage.output_tokens, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Native tool-loop conformance: true-order blocks, fail-closed streams,
+// error tool results, and opaque thinking continuations (offline, loopback)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn normalizes_a_text_only_turn() {
+    let events = vec![
+        json!({ "type": "message_start", "message": { "id": "m", "usage": { "input_tokens": 3, "output_tokens": 1 } } }),
+        json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
+        json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "Hello " } }),
+        json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "there." } }),
+        json!({ "type": "content_block_stop", "index": 0 }),
+        json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn", "stop_sequence": null }, "usage": { "output_tokens": 4 } }),
+        json!({ "type": "message_stop" }),
+    ];
+    let server = MockServer::start(CannedResponse::sse(200, &sse_body(&events)));
+    let provider = provider(&server.base_url);
+
+    let result = collect_turn(provider.stream(&base_request())).expect("turn completes");
+    assert_eq!(
+        result.blocks,
+        vec![AssistantContent::Text {
+            text: "Hello there.".into()
+        }]
+    );
+    assert_eq!(result.text(), "Hello there.");
+    assert!(result.tool_calls().is_empty());
+    assert_eq!(result.finish_reason, FinishReason::Stop);
+    assert_eq!(result.usage.input_tokens, 3);
+    assert_eq!(result.usage.output_tokens, 4);
+}
+
+#[test]
+fn emits_tool_only_turns_as_ordered_complete_calls() {
+    let server = MockServer::start(CannedResponse::sse(200, &sse_body(&two_tool_events())));
+    let provider = provider(&server.base_url);
+
+    let events: Vec<ProviderStreamEvent> = provider.stream(&base_request()).collect();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ProviderStreamEvent::TextDelta { .. })),
+        "no text in a tool-only turn: {:?}",
+        event_kinds(&events)
+    );
+
+    let result = collect_turn(events.into_iter()).expect("turn completes");
+    // Two calls, in arrival order, with distinct ids and validated inputs.
+    assert_eq!(
+        result.blocks,
+        vec![
+            AssistantContent::ToolCall {
+                call: ToolCall {
+                    id: "tu_a".into(),
+                    name: "read-file".into(),
+                    arguments: json!({ "path": "a.ts" }),
+                },
+            },
+            AssistantContent::ToolCall {
+                call: ToolCall {
+                    id: "tu_b".into(),
+                    name: "search".into(),
+                    arguments: json!({ "query": "relay" }),
+                },
+            },
+        ]
+    );
+    assert_eq!(result.finish_reason, FinishReason::ToolCalls);
+}
+
+#[test]
+fn emits_blocks_in_true_order_text_tool_text() {
+    let server = MockServer::start(CannedResponse::sse(
+        200,
+        &sse_body(&text_tool_text_events()),
+    ));
+    let provider = provider(&server.base_url);
+
+    let events: Vec<ProviderStreamEvent> = provider.stream(&base_request()).collect();
+    // The raw event stream interleaves: the tool call is emitted at its own
+    // content_block_stop, between the two text runs.
+    let kinds = event_kinds(&events);
+    let first_text = kinds.iter().position(|kind| *kind == "text-delta");
+    let last_text = kinds.iter().rposition(|kind| *kind == "text-delta");
+    let tool = kinds.iter().position(|kind| *kind == "tool-call");
+    assert!(
+        first_text.is_some_and(|first| tool.is_some_and(|tool| first < tool))
+            && tool.is_some_and(|tool| last_text.is_some_and(|last| tool < last)),
+        "{kinds:?}"
+    );
+
+    // The authoritative block list keeps the interleaving.
+    let result = collect_turn(events.into_iter()).expect("turn completes");
+    assert_eq!(
+        result.blocks,
+        vec![
+            AssistantContent::Text {
+                text: "Checking the file.".into()
+            },
+            AssistantContent::ToolCall {
+                call: ToolCall {
+                    id: "tu_9".into(),
+                    name: "read-file".into(),
+                    arguments: json!({ "path": "pkg.rs" }),
+                },
+            },
+            AssistantContent::Text {
+                text: "Now summarizing.".into()
+            },
+        ]
+    );
+    // Visible text joins around the call without the call inside it.
+    assert_eq!(result.text(), "Checking the file.Now summarizing.");
+}
+
+#[test]
+fn error_tool_results_carry_is_error_on_the_wire() {
+    let server = MockServer::start(CannedResponse::sse(
+        200,
+        &sse_body(&plain_end_turn_events("end_turn")),
+    ));
+    let provider = provider(&server.base_url);
+
+    let mut request = base_request();
+    request.messages = vec![
+        ModelMessage::user_text("read the config"),
+        ModelMessage::Assistant {
+            content: vec![AssistantContent::ToolCall {
+                call: ToolCall {
+                    id: "t1".into(),
+                    name: "read-file".into(),
+                    arguments: json!({ "path": "relay.config.yaml" }),
+                },
+            }],
+        },
+        ModelMessage::tool_result("t1", "denied: the path is outside the grant", true)
+            .expect("bounded"),
+    ];
+
+    collect_turn(provider.stream(&request)).expect("turn completes");
+
+    let wire = &server.recorded()[0].body;
+    assert_eq!(
+        wire["messages"][2],
+        json!({
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "t1",
+                    "content": "denied: the path is outside the grant",
+                    "is_error": true,
+                },
+            ],
+        })
+    );
+}
+
+#[test]
+fn fails_closed_when_the_stream_ends_without_message_stop() {
+    let mut incomplete = tool_use_events();
+    assert_eq!(incomplete.pop().unwrap()["type"], "message_stop");
+    let server = MockServer::start(CannedResponse::sse(200, &sse_body(&incomplete)));
+    let provider = provider(&server.base_url);
+
+    let events: Vec<ProviderStreamEvent> = provider.stream(&base_request()).collect();
+    let error = error_event(&events);
+    assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
+    assert!(!error.retryable);
+    assert!(
+        error.message.contains("without a message_stop"),
+        "{}",
+        error.message
+    );
+    assert_no_completed(&events);
+}
+
+#[test]
+fn fails_closed_on_a_duplicate_content_block_start_index() {
+    let events = vec![
+        json!({ "type": "message_start", "message": { "id": "m", "usage": { "input_tokens": 1, "output_tokens": 1 } } }),
+        json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
+        json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
+        json!({ "type": "message_stop" }),
+    ];
+    let server = MockServer::start(CannedResponse::sse(200, &sse_body(&events)));
+    let provider = provider(&server.base_url);
+
+    let events: Vec<ProviderStreamEvent> = provider.stream(&base_request()).collect();
+    let error = error_event(&events);
+    assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
+    assert!(error.message.contains("already open"), "{}", error.message);
+    assert_no_completed(&events);
+}
+
+#[test]
+fn fails_closed_on_a_delta_for_an_unannounced_block_index() {
+    let events = vec![
+        json!({ "type": "message_start", "message": { "id": "m", "usage": { "input_tokens": 1, "output_tokens": 1 } } }),
+        json!({ "type": "content_block_delta", "index": 3, "delta": { "type": "text_delta", "text": "orphan" } }),
+        json!({ "type": "message_stop" }),
+    ];
+    let server = MockServer::start(CannedResponse::sse(200, &sse_body(&events)));
+    let provider = provider(&server.base_url);
+
+    let events: Vec<ProviderStreamEvent> = provider.stream(&base_request()).collect();
+    let error = error_event(&events);
+    assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
+    assert!(error.message.contains("is not open"), "{}", error.message);
+    assert_no_completed(&events);
+}
+
+#[test]
+fn fails_closed_on_a_delta_or_stop_for_a_closed_block_index() {
+    let base = vec![
+        json!({ "type": "message_start", "message": { "id": "m", "usage": { "input_tokens": 1, "output_tokens": 1 } } }),
+        json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
+        json!({ "type": "content_block_stop", "index": 0 }),
+    ];
+    for tail in [
+        vec![
+            json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "late" } }),
+        ],
+        vec![json!({ "type": "content_block_stop", "index": 0 })],
+    ] {
+        let mut events = base.clone();
+        events.extend(tail);
+        events.push(json!({ "type": "message_stop" }));
+        let server = MockServer::start(CannedResponse::sse(200, &sse_body(&events)));
+        let provider = provider(&server.base_url);
+
+        let collected: Vec<ProviderStreamEvent> = provider.stream(&base_request()).collect();
+        let error = error_event(&collected);
+        assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
+        assert!(error.message.contains("is not open"), "{}", error.message);
+        assert_no_completed(&collected);
+    }
+}
+
+#[test]
+fn fails_closed_when_a_tool_use_block_is_missing_its_id_or_name() {
+    for (content_block, missing) in [
+        (
+            json!({ "type": "tool_use", "name": "read-file", "input": {} }),
+            "id",
+        ),
+        (
+            json!({ "type": "tool_use", "id": "tu_1", "input": {} }),
+            "name",
+        ),
+        (
+            json!({ "type": "tool_use", "id": "", "name": "read-file", "input": {} }),
+            "id",
+        ),
+        (
+            json!({ "type": "tool_use", "id": "tu_1", "name": "", "input": {} }),
+            "name",
+        ),
+    ] {
+        let events = vec![
+            json!({ "type": "message_start", "message": { "id": "m", "usage": { "input_tokens": 1, "output_tokens": 1 } } }),
+            json!({ "type": "content_block_start", "index": 0, "content_block": content_block }),
+            json!({ "type": "message_stop" }),
+        ];
+        let server = MockServer::start(CannedResponse::sse(200, &sse_body(&events)));
+        let provider = provider(&server.base_url);
+
+        let collected: Vec<ProviderStreamEvent> = provider.stream(&base_request()).collect();
+        let error = error_event(&collected);
+        assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
+        assert!(
+            error.message.contains(&format!("missing its {missing}")),
+            "{}",
+            error.message
+        );
+        assert_no_completed(&collected);
+    }
+}
+
+#[test]
+fn fails_closed_on_a_delta_kind_that_does_not_match_the_block_kind() {
+    for (block, delta, expected) in [
+        (
+            json!({ "type": "text", "text": "" }),
+            json!({ "type": "input_json_delta", "partial_json": "{\"a\":" }),
+            "input_json_delta arrived for block index 0, which is not a tool_use block",
+        ),
+        (
+            json!({ "type": "tool_use", "id": "tu_1", "name": "read-file", "input": {} }),
+            json!({ "type": "text_delta", "text": "sneaky" }),
+            "text_delta arrived for block index 0, which is not a text block",
+        ),
+        (
+            json!({ "type": "text", "text": "" }),
+            json!({ "type": "signature_delta", "signature": "sig" }),
+            "signature_delta arrived for block index 0, which is not a thinking block",
+        ),
+    ] {
+        let events = vec![
+            json!({ "type": "message_start", "message": { "id": "m", "usage": { "input_tokens": 1, "output_tokens": 1 } } }),
+            json!({ "type": "content_block_start", "index": 0, "content_block": block }),
+            json!({ "type": "content_block_delta", "index": 0, "delta": delta }),
+            json!({ "type": "message_stop" }),
+        ];
+        let server = MockServer::start(CannedResponse::sse(200, &sse_body(&events)));
+        let provider = provider(&server.base_url);
+
+        let collected: Vec<ProviderStreamEvent> = provider.stream(&base_request()).collect();
+        let error = error_event(&collected);
+        assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
+        assert_eq!(error.message, expected);
+        assert_no_completed(&collected);
+    }
+}
+
+#[test]
+fn captures_thinking_as_an_opaque_continuation_and_replays_it_byte_for_byte() {
+    let server = MockServer::start(CannedResponse::sse(
+        200,
+        &sse_body(&thinking_then_text_events()),
+    ));
+    let capture_provider = provider(&server.base_url);
+
+    let result = collect_turn(capture_provider.stream(&base_request())).expect("turn completes");
+
+    // Captured in true order as a bounded opaque continuation block.
+    assert_eq!(result.blocks.len(), 2);
+    match &result.blocks[0] {
+        AssistantContent::Continuation {
+            discriminator,
+            data,
+        } => {
+            assert_eq!(discriminator, "thinking");
+            assert_eq!(
+                data,
+                "{\"signature\":\"sig-abc123\",\"thinking\":\"Pondering deeply.\"}"
+            );
+        }
+        other => panic!("expected a continuation block, got {other:?}"),
+    }
+    // Hidden reasoning never reaches any visible surface: not the turn text,
+    // not structured output (and receipts serialize only those).
+    assert_eq!(result.text(), "The answer is 42.");
+    assert!(!result.text().contains("Pondering"), "{}", result.text());
+    assert!(result.structured_output.is_none());
+
+    // Replay: the same blocks in the next request transcript map back onto
+    // the identical thinking wire block, bytes preserved.
+    let replay = MockServer::start(CannedResponse::sse(
+        200,
+        &sse_body(&plain_end_turn_events("end_turn")),
+    ));
+    let replay_provider = provider(&replay.base_url);
+    let mut request = base_request();
+    request.messages = vec![
+        ModelMessage::user_text("the original question"),
+        ModelMessage::Assistant {
+            content: result.blocks.clone(),
+        },
+    ];
+    collect_turn(replay_provider.stream(&request)).expect("replay turn completes");
+
+    let wire = &replay.recorded()[0].body;
+    assert_eq!(
+        wire["messages"][1],
+        json!({
+            "role": "assistant",
+            "content": [
+                { "type": "thinking", "thinking": "Pondering deeply.", "signature": "sig-abc123" },
+                { "type": "text", "text": "The answer is 42." },
+            ],
+        })
+    );
+}
+
+#[test]
+fn captures_redacted_thinking_and_replays_it_verbatim() {
+    let server = MockServer::start(CannedResponse::sse(
+        200,
+        &sse_body(&redacted_thinking_then_text_events()),
+    ));
+    let capture_provider = provider(&server.base_url);
+
+    let result = collect_turn(capture_provider.stream(&base_request())).expect("turn completes");
+    assert_eq!(result.blocks.len(), 2);
+    assert_eq!(
+        result.blocks[0],
+        AssistantContent::Continuation {
+            discriminator: "redacted-thinking".into(),
+            data: "opaque-eNc=".into(),
+        }
+    );
+    // The opaque payload is not visible text.
+    assert_eq!(result.text(), "Visible answer.");
+
+    let replay = MockServer::start(CannedResponse::sse(
+        200,
+        &sse_body(&plain_end_turn_events("end_turn")),
+    ));
+    let replay_provider = provider(&replay.base_url);
+    let mut request = base_request();
+    request.messages = vec![
+        ModelMessage::user_text("again"),
+        ModelMessage::Assistant {
+            content: result.blocks.clone(),
+        },
+    ];
+    collect_turn(replay_provider.stream(&request)).expect("replay turn completes");
+
+    let wire = &replay.recorded()[0].body;
+    assert_eq!(
+        wire["messages"][1],
+        json!({
+            "role": "assistant",
+            "content": [
+                { "type": "redacted_thinking", "data": "opaque-eNc=" },
+                { "type": "text", "text": "Visible answer." },
+            ],
+        })
+    );
+}
+
+#[test]
+fn un_replayable_continuation_blocks_fail_before_any_http_request() {
+    let server = MockServer::start(CannedResponse::sse(
+        200,
+        &sse_body(&plain_end_turn_events("end_turn")),
+    ));
+    let provider = provider(&server.base_url);
+
+    let mut request = base_request();
+    request.messages = vec![
+        ModelMessage::user_text("continue"),
+        ModelMessage::Assistant {
+            content: vec![AssistantContent::Continuation {
+                discriminator: "vendor-x".into(),
+                data: "secret-opaque-payload".into(),
+            }],
+        },
+    ];
+
+    let error =
+        collect_turn(provider.stream(&request)).expect_err("unknown discriminator fails closed");
+    assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
+    assert!(error.message.contains("vendor-x"), "{}", error.message);
+    // The opaque payload is never echoed in the failure.
+    assert!(
+        !error.message.contains("secret-opaque-payload"),
+        "{}",
+        error.message
+    );
+    assert!(
+        server.recorded().is_empty(),
+        "no HTTP request may reach the server for an un-replayable continuation"
+    );
+}
+
+#[test]
+fn fails_closed_when_a_text_block_exceeds_the_bound() {
+    let events = vec![
+        json!({ "type": "message_start", "message": { "id": "m", "usage": { "input_tokens": 1, "output_tokens": 1 } } }),
+        json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
+        json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "x".repeat(MAX_TEXT_BLOCK_BYTES + 1) } }),
+        json!({ "type": "content_block_stop", "index": 0 }),
+        json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn", "stop_sequence": null }, "usage": { "output_tokens": 2 } }),
+        json!({ "type": "message_stop" }),
+    ];
+    let server = MockServer::start(CannedResponse::sse(200, &sse_body(&events)));
+    let provider = provider(&server.base_url);
+
+    let collected: Vec<ProviderStreamEvent> = provider.stream(&base_request()).collect();
+    let error = error_event(&collected);
+    assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
+    assert!(
+        error.message.contains("exceeded the") && error.message.contains("bound"),
+        "{}",
+        error.message
+    );
+    assert_no_completed(&collected);
+}
+
+#[test]
+fn fails_closed_when_a_thinking_block_exceeds_the_continuation_bound() {
+    let events = vec![
+        json!({ "type": "message_start", "message": { "id": "m", "usage": { "input_tokens": 1, "output_tokens": 1 } } }),
+        json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "thinking", "thinking": "" } }),
+        json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "thinking_delta", "thinking": "x".repeat(MAX_CONTINUATION_DATA_BYTES + 1) } }),
+        json!({ "type": "content_block_stop", "index": 0 }),
+        json!({ "type": "message_stop" }),
+    ];
+    let server = MockServer::start(CannedResponse::sse(200, &sse_body(&events)));
+    let provider = provider(&server.base_url);
+
+    let collected: Vec<ProviderStreamEvent> = provider.stream(&base_request()).collect();
+    let error = error_event(&collected);
+    assert_eq!(error.kind, ProviderErrorKind::InvalidResponse);
+    assert!(
+        error.message.contains("continuation") && error.message.contains("bound"),
+        "{}",
+        error.message
+    );
+    assert_no_completed(&collected);
 }
 
 // ---------------------------------------------------------------------------

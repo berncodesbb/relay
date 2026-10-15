@@ -18,25 +18,24 @@ Each YAML layer is validated in isolation: unknown keys, malformed connection na
 
 | Term | What it is | Where it lives |
 | --- | --- | --- |
-| **Adapter kind** | The wire *protocol* a connection speaks: `openai-chat` (any OpenAI-compatible Chat Completions endpoint — OpenAI, GLM, Groq, OpenRouter, local gateways), `anthropic` (native Messages API), or `fake` (deterministic, offline, in-process). Adapters are the closed set Relay ships; they never grow one entry per vendor. | `providers.<name>.adapter` |
-| **Provider connection** | A named piece of infrastructure you configure: an adapter, the environment variable holding its credential, an optional base URL, and capability settings. Connection names are yours (`openai`, `glm`, `local-gateway`); several connections may share one adapter. Connections are infrastructure, not responsibilities. | `providers:` |
+| **Adapter kind** | The wire *protocol* a connection speaks: `anthropic` (the native Messages API — also used for Anthropic Messages-compatible gateways via `baseUrl`) or `fake` (deterministic, offline, in-process). Adapters are the closed set Relay ships; they never grow one entry per vendor. Anthropic Messages is Relay's only live external protocol; the `openai-chat` adapter was removed (see [Migrating off the removed OpenAI Chat support](#migrating-off-the-removed-openai-chat-support)). | `providers.<name>.adapter` |
+| **Provider connection** | A named piece of infrastructure you configure: an adapter, the environment variable holding its credential, an optional base URL, and capability settings. Connection names are yours (`anthropic`, `claude-proxy`, `local-gateway`); several connections may share one adapter. Connections are infrastructure, not responsibilities. | `providers:` |
 | **Model role** | An execution responsibility that you name and define: a connection, a model, optional limits, and optional fallback roles. Role names are user-defined catalog keys — not an enum — such as `reasoning`, `coding`, `review`, `fast`, or your own (`product`, `ux-writing`, `security-review`). Name a role after what it does, never after a vendor or a vague quality. | `models:` |
 | **Routing purpose** | Why a model call happens: one of the seven workflow modes (`discovery`, `specification`, `technical-design`, `planning`, `implementation`, `verification`, `delivery`), or the utility purpose `intent` (conversational turns). Each purpose maps to a role. | `routing:` |
 
-A model call resolves **purpose → role → provider connection → adapter → model**, deterministically, before the attempt starts; models never choose or rewrite their own routing.
+A model call resolves **purpose → role → provider connection → adapter → model**, deterministically, before the attempt starts; models never choose or rewrite their own routing. Relay owns the conversation transcript and the tool loop on top of whatever connection serves the call: tools are native `tool_use`/`tool_result` exchanges executed against the attempt's capability grant, and provider-hosted tools or provider-side conversation state are never authoritative.
 
 ## The built-in defaults are offline
 
-The defaults define three connections — `fake` (adapter `fake`), `openai` (adapter `openai-chat`, reading `OPENAI_API_KEY`), and `anthropic` (adapter `anthropic`, reading `ANTHROPIC_API_KEY`) — and route all five built-in roles to the `fake` connection with the model `fake-standard`. A fresh checkout therefore runs `relay`, `relay run`, and `relay --print` end to end with no keys, no configuration, and no network. This is effective configuration, not hidden CLI branching: override any role or add a live connection in your own layers and the default profile yields predictably, role by role.
+The defaults define two connections — `fake` (adapter `fake`) and `anthropic` (adapter `anthropic`, reading `ANTHROPIC_API_KEY`) — and route all five built-in roles to the `fake` connection with the model `fake-standard`. A fresh checkout therefore runs `relay`, `relay run`, and `relay --print` end to end with no keys, no configuration, and no network. This is effective configuration, not hidden CLI branching: override any role or add a live connection in your own layers and the default profile yields predictably, role by role.
 
 `relay config show` renders exactly this effective shape on a fresh checkout:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "providers": {
     "fake": { "adapter": "fake" },
-    "openai": { "adapter": "openai-chat", "apiKeyEnv": "OPENAI_API_KEY" },
     "anthropic": { "adapter": "anthropic", "apiKeyEnv": "ANTHROPIC_API_KEY" }
   },
   "models": {
@@ -65,74 +64,67 @@ The defaults define three connections — `fake` (adapter `fake`), `openai` (ada
 providers:
   # Any name (lowercase kebab-case, 1-64 characters); the name is what
   # models.<role>.provider and --provider refer to.
-  glm:
-    adapter: openai-chat              # required: openai-chat | anthropic | fake
-    baseUrl: https://api.z.ai/api/paas/v4
-    apiKeyEnv: GLM_API_KEY            # NAME of the env var; never a key value
-    preset: glm                       # optional capability preset (see below)
-
-  openai:
-    adapter: openai-chat
-    baseUrl: https://api.openai.com/v1
-    apiKeyEnv: OPENAI_API_KEY
-
   anthropic:
-    adapter: anthropic
-    apiKeyEnv: ANTHROPIC_API_KEY
+    adapter: anthropic                # required: anthropic | fake
+    apiKeyEnv: ANTHROPIC_API_KEY      # NAME of the env var; never a key value
+
+  gateway:
+    adapter: anthropic                # any Anthropic Messages-compatible endpoint
+    baseUrl: https://gateway.example/anthropic
+    apiKeyEnv: GATEWAY_API_KEY
 
   local:
-    adapter: openai-chat              # a second openai-chat connection coexists
-    baseUrl: http://localhost:11434/v1
+    adapter: anthropic                # a second anthropic connection coexists
+    baseUrl: http://localhost:8787
     apiKeyEnv: LOCAL_GATEWAY_KEY
 ```
 
-- `adapter` is required, except on the legacy keys `openai`, `anthropic`, and `fake`, where it is inferred (`openai-chat`, `anthropic`, `fake`). This keeps version-1 files loading unchanged.
-- `apiKeyEnv` must be an environment-variable *name* (`[A-Za-z_][A-Za-z0-9_]*`) — anything that looks like a credential value (`sk-…`, contains `=` or whitespace) is a configuration error by design. When omitted it defaults per adapter (`OPENAI_API_KEY` for `openai-chat`, `ANTHROPIC_API_KEY` for `anthropic`, none for `fake`). The value is read from the environment only when the adapter is constructed for a run, and never persisted, logged, or echoed.
+- `adapter` is required, except on the legacy keys `anthropic` and `fake`, where it is inferred. (The legacy `openai` key no longer infers anything — a bare `providers.openai` entry fails with migration guidance; see the migration section below.)
+- `apiKeyEnv` must be an environment-variable *name* (`[A-Za-z_][A-Za-z0-9_]*`) — anything that looks like a credential value (`sk-…`, contains `=` or whitespace) is a configuration error by design. When omitted it defaults per adapter (`ANTHROPIC_API_KEY` for `anthropic`, none for `fake`). The value is read from the environment only when the adapter is constructed for a run, and never persisted, logged, or echoed.
 - `baseUrl` is optional (validated as a URL); `fake` connections ignore it.
-- Layers merge connections **by name with complete replacement**: a later layer that defines `glm` replaces that whole connection; connections it does not name survive — the same semantics as the role catalog. (A side effect inherited from version 1: a layer whose `providers` section omits the legacy `openai`/`anthropic` keys resets those two connections to their defaults, while custom names survive.)
+- Layers merge connections **by name with complete replacement**: a later layer that defines `gateway` replaces that whole connection; connections it does not name survive — the same semantics as the role catalog. (A side effect inherited from version 1: a layer whose `providers` section omits the legacy `anthropic` key resets that connection to its default, while custom names survive.)
 
-### Capabilities and presets
+### Capabilities and profiles
 
-OpenAI compatibility is a *transport*, not a promise of feature parity: `openai-chat` targets Chat Completions only (not the Responses API), and compatible endpoints differ in what they accept. Each connection therefore carries an effective **capability profile**, resolved deterministically as `adapter defaults → optional preset → explicit overrides`:
+Compatible endpoints differ in what they accept, so each connection carries an effective **capability profile**, resolved deterministically as `adapter defaults → explicit overrides`:
 
 ```yaml
 providers:
-  glm:
-    adapter: openai-chat
-    baseUrl: https://api.z.ai/api/paas/v4
-    apiKeyEnv: GLM_API_KEY
-    preset: glm                       # conservative GLM profile
-    capabilities:                     # explicit overrides win over the preset
-      structuredOutput: json-schema   # ...if your endpoint supports it
+  gateway:
+    adapter: anthropic
+    baseUrl: https://gateway.example/anthropic
+    apiKeyEnv: GATEWAY_API_KEY
+    capabilities:                     # explicit overrides win over adapter defaults
+      structuredOutput: json-object
 ```
 
-Capability fields and spellings: `instructions` (`developer` | `system-instruction`), `toolCalls`, `streamedToolArguments`, `parallelToolCalls`, `streamedUsage`, `imageInput` (`supported` | `unsupported`), `structuredOutput` (`json-schema` | `json-object` | `unsupported`), `outputTokenParam` (`max-tokens` | `max-completion-tokens` | `model-default`). The first shipped preset is `glm`: system instructions instead of the developer role, `json-object` structured output with the JSON Schema embedded in the instruction (schemas over 16 KiB fail preflight rather than truncate), no streamed-usage request, and plain `max_tokens`.
+Capability fields and spellings: `instructions` (`system-instruction`), `toolCalls`, `streamedToolArguments`, `parallelToolCalls`, `streamedUsage`, `imageInput` (`supported` | `unsupported`), `structuredOutput` (`json-schema` | `json-object` | `unsupported`), `outputTokenParam` (`max-tokens`). No presets ship today; the preset mechanism remains for future named profiles, and the `glm` preset was removed with the `openai-chat` adapter.
 
-A requested Relay feature is either translated by a documented rule recorded in the profile (developer → system instruction; native `json-schema` → `json-object` with the schema embedded) or rejected with an actionable error **before any HTTP request is issued** — never silently dropped. Image/file input is recorded as unsupported everywhere until Relay requests it.
+A requested Relay feature is either translated by a documented rule recorded in the profile (native `json-schema` → `json-object` with the schema embedded in the system instruction) or rejected with an actionable error **before any HTTP request is issued** — never silently dropped. Image/file input is recorded as unsupported everywhere until Relay requests it.
 
 ## Full annotated example
 
 A mixed live setup expressed with named connections and five roles (all fields shown are the complete set):
 
 ```yaml
-# Schema version. Currently 1; defaults when omitted.
-version: 1
+# Schema version. Currently 2; version 1 files that avoid removed OpenAI
+# spellings also load (see the migration section below).
+version: 2
 
 providers:
-  openai: { adapter: openai-chat, apiKeyEnv: OPENAI_API_KEY }
   anthropic: { adapter: anthropic, apiKeyEnv: ANTHROPIC_API_KEY }
-  glm: { adapter: openai-chat, baseUrl: https://api.z.ai/api/paas/v4,
-         apiKeyEnv: GLM_API_KEY, preset: glm }
+  gateway: { adapter: anthropic, baseUrl: https://gateway.example/anthropic,
+             apiKeyEnv: GATEWAY_API_KEY }
 
 # Model roles. Keys are your names (lowercase kebab-case, 1-64 characters);
 # values reference provider connections by name.
 models:
   reasoning:  { provider: anthropic, model: claude-sonnet-5-5 }
   architect:  { provider: anthropic, model: claude-opus-5-5 }
-  coding:     { provider: glm, model: glm-4.6 }
+  coding:     { provider: gateway, model: claude-sonnet-5-5 }
   review:
-    provider: openai                # any configured connection name
-    model: gpt-5.2
+    provider: gateway               # any configured connection name
+    model: claude-sonnet-5-5
     fallbacks: [reasoning]          # optional role names, tried in order (max 3)
   fast:
     provider: anthropic
@@ -194,12 +186,12 @@ waves). See `relay run --help`.
 Define a role, reroute one purpose, and leave the rest to the defaults. Later layers merge into the role catalog by name, so the five built-in roles stay available; only `verification` changes.
 
 ```yaml
-version: 1
+version: 2
 budgets: {}
 models:
   security-review:
-    provider: openai
-    model: gpt-5.2
+    provider: anthropic
+    model: claude-sonnet-5-5
     limits: { temperature: 0 }
 routing: { intent: fast, discovery: reasoning, specification: reasoning,
            technical-design: architect, planning: reasoning, implementation: coding,
@@ -211,12 +203,12 @@ routing: { intent: fast, discovery: reasoning, specification: reasoning,
 ### Role fallbacks and limits (project layer)
 
 ```yaml
-version: 1
+version: 2
 budgets: {}
 models:
   coding:
-    provider: glm
-    model: glm-4.6
+    provider: gateway
+    model: claude-sonnet-5-5
     limits: { maxOutputTokens: 16384, temperature: 0.2 }
     fallbacks: [reasoning, fast]     # role names, in try order, max 3
 routing: { intent: fast, discovery: reasoning, specification: reasoning,
@@ -231,7 +223,7 @@ A layer that names `coding` replaces that entire role definition — provider, m
 Both forms are accepted in the same file. Inline routes behave exactly as before and record no role in model events.
 
 ```yaml
-version: 1
+version: 2
 budgets: {}
 models:
   reasoning: { provider: anthropic, model: claude-sonnet-5-5 }
@@ -241,17 +233,29 @@ routing:
   specification: reasoning
   technical-design: { provider: anthropic, model: claude-opus-5-5 }  # legacy inline
   planning: reasoning
-  implementation: { provider: glm, model: glm-4.6 }
-  verification: { provider: openai, model: gpt-5.2 }
+  implementation: { provider: gateway, model: claude-sonnet-5-5 }
+  verification: { provider: gateway, model: claude-sonnet-5-5 }
   delivery: { provider: anthropic, model: claude-haiku-4-5 }
 ```
 
-### Migrating a version-1 configuration
+### Migrating off the removed OpenAI Chat support
 
-No migration is required: a complete version-1 file containing only inline routes and the fixed `openai`/`anthropic` provider entries loads with equivalent semantics — the legacy keys infer their adapters, `provider: openai | anthropic | fake` in roles and inline routes resolves to the same-named default connections, and old event logs replay unchanged (`role` is optional on model events). The same routing expressed with roles:
+Relay shipped an `openai-chat` adapter (Chat Completions compatibility, including the `glm` preset) until 2026-10-15, when Anthropic Messages became the sole live external protocol. The removal is intentional and deliberate: endpoint capabilities and model identifiers are not equivalent between protocols, so Relay never translates or guesses a replacement.
+
+Concretely, version-1 files **that do not name removed spellings load unchanged** — the legacy `anthropic` and `fake` keys still infer their adapters, inline routes still work, and old event logs replay unchanged. Configuration that does name removed spellings fails at validation time — before any network call or project-state change — with a targeted migration error:
+
+- `adapter: openai-chat` (any connection) →
+  `providers.<name>.adapter: openai-chat was removed; configure an Anthropic Messages-compatible endpoint with adapter: anthropic and select a model supported by that endpoint`
+- a bare legacy `providers.openai` entry (no `adapter`) →
+  `providers.openai: the implicit openai connection was removed with the openai-chat adapter; configure an Anthropic Messages-compatible connection (adapter: anthropic) and update routes that name openai`
+- `preset: glm` →
+  `providers.<name>: the glm preset was removed with the openai-chat adapter; configure an Anthropic Messages-compatible connection instead`
+- removed capability spellings (`instructions: developer`, `outputTokenParam: max-completion-tokens` or `model-default`) → an error of the same shape naming the `anthropic` replacement (`system-instruction`, `max-tokens`).
+
+Routes that referenced the removed connection by *name* (`provider: openai`) fail effective validation with the available connections listed — define a replacement connection and update the reference:
 
 ```yaml
-# BEFORE — inline-only, still fully supported.
+# BEFORE — fails: the openai connection no longer exists.
 version: 1
 budgets: {}
 providers:
@@ -268,82 +272,64 @@ routing:
 ```
 
 ```yaml
-# AFTER — identical effective routing, named. The explicit `intent` route is new.
-version: 1
+# AFTER — identical shape, one live protocol. The explicit `intent` route is new.
+version: 2
 budgets: {}
 models:
   reasoning:  { provider: anthropic, model: claude-sonnet-5-5 }
   architect:  { provider: anthropic, model: claude-opus-5-5 }
   coding:     { provider: anthropic, model: claude-sonnet-5-5 }
-  review:     { provider: openai, model: gpt-5.2 }
+  review:     { provider: anthropic, model: claude-sonnet-5-5 }
   fast:       { provider: anthropic, model: claude-haiku-4-5 }
 routing: { intent: fast, discovery: reasoning, specification: reasoning,
            technical-design: architect, planning: reasoning, implementation: coding,
            verification: review, delivery: fast }
 ```
 
-### One vendor for everything
+### One connection for everything
 
-All modes on OpenAI, with an Anthropic fallback for verification (fallbacks name roles, so the backup is a role too):
-
-```yaml
-version: 1
-budgets: {}
-models:
-  reasoning:  { provider: openai, model: gpt-5.2 }
-  architect:
-    provider: openai
-    model: gpt-5.2
-    limits: { maxOutputTokens: 16384 }
-  coding:     { provider: openai, model: gpt-5.2 }
-  review:
-    provider: openai
-    model: gpt-5.2
-    fallbacks: [second-opinion]
-  second-opinion: { provider: anthropic, model: claude-sonnet-5-5 }
-  fast:       { provider: openai, model: gpt-5-mini }
-routing: { intent: fast, discovery: reasoning, specification: reasoning,
-           technical-design: architect, planning: reasoning, implementation: coding,
-           verification: review, delivery: fast }
-```
-
-### GLM through OpenAI compatibility
-
-A GLM connection is pure configuration — no GLM-specific adapter or SDK:
+All modes on one Anthropic connection, with a second connection as a verification fallback (fallbacks name roles, so the backup is a role too):
 
 ```yaml
-version: 1
+version: 2
 budgets: {}
 providers:
-  glm:
-    adapter: openai-chat
-    baseUrl: https://api.z.ai/api/paas/v4
-    apiKeyEnv: GLM_API_KEY
-    preset: glm
+  anthropic: { adapter: anthropic, apiKeyEnv: ANTHROPIC_API_KEY }
+  gateway:   { adapter: anthropic, baseUrl: https://gateway.example/anthropic,
+               apiKeyEnv: GATEWAY_API_KEY }
 models:
-  coding: { provider: glm, model: glm-4.6 }
+  reasoning:  { provider: anthropic, model: claude-sonnet-5-5 }
+  architect:
+    provider: anthropic
+    model: claude-opus-5-5
+    limits: { maxOutputTokens: 16384 }
+  coding:     { provider: anthropic, model: claude-sonnet-5-5 }
+  review:
+    provider: anthropic
+    model: claude-sonnet-5-5
+    fallbacks: [second-opinion]
+  second-opinion: { provider: gateway, model: claude-sonnet-5-5 }
+  fast:       { provider: anthropic, model: claude-haiku-4-5 }
 routing: { intent: fast, discovery: reasoning, specification: reasoning,
            technical-design: architect, planning: reasoning, implementation: coding,
            verification: review, delivery: fast }
 ```
-
-Export `GLM_API_KEY` and `relay run --provider glm` works. `openai-chat` means Chat Completions compatibility — not full OpenAI feature parity, and not the Responses API.
 
 ### Multiple connections on one adapter
 
-Two OpenAI-compatible endpoints coexist as separate names; roles and `--provider` pick between them:
+Two Anthropic Messages-compatible endpoints coexist as separate names; roles and `--provider` pick between them:
 
 ```yaml
-version: 1
+version: 2
 budgets: {}
 providers:
-  openai: { adapter: openai-chat, apiKeyEnv: OPENAI_API_KEY }
-  groq:   { adapter: openai-chat, baseUrl: https://api.groq.com/openai/v1,
-            apiKeyEnv: GROQ_API_KEY, capabilities: { outputTokenParam: max-tokens } }
-  local:  { adapter: openai-chat, baseUrl: http://localhost:11434/v1,
-            apiKeyEnv: LOCAL_GATEWAY_KEY }
+  anthropic: { adapter: anthropic, apiKeyEnv: ANTHROPIC_API_KEY }
+  gateway:   { adapter: anthropic, baseUrl: https://gateway.example/anthropic,
+               apiKeyEnv: GATEWAY_API_KEY }
+  local:     { adapter: anthropic, baseUrl: http://localhost:8787,
+               apiKeyEnv: LOCAL_GATEWAY_KEY }
 models:
-  fast: { provider: groq, model: llama-3.3-70b-versatile }
+  fast: { provider: gateway, model: claude-haiku-4-5 }
 ```
 
 ### Offline demo/test setup
@@ -351,7 +337,7 @@ models:
 This is already the built-in default; write it explicitly only to pin it:
 
 ```yaml
-version: 1
+version: 2
 budgets: {}
 providers:
   fake: { adapter: fake }
@@ -383,7 +369,7 @@ configured route  <  --role <name>  <  --provider <name>  <  --model <name>
 ```
 
 - `--role <name>` routes every model call this invocation to one configured role (with that role's fallback chain), regardless of purpose. An unknown role fails with a usage error listing the available roles, before any project state is created.
-- `--provider <name>` forces every route onto one configured provider connection; model ids and limits stay as routed (so point it at a connection your routes are configured for — on the offline defaults, `--provider openai` would send the `fake-standard` model id to OpenAI). An unknown connection fails with a usage error listing the configured connections.
+- `--provider <name>` forces every route onto one configured provider connection; model ids and limits stay as routed (so point it at a connection your routes are configured for — on the offline defaults, `--provider anthropic` would send the `fake-standard` model id to Anthropic). An unknown connection fails with a usage error listing the configured connections.
 - `--model <name>` overrides the routed model.
 
 `--provider` and `--model` are low-level overrides and may intentionally
@@ -391,7 +377,7 @@ produce connection/model combinations that do not appear in the `models`
 catalog.
 
 The shipped CLI exposes `--provider <name>` with any configured connection
-name (the defaults provide `fake`, `openai`, and `anthropic`; the default is
+name (the defaults provide `fake` and `anthropic`; the default is
 `fake`, fully offline). Configuration errors and unknown connections exit
 with code 2 and create no project state; provider transport failures during
 a run remain runtime failures (exit 1). The `--role`/`--model` flags are
@@ -406,30 +392,29 @@ Each file layer is validated strictly with actionable errors (`ConfigValidationE
 
 - Unknown fields are ignored exactly as before (Zod default-object behavior); values are validated strictly.
 - Connection names must be lowercase kebab-case, 1–64 characters.
-- `adapter` must be one of `openai-chat | anthropic | fake` (required except on the legacy keys).
+- `adapter` must be one of `anthropic | fake` (required except on the legacy keys `anthropic` and `fake`); the removed `openai-chat` spelling fails with the migration error above rather than a generic unknown-adapter message.
 - `apiKeyEnv` must be an environment-variable name; a credential-looking value is rejected.
 - `baseUrl` must be a valid URL.
-- Capability values must use their documented spellings; unknown preset names and preset/adapter mismatches fail with the available presets/adapters listed.
+- Capability values must use their documented spellings; removed spellings (`developer`, `max-completion-tokens`, `model-default`) and unknown preset names fail with actionable errors naming the replacement or the available options.
 - `routing` keys other than the seven modes (and `intent`) are rejected by name; a routing table missing any of the seven modes is rejected with the missing-mode list.
 - Out-of-range numbers (for example `maxTurns: 0` or `temperature: 5`) are rejected with the allowed range.
 - Invalid YAML (including duplicate mapping keys) fails with the parser error and the file path.
 
 After the layers merge, the effective configuration is cross-reference validated — every issue names a dotted path and the layer that introduced it, and all of them fail before any model call or project-state change. Representative messages:
 
-- `routing.verification.provider: references unknown provider connection "openaai"; available connections: fake, openai, anthropic. Define a providers.openaai entry.`
+- `routing.verification.provider: references unknown provider connection "openaai"; available connections: fake, anthropic. Define a providers.openaai entry.`
 - `models.review.fallbacks[0]: unknown role "reasonig"` — a fallback naming an undefined role.
 - `models.review.fallbacks[0]: role "review" cannot fall back to itself` — self-reference.
 - `models.review.fallbacks: cycle detected (review -> reasoning -> review)` — a fallback cycle.
-- `providers.glm: unknown capability preset "grok" (available presets: glm)`.
+- `providers.gateway: unknown capability preset "grok" (available presets: )` — no presets ship today.
 - An expanded chain longer than one primary plus three fallbacks is rejected.
 
 ## Environment variables
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `OPENAI_API_KEY` | For any connection defaulting to it | OpenAI credential (read at adapter construction; never persisted) |
-| `ANTHROPIC_API_KEY` | For any connection defaulting to it | Anthropic credential (same handling) |
-| *your `apiKeyEnv` values* | For the connections that name them | e.g. `GLM_API_KEY` for a `glm` connection |
+| `ANTHROPIC_API_KEY` | For any connection defaulting to it | Anthropic credential (read at adapter construction; never persisted) |
+| *your `apiKeyEnv` values* | For the connections that name them | e.g. `GATEWAY_API_KEY` for a `gateway` connection |
 | `NO_COLOR` | No | Disable ANSI colors, same as `--no-color` |
 
 Endpoints are configured per connection with `baseUrl` in YAML; there are no base-URL environment variables. A connection whose credential variable is unset is *unavailable*: routing that uses it as a primary fails immediately with an error telling you which variable to set; fallback routes that use it are skipped.
@@ -440,8 +425,8 @@ Endpoints are configured per connection with `baseUrl` in YAML; there are no bas
 relay config show                        # print the fully resolved configuration
 relay config path                        # list the layers that applied and their file paths
 relay config get providers               # the effective connection table
-relay config get providers.glm           # one connection (including its effective adapter)
-relay config get providers.glm.preset    # one connection field
+relay config get providers.gateway       # one connection (including its effective adapter)
+relay config get providers.gateway.baseUrl   # one connection field
 relay config get routing                 # the purpose → role table
 relay config get models.review           # one role definition from the effective catalog
 ```

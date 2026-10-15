@@ -46,8 +46,8 @@ fn parses_the_plan_default_block_verbatim() {
     assert_eq!(
         models.get("review"),
         Some(&model_role_with_fallbacks(
-            "openai",
-            "gpt-5.2",
+            "anthropic",
+            "claude-haiku-4-5",
             vec!["reasoning"]
         ))
     );
@@ -62,9 +62,9 @@ fn accepts_user_defined_role_names() {
 version: 1
 budgets: {}
 models:
-  product: { provider: openai, model: gpt-5.2 }
+  product: { provider: anthropic, model: claude-sonnet-5-5 }
   ux-writing: { provider: anthropic, model: claude-haiku-4-5 }
-  security-review: { provider: openai, model: gpt-5.2, fallbacks: [product] }
+  security-review: { provider: anthropic, model: claude-sonnet-5-5, fallbacks: [product] }
 routing:
   discovery: product
   specification: product
@@ -148,7 +148,7 @@ routing:
   technical-design: {{ provider: anthropic, model: claude-opus-5-5 }}
   planning: {{ provider: anthropic, model: claude-sonnet-5-5 }}
   implementation: {{ provider: anthropic, model: claude-sonnet-5-5 }}
-  verification: {{ provider: openai, model: gpt-5.2 }}
+  verification: {{ provider: anthropic, model: claude-haiku-4-5 }}
   delivery: {{ provider: anthropic, model: claude-haiku-4-5 }}
 "#
         );
@@ -188,8 +188,8 @@ version: 1
 budgets: {}
 models:
   review:
-    provider: openai
-    model: gpt-5.2
+    provider: anthropic
+    model: claude-haiku-4-5
     fallbacks: [Reasoning]
 routing:
   discovery: reasoning
@@ -214,8 +214,8 @@ version: 1
 budgets: {}
 models:
   review:
-    provider: openai
-    model: gpt-5.2
+    provider: anthropic
+    model: claude-haiku-4-5
     fallbacks: [a, b, c, d]
 routing:
   discovery: reasoning
@@ -249,10 +249,10 @@ routing:
   intent: fast
   discovery: { provider: anthropic, model: claude-sonnet-5-5 }
   specification: { provider: anthropic, model: claude-sonnet-5-5 }
-  technical-design: { provider: anthropic, model: claude-opus-5-5, fallbacks: [{ provider: openai, model: gpt-5.2 }] }
+  technical-design: { provider: anthropic, model: claude-opus-5-5, fallbacks: [{ provider: anthropic, model: claude-haiku-4-5 }] }
   planning: { provider: anthropic, model: claude-sonnet-5-5 }
   implementation: { provider: anthropic, model: claude-sonnet-5-5 }
-  verification: { provider: openai, model: gpt-5.2 }
+  verification: { provider: anthropic, model: claude-haiku-4-5 }
   delivery: { provider: anthropic, model: claude-haiku-4-5 }
 "#,
     )
@@ -268,8 +268,8 @@ routing:
             "anthropic",
             "claude-opus-5-5",
             vec![relay_config::schema::InlineFallback {
-                provider: "openai".to_string(),
-                model: "gpt-5.2".to_string(),
+                provider: "anthropic".to_string(),
+                model: "claude-haiku-4-5".to_string(),
             }],
         ))
     );
@@ -303,13 +303,13 @@ version: 1
 budgets: {}
 routing:
   intent: { provider: anthropic, model: claude-haiku-4-5 }
-  frobnicate: { provider: openai, model: gpt-5.2 }
+  frobnicate: { provider: anthropic, model: claude-sonnet-5-5 }
   discovery: { provider: anthropic, model: claude-sonnet-5-5 }
   specification: { provider: anthropic, model: claude-sonnet-5-5 }
   technical-design: { provider: anthropic, model: claude-opus-5-5 }
   planning: { provider: anthropic, model: claude-sonnet-5-5 }
   implementation: { provider: anthropic, model: claude-sonnet-5-5 }
-  verification: { provider: openai, model: gpt-5.2 }
+  verification: { provider: anthropic, model: claude-haiku-4-5 }
   delivery: { provider: anthropic, model: claude-haiku-4-5 }
 "#,
     );
@@ -364,7 +364,7 @@ routing:
   technical-design: { provider: anthropic, model: claude-opus-5-5 }
   planning: { provider: anthropic, model: claude-sonnet-5-5 }
   implementation: { provider: anthropic, model: claude-sonnet-5-5 }
-  verification: { provider: openai, model: gpt-5.2 }
+  verification: { provider: anthropic, model: claude-haiku-4-5 }
   delivery: { provider: anthropic, model: claude-haiku-4-5 }
 "#,
     );
@@ -394,7 +394,7 @@ routing:
   technical-design: { provider: anthropic, model: claude-opus-5-5 }
   planning: { provider: anthropic, model: claude-sonnet-5-5 }
   implementation: { provider: anthropic, model: claude-sonnet-5-5 }
-  verification: { provider: openai, model: gpt-5.2 }
+  verification: { provider: anthropic, model: claude-haiku-4-5 }
   delivery: { provider: anthropic, model: claude-haiku-4-5 }
 "#,
     );
@@ -406,29 +406,43 @@ routing:
 }
 
 #[test]
-fn keeps_schema_version_at_one_for_the_backward_compatible_additions() {
+fn accepts_both_declared_schema_versions() {
+    // A version-1 layer without removed spellings loads unchanged.
     let parsed = parse_yaml_config(PLAN_DEFAULT_YAML).unwrap();
     assert_eq!(parsed.version, 1);
+    // Version 2 is the current schema.
+    let parsed = parse_yaml_config(&PLAN_DEFAULT_YAML.replace("version: 1", "version: 2")).unwrap();
+    assert_eq!(parsed.version, 2);
+    assert_eq!(relay_config::CONFIG_SCHEMA_VERSION, 2);
+    assert_eq!(relay_config::ACCEPTED_SCHEMA_VERSIONS, [1, 2]);
 }
 
 #[test]
-fn parses_named_provider_connections_with_adapter_endpoint_and_preset() {
+fn parses_named_provider_connections_with_adapter_and_endpoint() {
     let parsed = parse_yaml_config(NAMED_CONNECTIONS_YAML).unwrap();
-    let glm = parsed.providers.get("glm").unwrap();
-    assert_eq!(glm.adapter, AdapterKind::OpenaiChat);
-    assert_eq!(glm.api_key_env.as_deref(), Some("GLM_API_KEY"));
+    let claude_pro = parsed.providers.get("claude-pro").unwrap();
+    assert_eq!(claude_pro.adapter, AdapterKind::Anthropic);
     assert_eq!(
-        glm.base_url.as_deref(),
-        Some("https://api.z.ai/api/paas/v4")
+        claude_pro.api_key_env.as_deref(),
+        Some("CLAUDE_PRO_API_KEY")
     );
-    assert_eq!(glm.preset.as_deref(), Some("glm"));
-    // A second connection sharing the openai-chat adapter coexists; its
-    // apiKeyEnv defaults per adapter and its preset is unset.
-    let local = parsed.providers.get("local").unwrap();
-    assert_eq!(local.adapter, AdapterKind::OpenaiChat);
-    assert_eq!(local.api_key_env.as_deref(), Some("OPENAI_API_KEY"));
-    assert_eq!(local.base_url.as_deref(), Some("http://localhost:8080/v1"));
-    assert_eq!(local.preset, None);
+    assert_eq!(
+        claude_pro.base_url.as_deref(),
+        Some("https://api.anthropic.com")
+    );
+    // A second connection sharing the adapter coexists; its apiKeyEnv
+    // defaults per adapter and optional fields are unset.
+    let claude_local = parsed.providers.get("claude-local").unwrap();
+    assert_eq!(claude_local.adapter, AdapterKind::Anthropic);
+    assert_eq!(
+        claude_local.api_key_env.as_deref(),
+        Some("ANTHROPIC_API_KEY")
+    );
+    assert_eq!(
+        claude_local.base_url.as_deref(),
+        Some("http://localhost:8080")
+    );
+    assert_eq!(claude_local.preset, None);
     // Roles reference the connections by name; validity is deferred to
     // effective validation, but the names parse as strings.
     assert_eq!(
@@ -439,22 +453,16 @@ fn parses_named_provider_connections_with_adapter_endpoint_and_preset() {
             .get("reasoning")
             .unwrap()
             .provider,
-        "glm"
+        "claude-pro"
     );
 }
 
 #[test]
 fn infers_legacy_adapters_and_preserves_the_version_one_default_quirks() {
-    // Absent section: both legacy live keys with the object-level defaults.
+    // Absent section: the anthropic connection with the object-level
+    // defaults.
     let parsed = parse_yaml_config(PLAN_DEFAULT_YAML).unwrap();
-    assert_eq!(
-        parsed.providers.names().collect::<Vec<_>>(),
-        ["openai", "anthropic"]
-    );
-    assert_eq!(
-        parsed.providers.get("openai"),
-        Some(&connection(AdapterKind::OpenaiChat, Some("OPENAI_API_KEY")))
-    );
+    assert_eq!(parsed.providers.names().collect::<Vec<_>>(), ["anthropic"]);
     assert_eq!(
         parsed.providers.get("anthropic"),
         Some(&connection(
@@ -463,8 +471,9 @@ fn infers_legacy_adapters_and_preserves_the_version_one_default_quirks() {
         ))
     );
 
-    // Present section, present-but-empty anthropic object: the field-level
-    // OPENAI_API_KEY quirk; absent openai key: the object-level default.
+    // Present section, present-but-empty anthropic object: the adapter's
+    // credential-variable default. No implicit openai connection is
+    // re-added anymore.
     let parsed = parse_yaml_config(
         r#"
 version: 1
@@ -481,16 +490,18 @@ routing:
 "#,
     )
     .unwrap();
+    assert_eq!(parsed.providers.names().collect::<Vec<_>>(), ["anthropic"]);
     assert_eq!(
         parsed.providers.get("anthropic"),
-        Some(&connection(AdapterKind::Anthropic, Some("OPENAI_API_KEY")))
-    );
-    assert_eq!(
-        parsed.providers.get("openai"),
-        Some(&connection(AdapterKind::OpenaiChat, Some("OPENAI_API_KEY")))
+        Some(&connection(
+            AdapterKind::Anthropic,
+            Some("ANTHROPIC_API_KEY")
+        ))
     );
 
-    // The fake key infers its adapter and needs no credential.
+    // The fake key infers its adapter and needs no credential, and the
+    // section stays complete: the absent legacy anthropic key is re-added
+    // with its object-level default.
     let parsed = parse_yaml_config(
         r#"
 version: 1
@@ -508,6 +519,10 @@ routing:
     )
     .unwrap();
     assert_eq!(
+        parsed.providers.names().collect::<Vec<_>>(),
+        ["fake", "anthropic"]
+    );
+    assert_eq!(
         parsed.providers.get("fake"),
         Some(&connection(AdapterKind::Fake, None))
     );
@@ -517,7 +532,7 @@ routing:
         r#"
 version: 1
 budgets: {}
-providers: { openai: { apiKeyEnv: "" } }
+providers: { anthropic: { apiKeyEnv: "" } }
 routing:
   discovery: { provider: fake, model: m }
   specification: { provider: fake, model: m }
@@ -530,7 +545,7 @@ routing:
     );
     assert!(
         error.issues.iter().any(|issue| issue
-            == "providers.openai.apiKeyEnv: Too small: expected string to have >=1 characters"),
+            == "providers.anthropic.apiKeyEnv: Too small: expected string to have >=1 characters"),
         "{:?}",
         error.issues
     );
@@ -544,9 +559,9 @@ fn rejects_unknown_adapter_kinds_listing_the_allowed_spellings() {
 version: 1
 budgets: {{}}
 providers:
-  glm:
+  gateway:
     adapter: {bad}
-    apiKeyEnv: GLM_API_KEY
+    apiKeyEnv: GATEWAY_API_KEY
 routing:
   discovery: {{ provider: fake, model: m }}
   specification: {{ provider: fake, model: m }}
@@ -559,8 +574,8 @@ routing:
         ));
         assert!(
             error.issues.iter().any(|issue| issue
-                == "providers.glm.adapter: Invalid option: expected one of \
-                    \"openai-chat\"|\"anthropic\"|\"fake\""),
+                == "providers.gateway.adapter: Invalid option: expected one of \
+                    \"anthropic\"|\"fake\""),
             "adapter {bad:?}: {:?}",
             error.issues
         );
@@ -571,7 +586,7 @@ routing:
 version: 1
 budgets: {}
 providers:
-  glm:
+  gateway:
     adapter: 7
 routing:
   discovery: { provider: fake, model: m }
@@ -585,7 +600,7 @@ routing:
     );
     assert!(
         error.issues.iter().any(|issue| issue
-            == "providers.glm.adapter: Invalid input: expected string, received number"),
+            == "providers.gateway.adapter: Invalid input: expected string, received number"),
         "{:?}",
         error.issues
     );
@@ -598,7 +613,7 @@ fn requires_an_adapter_for_new_connection_names() {
 version: 1
 budgets: {}
 providers:
-  glm: { apiKeyEnv: GLM_API_KEY }
+  gateway: { apiKeyEnv: GATEWAY_API_KEY }
 routing:
   discovery: { provider: fake, model: m }
   specification: { provider: fake, model: m }
@@ -611,9 +626,8 @@ routing:
     );
     assert_eq!(
         error.issues[0],
-        "providers.glm.adapter: provider connections require an adapter \
-         (\"openai-chat\"|\"anthropic\"|\"fake\"); only the legacy keys openai, anthropic, and \
-         fake may omit it"
+        "providers.gateway.adapter: provider connections require an adapter \
+         (\"anthropic\"|\"fake\"); only the legacy keys anthropic and fake may omit it"
     );
 }
 
@@ -624,8 +638,8 @@ fn rejects_malformed_connection_names_with_a_connection_phrased_diagnostic() {
 version: 1
 budgets: {}
 providers:
-  GLM: { adapter: openai-chat }
-  local_gateway: { adapter: openai-chat }
+  GATEWAY: { adapter: anthropic }
+  local_gateway: { adapter: anthropic }
 routing:
   discovery: { provider: fake, model: m }
   specification: { provider: fake, model: m }
@@ -638,8 +652,8 @@ routing:
     );
     assert_eq!(
         error.issues[0],
-        "providers.GLM: provider connection names are lowercase kebab-case, 1-64 characters, \
-         e.g. openai, glm, local-gateway"
+        "providers.GATEWAY: provider connection names are lowercase kebab-case, 1-64 characters, \
+         e.g. anthropic, claude-proxy, local-gateway"
     );
     assert!(
         error
@@ -654,17 +668,17 @@ fn rejects_literal_secrets_and_invalid_names_in_api_key_env() {
     for bad in [
         "sk-1234567890abcdef", // literal credential value
         "MY KEY",              // whitespace
-        "OPENAI-KEY",          // dash
-        "GLM=KEY",             // assignment
-        "1GLM_KEY",            // leading digit
+        "ANTHROPIC-KEY",       // dash
+        "GATEWAY=KEY",         // assignment
+        "1GATEWAY_KEY",        // leading digit
     ] {
         let error = expect_rejection(&format!(
             r#"
 version: 1
 budgets: {{}}
 providers:
-  glm:
-    adapter: openai-chat
+  gateway:
+    adapter: anthropic
     apiKeyEnv: "{bad}"
 routing:
   discovery: {{ provider: fake, model: m }}
@@ -678,9 +692,9 @@ routing:
         ));
         assert!(
             error.issues.iter().any(|issue| issue
-                == "providers.glm.apiKeyEnv: apiKeyEnv must name an environment variable \
-                     (letters, digits, underscores; e.g. GLM_API_KEY), never hold a credential \
-                     value"),
+                == "providers.gateway.apiKeyEnv: apiKeyEnv must name an environment variable \
+                     (letters, digits, underscores; e.g. ANTHROPIC_API_KEY), never hold a \
+                     credential value"),
             "apiKeyEnv {bad:?}: {:?}",
             error.issues
         );
@@ -692,9 +706,9 @@ routing:
 version: 1
 budgets: {}
 providers:
-  glm:
-    adapter: openai-chat
-    apiKeyEnv: _GLM_API_KEY
+  gateway:
+    adapter: anthropic
+    apiKeyEnv: _GATEWAY_API_KEY
 routing:
   discovery: { provider: fake, model: m }
   specification: { provider: fake, model: m }
@@ -707,8 +721,13 @@ routing:
     )
     .unwrap();
     assert_eq!(
-        parsed.providers.get("glm").unwrap().api_key_env.as_deref(),
-        Some("_GLM_API_KEY")
+        parsed
+            .providers
+            .get("gateway")
+            .unwrap()
+            .api_key_env
+            .as_deref(),
+        Some("_GATEWAY_API_KEY")
     );
 }
 
@@ -719,9 +738,8 @@ fn parses_capability_overrides_with_the_contract_wire_spellings() {
 version: 1
 budgets: {}
 providers:
-  glm:
-    adapter: openai-chat
-    preset: glm
+  claude-proxy:
+    adapter: anthropic
     capabilities:
       instructions: system-instruction
       structuredOutput: json-schema
@@ -739,7 +757,7 @@ routing:
 "#,
     )
     .unwrap();
-    let capabilities = &parsed.providers.get("glm").unwrap().capabilities;
+    let capabilities = &parsed.providers.get("claude-proxy").unwrap().capabilities;
     assert_eq!(
         capabilities.instructions,
         Some(InstructionStyle::SystemInstruction)
@@ -767,8 +785,8 @@ fn rejects_capability_values_that_are_not_wire_spellings() {
 version: 1
 budgets: {}
 providers:
-  glm:
-    adapter: openai-chat
+  claude-proxy:
+    adapter: anthropic
     capabilities:
       instructions: system
       structuredOutput: JSON-Schema
@@ -785,14 +803,14 @@ routing:
 "#,
     );
     let expected = [
-        "providers.glm.capabilities.instructions: Invalid option: expected one of \
-         \"developer\"|\"system-instruction\"",
-        "providers.glm.capabilities.structuredOutput: Invalid option: expected one of \
+        "providers.claude-proxy.capabilities.instructions: Invalid option: expected one of \
+         \"system-instruction\"",
+        "providers.claude-proxy.capabilities.structuredOutput: Invalid option: expected one of \
          \"json-schema\"|\"json-object\"|\"unsupported\"",
-        "providers.glm.capabilities.toolCalls: Invalid option: expected one of \
+        "providers.claude-proxy.capabilities.toolCalls: Invalid option: expected one of \
          \"supported\"|\"unsupported\"",
-        "providers.glm.capabilities.outputTokenParam: Invalid option: expected one of \
-         \"max-tokens\"|\"max-completion-tokens\"|\"model-default\"",
+        "providers.claude-proxy.capabilities.outputTokenParam: Invalid option: expected one of \
+         \"max-tokens\"",
     ];
     for issue in expected {
         assert!(
@@ -807,8 +825,8 @@ routing:
 version: 1
 budgets: {}
 providers:
-  glm:
-    adapter: openai-chat
+  claude-proxy:
+    adapter: anthropic
     capabilities: { streamedUsage: true }
 routing:
   discovery: { provider: fake, model: m }
@@ -822,8 +840,8 @@ routing:
     );
     assert!(
         error.issues.iter().any(|issue| issue
-            == "providers.glm.capabilities.streamedUsage: Invalid input: expected string, \
-                     received boolean"),
+            == "providers.claude-proxy.capabilities.streamedUsage: Invalid input: expected \
+                     string, received boolean"),
         "{:?}",
         error.issues
     );
@@ -839,8 +857,8 @@ fn presets_parse_as_nonempty_strings_and_defer_validity_to_effective_validation(
 version: 1
 budgets: {}
 providers:
-  glm:
-    adapter: openai-chat
+  gateway:
+    adapter: anthropic
     preset: grok
 routing:
   discovery: { provider: fake, model: m }
@@ -856,7 +874,7 @@ routing:
         parsed
             .unwrap()
             .providers
-            .get("glm")
+            .get("gateway")
             .unwrap()
             .preset
             .as_deref(),
@@ -868,8 +886,8 @@ routing:
 version: 1
 budgets: {}
 providers:
-  glm:
-    adapter: openai-chat
+  gateway:
+    adapter: anthropic
     preset: ""
 routing:
   discovery: { provider: fake, model: m }
@@ -883,7 +901,7 @@ routing:
     );
     assert!(
         error.issues.iter().any(|issue| issue
-            == "providers.glm.preset: Too small: expected string to have >=1 characters"),
+            == "providers.gateway.preset: Too small: expected string to have >=1 characters"),
         "{:?}",
         error.issues
     );
@@ -897,8 +915,8 @@ fn rejects_duplicate_connection_keys_at_yaml_parse() {
 version: 1
 budgets: {}
 providers:
-  glm: { adapter: openai-chat, apiKeyEnv: GLM_API_KEY }
-  glm: { adapter: anthropic }
+  gateway: { adapter: anthropic, apiKeyEnv: GATEWAY_API_KEY }
+  gateway: { adapter: fake }
 routing:
   discovery: { provider: fake, model: m }
   specification: { provider: fake, model: m }
@@ -927,19 +945,19 @@ fn validates_provider_references_as_connection_names_at_layer_parse() {
 version: 1
 budgets: {}
 routing:
-  discovery: { provider: OpenAI, model: m1 }
+  discovery: { provider: Anthropic-Caps, model: m1 }
   specification: { provider: anthropic, model: m1 }
   technical-design: { provider: anthropic, model: m1 }
   planning: { provider: anthropic, model: m1 }
   implementation: { provider: anthropic, model: m1 }
-  verification: { provider: openai, model: m2 }
+  verification: { provider: anthropic, model: m2 }
   delivery: { provider: anthropic, model: m1 }
 "#,
     );
     assert_eq!(
         error.issues[0],
         "routing.discovery.provider: provider must be a provider connection name (lowercase \
-         kebab-case, e.g. openai, glm)"
+         kebab-case, e.g. anthropic, claude-proxy)"
     );
 
     // A non-string provider stays a hard union issue.
@@ -953,7 +971,7 @@ routing:
   technical-design: { provider: anthropic, model: m1 }
   planning: { provider: anthropic, model: m1 }
   implementation: { provider: anthropic, model: m1 }
-  verification: { provider: openai, model: m2 }
+  verification: { provider: anthropic, model: m2 }
   delivery: { provider: anthropic, model: m1 }
 "#,
     );
@@ -975,7 +993,7 @@ routing:
   technical-design: { provider: anthropic, model: m1 }
   planning: { provider: anthropic, model: m1 }
   implementation: { provider: anthropic, model: m1 }
-  verification: { provider: openai, model: m2 }
+  verification: { provider: anthropic, model: m2 }
   delivery: { provider: anthropic, model: m1 }
 "#,
     )
@@ -1005,7 +1023,7 @@ routing:
     assert_eq!(
         error.issues[0],
         "models.reasoning.provider: provider must be a provider connection name (lowercase \
-         kebab-case, e.g. openai, glm)"
+         kebab-case, e.g. anthropic, claude-proxy)"
     );
 }
 
@@ -1016,8 +1034,8 @@ fn empty_capability_overrides_are_equivalent_to_absent_ones() {
 version: 1
 budgets: {}
 providers:
-  glm:
-    adapter: openai-chat
+  claude-proxy:
+    adapter: anthropic
     capabilities: {}
 routing:
   discovery: { provider: fake, model: m }
@@ -1031,12 +1049,12 @@ routing:
     )
     .unwrap();
     assert_eq!(
-        parsed.providers.get("glm").unwrap().capabilities,
+        parsed.providers.get("claude-proxy").unwrap().capabilities,
         CapabilityOverrides::default()
     );
     assert_eq!(
-        *parsed.providers.get("glm").unwrap(),
-        connection(AdapterKind::OpenaiChat, Some("OPENAI_API_KEY"))
+        *parsed.providers.get("claude-proxy").unwrap(),
+        connection(AdapterKind::Anthropic, Some("ANTHROPIC_API_KEY"))
     );
 }
 
@@ -1060,7 +1078,7 @@ routing:
   technical-design: { provider: anthropic, model: m1 }
   planning: { provider: anthropic, model: m1 }
   implementation: { provider: anthropic, model: m1 }
-  verification: { provider: openai, model: m2 }
+  verification: { provider: anthropic, model: m2 }
   delivery: { provider: anthropic, model: m1 }
 "#,
             expected: "budgets: Invalid input: expected object, received undefined",
@@ -1073,8 +1091,8 @@ routing:
         },
         Case {
             label: "wrong version",
-            yaml: "version: 2\nbudgets: {}\nrouting:\n  discovery: r\n",
-            expected: "version: Invalid input: expected 1",
+            yaml: "version: 3\nbudgets: {}\nrouting:\n  discovery: r\n",
+            expected: "version: Invalid input: expected 1 or 2",
         },
         Case {
             label: "budget range",
@@ -1108,9 +1126,9 @@ routing:
         },
         Case {
             label: "provider name syntax",
-            yaml: "version: 1\nbudgets: {}\nmodels:\n  reasoning:\n    provider: OpenAI\n    model: m1\nrouting:\n  discovery: reasoning\n",
+            yaml: "version: 1\nbudgets: {}\nmodels:\n  reasoning:\n    provider: Anthropic\n    model: m1\nrouting:\n  discovery: reasoning\n",
             expected: "models.reasoning.provider: provider must be a provider connection name \
-                       (lowercase kebab-case, e.g. openai, glm)",
+                       (lowercase kebab-case, e.g. anthropic, claude-proxy)",
         },
         Case {
             label: "autonomy",
@@ -1124,8 +1142,8 @@ routing:
         },
         Case {
             label: "baseUrl",
-            yaml: "version: 1\nbudgets: {}\nproviders:\n  openai: { baseUrl: notaurl }\nrouting:\n  discovery: { provider: fake, model: m }\n",
-            expected: "providers.openai.baseUrl: Invalid URL",
+            yaml: "version: 1\nbudgets: {}\nproviders:\n  gateway: { adapter: anthropic, baseUrl: notaurl }\nrouting:\n  discovery: { provider: fake, model: m }\n",
+            expected: "providers.gateway.baseUrl: Invalid URL",
         },
         Case {
             label: "root not an object",
@@ -1156,8 +1174,8 @@ fn formats_multi_issue_reports_like_the_typescript_reference() {
     assert_eq!(error.issues.len(), 2);
     assert_eq!(
         error.to_string(),
-        "Invalid Relay configuration in roles.yaml:\n  - version: Invalid input: expected 1\n  \
-         - budgets.maxTurns: Too small: expected number to be >=1"
+        "Invalid Relay configuration in roles.yaml:\n  - version: Invalid input: expected 1 or \
+         2\n  - budgets.maxTurns: Too small: expected number to be >=1"
     );
 }
 
@@ -1166,9 +1184,9 @@ fn provider_connections_expose_lookup_helpers() {
     let parsed = parse_yaml_config(NAMED_CONNECTIONS_YAML).unwrap();
     assert_eq!(
         parsed.providers.names().collect::<Vec<_>>(),
-        ["glm", "local", "openai", "anthropic"]
+        ["claude-pro", "claude-local", "anthropic"]
     );
-    assert!(parsed.providers.contains("glm"));
+    assert!(parsed.providers.contains("claude-pro"));
     assert!(!parsed.providers.contains("groq"));
     let pairs: Vec<(&str, AdapterKind)> = parsed
         .providers
@@ -1178,9 +1196,8 @@ fn provider_connections_expose_lookup_helpers() {
     assert_eq!(
         pairs,
         vec![
-            ("glm", AdapterKind::OpenaiChat),
-            ("local", AdapterKind::OpenaiChat),
-            ("openai", AdapterKind::OpenaiChat),
+            ("claude-pro", AdapterKind::Anthropic),
+            ("claude-local", AdapterKind::Anthropic),
             ("anthropic", AdapterKind::Anthropic),
         ]
     );

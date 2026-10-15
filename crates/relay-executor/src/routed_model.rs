@@ -23,7 +23,9 @@
 //! primary plus [`MAX_FALLBACKS`](relay_config::MAX_FALLBACKS) fallbacks),
 //! deduplicated by `(connection, model)`, and advanced only for provider
 //! *availability* failures — see the table on
-//! [`RoutedModelClient`].
+//! [`RoutedModelClient`]. A transcript carrying opaque provider continuation
+//! blocks is pinned to its primary route and never falls back (see
+//! [`RoutedModelClient`] for the pinned-failure contract).
 
 use std::sync::Arc;
 
@@ -35,11 +37,10 @@ use relay_domain::ModelRoute;
 use relay_providers::anthropic::AnthropicProvider;
 use relay_providers::collect_turn;
 use relay_providers::contract::{
-    AdapterKind, CancelToken, ModelMessage, ModelProvider, ModelRequest, ProviderErrorKind,
-    resolve_capabilities,
+    AdapterKind, AssistantContent, CancelToken, ModelMessage, ModelProvider, ModelRequest,
+    ProviderErrorKind, resolve_capabilities,
 };
 use relay_providers::fake::FakeProvider;
-use relay_providers::openai::{OpenAIProvider, OpenAIProviderOptions};
 
 use crate::model::{
     ModelCallFailure, ModelClient, ModelClientError, ModelTurnRequest, ModelTurnResponse,
@@ -156,34 +157,6 @@ impl ProviderRegistry {
 /// [`ConnectionState::Unavailable`] with the bounded, redacted reason.
 fn build_connection(connection: &ProviderConnection) -> ConnectionState {
     match connection.adapter {
-        AdapterKind::Fake => ConnectionState::Ready {
-            adapter: AdapterKind::Fake,
-            provider: Arc::new(FakeProvider::echo()),
-        },
-        AdapterKind::OpenaiChat => {
-            let adapter = AdapterKind::OpenaiChat;
-            match resolve_capabilities(
-                adapter,
-                connection.preset.as_deref(),
-                &connection.capabilities,
-            ) {
-                Err(error) => unavailable(adapter, error.to_string()),
-                Ok(capabilities) => {
-                    match OpenAIProvider::new(OpenAIProviderOptions {
-                        api_key: None,
-                        api_key_env: connection.api_key_env.clone(),
-                        base_url: connection.base_url.clone(),
-                        capabilities: Some(capabilities),
-                    }) {
-                        Ok(provider) => ConnectionState::Ready {
-                            adapter,
-                            provider: Arc::new(provider),
-                        },
-                        Err(failure) => unavailable(adapter, failure.to_string()),
-                    }
-                }
-            }
-        }
         AdapterKind::Anthropic => {
             let adapter = AdapterKind::Anthropic;
             match resolve_capabilities(
@@ -210,6 +183,10 @@ fn build_connection(connection: &ProviderConnection) -> ConnectionState {
                 }
             }
         }
+        AdapterKind::Fake => ConnectionState::Ready {
+            adapter: AdapterKind::Fake,
+            provider: Arc::new(FakeProvider::echo()),
+        },
     }
 }
 
@@ -384,6 +361,18 @@ fn role_chain_with_overrides(
 /// route fails hard naming the bounded reason; an `Unavailable` connection in
 /// a fallback position is recorded and skipped.
 ///
+/// ## Continuation route pinning
+///
+/// A transcript carrying any opaque
+/// [`AssistantContent::Continuation`] block is provider-bound state: it is
+/// pinned to the granted (primary) route and never falls back, because
+/// another connection cannot resume it.
+/// If that primary is unavailable or fails, the call fails with an
+/// actionable error explaining the pinning (restart from a fresh turn
+/// boundary, or make the primary connection available). A transcript with no
+/// continuation blocks is fully Relay-owned and portable: fallback replays
+/// the complete transcript on the next route unchanged.
+///
 /// Token usage is summed across every attempted route; every route that
 /// received a call is recorded in
 /// [`ModelTurnResponse::routes_attempted`](crate::model::ModelTurnResponse).
@@ -462,7 +451,20 @@ impl ModelClient for RoutedModelClient {
         request: &ModelTurnRequest,
         signal: &CancelToken,
     ) -> Result<ModelTurnResponse, ModelClientError> {
-        let chain = self.fallback_chain_for(route);
+        // Route pinning: opaque provider continuation blocks in the
+        // transcript belong to the connection that produced them and must
+        // never cross routes, so the call is pinned to the granted (primary)
+        // route alone. A transcript without continuation blocks is fully
+        // Relay-owned and portable, and fallback replays it unchanged.
+        let pinned = transcript_carries_continuation(&request.messages);
+        let chain = if pinned {
+            self.fallback_chain_for(route)
+                .into_iter()
+                .take(1)
+                .collect::<Vec<_>>()
+        } else {
+            self.fallback_chain_for(route)
+        };
         let mut attempts: Vec<RouteAttemptFailure> = Vec::new();
         let mut routes_attempted: Vec<ModelRoute> = Vec::new();
         let mut input_tokens: u64 = 0;
@@ -485,7 +487,7 @@ impl ModelClient for RoutedModelClient {
                             self.registry.names_listing()
                         ),
                     ));
-                    return Err(ModelClientError::Provider(ModelCallFailure::new(attempts)));
+                    return Err(provider_failure(&planned.route, pinned, attempts));
                 }
                 Some(ConnectionState::Unavailable { reason, .. }) => {
                     attempts.push(RouteAttemptFailure::from_message(
@@ -496,7 +498,7 @@ impl ModelClient for RoutedModelClient {
                     if index == 0 {
                         // An unavailable primary fails the call outright;
                         // only fallback positions may be skipped.
-                        return Err(ModelClientError::Provider(ModelCallFailure::new(attempts)));
+                        return Err(provider_failure(&planned.route, pinned, attempts));
                     }
                     continue;
                 }
@@ -508,10 +510,8 @@ impl ModelClient for RoutedModelClient {
             let provider_request = ModelRequest {
                 model: planned.route.model.clone(),
                 system: request.system.clone(),
-                messages: vec![ModelMessage::User {
-                    content: request.prompt.clone(),
-                }],
-                tools: None,
+                messages: request.messages.clone(),
+                tools: request.tools.clone(),
                 structured_output: None,
                 max_output_tokens: request
                     .max_output_tokens
@@ -533,7 +533,7 @@ impl ModelClient for RoutedModelClient {
                     output_tokens =
                         output_tokens.saturating_add(turn.usage.output_tokens.max(0) as u64);
                     return Ok(ModelTurnResponse {
-                        text: turn.text,
+                        blocks: turn.blocks,
                         input_tokens,
                         output_tokens,
                         routes_attempted,
@@ -557,9 +557,7 @@ impl ModelClient for RoutedModelClient {
                         | ProviderErrorKind::Auth
                         | ProviderErrorKind::InvalidResponse
                         | ProviderErrorKind::Unknown => {
-                            return Err(ModelClientError::Provider(ModelCallFailure::new(
-                                attempts,
-                            )));
+                            return Err(provider_failure(&planned.route, pinned, attempts));
                         }
                     }
                 }
@@ -567,8 +565,49 @@ impl ModelClient for RoutedModelClient {
         }
 
         // Every route failed with an availability failure (or was skipped).
-        Err(ModelClientError::Provider(ModelCallFailure::new(attempts)))
+        let failed_on = chain
+            .last()
+            .map(|planned| planned.route.clone())
+            .unwrap_or_else(|| route.clone());
+        Err(provider_failure(&failed_on, pinned, attempts))
     }
+}
+
+/// Whether the transcript carries any opaque provider continuation block.
+/// Continuation state is bound to the connection that produced it; a
+/// transcript carrying any is not portable across routes.
+fn transcript_carries_continuation(messages: &[ModelMessage]) -> bool {
+    messages.iter().any(|message| match message {
+        ModelMessage::Assistant { content } => content
+            .iter()
+            .any(|block| matches!(block, AssistantContent::Continuation { .. })),
+        _ => false,
+    })
+}
+
+/// The terminal provider failure for a call. When the call was pinned to its
+/// primary route by continuation state, an actionable note explaining the
+/// pinning is appended so the failure says why no fallback happened and what
+/// to do about it.
+fn provider_failure(
+    route: &ModelRoute,
+    pinned: bool,
+    attempts: Vec<RouteAttemptFailure>,
+) -> ModelClientError {
+    let mut attempts = attempts;
+    if pinned {
+        attempts.push(RouteAttemptFailure::from_message(
+            route.clone(),
+            ProviderErrorKind::Unknown,
+            format!(
+                "the conversation carries provider continuation state that only connection \
+                 \"{}\" can resume, so the call is route-pinned and did not fall back; restart \
+                 the attempt from a fresh turn boundary or make connection \"{}\" available",
+                route.provider, route.provider
+            ),
+        ));
+    }
+    ModelClientError::Provider(ModelCallFailure::new(attempts))
 }
 
 /// The route's output-token ceiling as `u64` (negative limits are ignored).
@@ -600,8 +639,8 @@ mod tests {
     use super::*;
     use relay_config::{NormalizedRouting, RouteLimits, normalize_routing};
     use relay_providers::contract::{
-        AdapterKind, FinishReason, ProviderEventStream, ProviderFailure, ProviderStreamEvent,
-        TokenUsage,
+        AdapterKind, AssistantContent, FinishReason, ProviderEventStream, ProviderFailure,
+        ProviderStreamEvent, TokenUsage, ToolCall,
     };
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -612,7 +651,14 @@ mod tests {
     // ------------------------------------------------------------------
 
     enum ScriptedTurn {
-        Respond { text: String, usage: TokenUsage },
+        Respond {
+            text: String,
+            usage: TokenUsage,
+        },
+        RespondBlocks {
+            blocks: Vec<AssistantContent>,
+            usage: TokenUsage,
+        },
         Fail(ProviderErrorKind, &'static str),
     }
 
@@ -667,6 +713,34 @@ mod tests {
                         usage,
                     },
                 ],
+                Some(ScriptedTurn::RespondBlocks { blocks, usage }) => {
+                    let mut events = Vec::new();
+                    for block in blocks {
+                        match block {
+                            AssistantContent::Text { text } => {
+                                events.push(ProviderStreamEvent::TextDelta { text });
+                            }
+                            AssistantContent::ToolCall { call } => {
+                                events.push(ProviderStreamEvent::ToolCall { call });
+                            }
+                            AssistantContent::Continuation {
+                                discriminator,
+                                data,
+                            } => {
+                                events.push(ProviderStreamEvent::Continuation {
+                                    discriminator,
+                                    data,
+                                });
+                            }
+                        }
+                    }
+                    events.push(ProviderStreamEvent::Usage { usage });
+                    events.push(ProviderStreamEvent::Completed {
+                        finish_reason: FinishReason::ToolCalls,
+                        usage,
+                    });
+                    events
+                }
                 Some(ScriptedTurn::Fail(kind, message)) => {
                     vec![ProviderStreamEvent::Error {
                         error: ProviderFailure::new(kind, message),
@@ -687,6 +761,26 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: input,
                 output_tokens: output,
+            },
+        }
+    }
+
+    fn respond_blocks(blocks: Vec<AssistantContent>, input: i64, output: i64) -> ScriptedTurn {
+        ScriptedTurn::RespondBlocks {
+            blocks,
+            usage: TokenUsage {
+                input_tokens: input,
+                output_tokens: output,
+            },
+        }
+    }
+
+    fn tool_call(id: &str, name: &str, path: &str) -> AssistantContent {
+        AssistantContent::ToolCall {
+            call: ToolCall {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                arguments: serde_json::json!({ "path": path }),
             },
         }
     }
@@ -790,7 +884,7 @@ mod tests {
                 &CancelToken::new(),
             )
             .expect("a completes");
-        assert_eq!(response.text, "from-a");
+        assert_eq!(response.text(), "from-a");
         assert_eq!(response.input_tokens, 3);
         assert_eq!(response.output_tokens, 5);
         assert_eq!(
@@ -805,7 +899,7 @@ mod tests {
                 &CancelToken::new(),
             )
             .expect("b completes");
-        assert_eq!(response.text, "from-b");
+        assert_eq!(response.text(), "from-b");
 
         // Each connection saw exactly its own call, with its own model id.
         assert_eq!(
@@ -866,7 +960,7 @@ mod tests {
                     &CancelToken::new(),
                 )
                 .expect("fallback completes");
-            assert_eq!(response.text, "from-backup", "kind {kind:?}");
+            assert_eq!(response.text(), "from-backup", "kind {kind:?}");
             assert_eq!(
                 response.routes_attempted,
                 vec![
@@ -955,7 +1049,7 @@ mod tests {
                 &CancelToken::new(),
             )
             .expect("completes");
-        assert_eq!(response.text, "primary answer");
+        assert_eq!(response.text(), "primary answer");
         assert!(backup.requests().is_empty(), "backup must not be called");
     }
 
@@ -1078,6 +1172,394 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Native tool turns through the routed client
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn tool_use_turns_return_ordered_blocks_and_native_calls() {
+        // A successful route answers with interleaved text and two tool
+        // calls; the response keeps the authoritative order and exposes the
+        // native calls through `ModelClient` without text-encoding them.
+        let provider = ScriptedProvider::new(vec![respond_blocks(
+            vec![
+                AssistantContent::Text {
+                    text: "let me check".to_owned(),
+                },
+                tool_call("call-1", "read-file", "a"),
+                tool_call("call-2", "list-files", "."),
+                AssistantContent::Text {
+                    text: " then finish".to_owned(),
+                },
+            ],
+            7,
+            13,
+        )]);
+        let registry = ProviderRegistry::from_connections([("c", ready(provider))]);
+        let plan = ResolvedRoutePlan::from_normalized(
+            &routing(
+                vec![("intent", vec![normalized_route("c", "m1", Some("coding"))])],
+                Vec::new(),
+            ),
+            &no_overrides(),
+        );
+        let client = client(registry, plan);
+
+        let mut request = prompt("x");
+        request.tools = Some(vec![relay_providers::contract::ToolSpec {
+            name: "read-file".into(),
+            description: "Reads a file".into(),
+            parameters: serde_json::Map::from_iter([(
+                "type".to_owned(),
+                serde_json::json!("object"),
+            )]),
+        }]);
+        let response = client
+            .complete(
+                &model_route("c", "m1", Some("coding")),
+                &request,
+                &CancelToken::new(),
+            )
+            .expect("completes");
+
+        let kinds: Vec<&str> = response
+            .blocks
+            .iter()
+            .map(|block| match block {
+                AssistantContent::Text { .. } => "text",
+                AssistantContent::ToolCall { .. } => "tool-call",
+                AssistantContent::Continuation { .. } => "continuation",
+            })
+            .collect();
+        assert_eq!(kinds, ["text", "tool-call", "tool-call", "text"]);
+        assert_eq!(response.text(), "let me check then finish");
+        assert_eq!(
+            response
+                .tool_calls()
+                .iter()
+                .map(|call| (call.id.as_str(), call.name.as_str()))
+                .collect::<Vec<_>>(),
+            [("call-1", "read-file"), ("call-2", "list-files")]
+        );
+        // Usage and route diagnostics are complete for the successful route.
+        assert_eq!(response.input_tokens, 7);
+        assert_eq!(response.output_tokens, 13);
+        assert_eq!(
+            response.routes_attempted,
+            vec![model_route("c", "m1", Some("coding"))]
+        );
+    }
+
+    #[test]
+    fn tool_turn_usage_and_routes_sum_across_a_fallback() {
+        // The primary fails with an availability failure after consuming
+        // tokens; the fallback answers a tool turn. Summed usage and both
+        // routes must be reported.
+        let flaky = ScriptedProvider::new(vec![ScriptedTurn::Fail(
+            ProviderErrorKind::RateLimit,
+            "throttled",
+        )]);
+        let backup = ScriptedProvider::new(vec![respond_blocks(
+            vec![tool_call("call-1", "read-file", "a")],
+            5,
+            9,
+        )]);
+        let registry = ProviderRegistry::from_connections([
+            ("flaky", ready(flaky)),
+            ("backup", ready(backup)),
+        ]);
+        let plan = ResolvedRoutePlan::from_normalized(
+            &routing(
+                vec![(
+                    "intent",
+                    vec![
+                        normalized_route("flaky", "m1", None),
+                        normalized_route("backup", "m2", None),
+                    ],
+                )],
+                Vec::new(),
+            ),
+            &no_overrides(),
+        );
+        let client = client(registry, plan);
+
+        let response = client
+            .complete(
+                &model_route("flaky", "m1", None),
+                &prompt("x"),
+                &CancelToken::new(),
+            )
+            .expect("fallback completes the tool turn");
+        assert_eq!(response.tool_calls().len(), 1);
+        assert_eq!(response.input_tokens, 5);
+        assert_eq!(response.output_tokens, 9);
+        assert_eq!(
+            response.routes_attempted,
+            vec![
+                model_route("flaky", "m1", None),
+                model_route("backup", "m2", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn provider_selection_stays_model_independent_on_tool_turns() {
+        // The granted route selects the connection; the model id travels
+        // with the route, and nothing about a tool-carrying request changes
+        // which provider serves it.
+        let provider = ScriptedProvider::new(vec![respond_blocks(
+            vec![tool_call("call-1", "read-file", "a")],
+            1,
+            1,
+        )]);
+        let registry = ProviderRegistry::from_connections([("conn-a", ready(provider.clone()))]);
+        let plan = ResolvedRoutePlan::from_normalized(
+            &routing(
+                vec![(
+                    "intent",
+                    vec![normalized_route("conn-a", "model-a", Some("coding"))],
+                )],
+                Vec::new(),
+            ),
+            &no_overrides(),
+        );
+        let client = client(registry, plan);
+
+        let response = client
+            .complete(
+                &model_route("conn-a", "model-a", Some("coding")),
+                &prompt("x"),
+                &CancelToken::new(),
+            )
+            .expect("completes");
+        assert_eq!(response.tool_calls().len(), 1);
+        assert_eq!(
+            provider
+                .requests()
+                .iter()
+                .map(|request| (request.model.as_str(), request.purpose.as_deref()))
+                .collect::<Vec<_>>(),
+            [("model-a", Some("coding"))]
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Continuation route pinning
+    // ------------------------------------------------------------------
+
+    /// A transcript whose assistant turn carries an opaque continuation
+    /// block: provider-bound state that only its producing route can resume.
+    fn continuation_transcript(prompt_text: &str) -> ModelTurnRequest {
+        ModelTurnRequest {
+            system: None,
+            messages: vec![
+                ModelMessage::user_text(prompt_text),
+                ModelMessage::Assistant {
+                    content: vec![
+                        AssistantContent::Text {
+                            text: "thinking...".to_owned(),
+                        },
+                        AssistantContent::Continuation {
+                            discriminator: "thinking".to_owned(),
+                            data: "opaque-signed-state".to_owned(),
+                        },
+                        tool_call("call-1", "read-file", "a"),
+                    ],
+                },
+                ModelMessage::tool_result("call-1", "file body", false).expect("bounded"),
+            ],
+            tools: None,
+            max_output_tokens: None,
+            temperature: None,
+        }
+    }
+
+    #[test]
+    fn continuation_transcripts_never_fall_back_to_another_route() {
+        // The primary fails with a retryable availability failure and the
+        // backup would happily answer — but the continuation block pins the
+        // call to the primary, so the backup must not be called.
+        let primary = ScriptedProvider::new(vec![ScriptedTurn::Fail(
+            ProviderErrorKind::RateLimit,
+            "throttled",
+        )]);
+        let backup = ScriptedProvider::new(vec![respond("backup answer", 1, 1)]);
+        let registry = ProviderRegistry::from_connections([
+            ("primary", ready(primary)),
+            ("backup", ready(backup.clone())),
+        ]);
+        let plan = ResolvedRoutePlan::from_normalized(
+            &routing(
+                vec![(
+                    "intent",
+                    vec![
+                        normalized_route("primary", "m1", None),
+                        normalized_route("backup", "m2", None),
+                    ],
+                )],
+                Vec::new(),
+            ),
+            &no_overrides(),
+        );
+        let client = client(registry, plan);
+
+        let error = client
+            .complete(
+                &model_route("primary", "m1", None),
+                &continuation_transcript("x"),
+                &CancelToken::new(),
+            )
+            .expect_err("pinned calls never fall back");
+        let ModelClientError::Provider(failure) = &error else {
+            panic!("expected a provider failure, got {error}");
+        };
+        assert!(
+            backup.requests().is_empty(),
+            "the continuation must not be sent to another route"
+        );
+        // The failure is actionable: it explains the pinning and both ways
+        // out.
+        let message = error.to_string();
+        assert!(message.contains("route-pinned"), "{message}");
+        assert!(message.contains("only connection \"primary\""), "{message}");
+        assert!(message.contains("fresh turn boundary"), "{message}");
+        assert!(
+            message.contains("make connection \"primary\" available"),
+            "{message}"
+        );
+        assert_eq!(failure.attempts().len(), 2, "failure plus the pin note");
+    }
+
+    #[test]
+    fn pinned_continuation_failures_when_the_primary_is_unavailable() {
+        // The primary connection exists but cannot serve (missing
+        // credential); the pin note must still explain why there was no
+        // fallback.
+        let registry = ProviderRegistry::from_connections([
+            (
+                "primary",
+                down("The RELAY_TEST_NEVER_SET_KEY environment variable is missing"),
+            ),
+            (
+                "backup",
+                ready(ScriptedProvider::new(vec![respond("backup", 1, 1)])),
+            ),
+        ]);
+        let plan = ResolvedRoutePlan::from_normalized(
+            &routing(
+                vec![(
+                    "intent",
+                    vec![
+                        normalized_route("primary", "m1", None),
+                        normalized_route("backup", "m2", None),
+                    ],
+                )],
+                Vec::new(),
+            ),
+            &no_overrides(),
+        );
+        let client = client(registry, plan);
+
+        let error = client
+            .complete(
+                &model_route("primary", "m1", None),
+                &continuation_transcript("x"),
+                &CancelToken::new(),
+            )
+            .expect_err("unavailable pinned primary fails");
+        let message = error.to_string();
+        assert!(message.contains("connection unavailable"), "{message}");
+        assert!(message.contains("route-pinned"), "{message}");
+    }
+
+    #[test]
+    fn portable_transcripts_fall_back_replaying_the_complete_transcript() {
+        // A tool-loop transcript WITHOUT continuation blocks is fully
+        // Relay-owned and portable: after an availability failure the next
+        // route must receive the complete transcript verbatim.
+        let primary =
+            ScriptedProvider::new(vec![ScriptedTurn::Fail(ProviderErrorKind::Server, "down")]);
+        let backup = ScriptedProvider::new(vec![respond("done", 2, 3)]);
+        let registry = ProviderRegistry::from_connections([
+            ("primary", ready(primary)),
+            ("backup", ready(backup.clone())),
+        ]);
+        let plan = ResolvedRoutePlan::from_normalized(
+            &routing(
+                vec![(
+                    "intent",
+                    vec![
+                        normalized_route("primary", "m1", None),
+                        normalized_route("backup", "m2", None),
+                    ],
+                )],
+                Vec::new(),
+            ),
+            &no_overrides(),
+        );
+        let client = client(registry, plan);
+
+        let request = ModelTurnRequest {
+            system: Some("be brief".to_owned()),
+            messages: vec![
+                ModelMessage::user_text("read the file"),
+                ModelMessage::Assistant {
+                    content: vec![tool_call("call-1", "read-file", "a")],
+                },
+                ModelMessage::tool_result("call-1", "file body", false).expect("bounded"),
+            ],
+            tools: None,
+            max_output_tokens: None,
+            temperature: None,
+        };
+        let response = client
+            .complete(
+                &model_route("primary", "m1", None),
+                &request,
+                &CancelToken::new(),
+            )
+            .expect("portable transcripts fall back");
+        assert_eq!(response.text(), "done");
+        assert_eq!(
+            response.routes_attempted,
+            vec![
+                model_route("primary", "m1", None),
+                model_route("backup", "m2", None),
+            ]
+        );
+        // The fallback saw the complete transcript, byte for byte.
+        assert_eq!(backup.requests().len(), 1);
+        assert_eq!(backup.requests()[0].messages, request.messages);
+        assert_eq!(backup.requests()[0].system.as_deref(), Some("be brief"));
+    }
+
+    #[test]
+    fn a_continuation_free_transcript_on_a_failing_solo_route_reports_plainly() {
+        // Without continuation state the same failure carries no pin note:
+        // the ordinary availability failure is the whole story.
+        let primary = ScriptedProvider::new(vec![ScriptedTurn::Fail(
+            ProviderErrorKind::RateLimit,
+            "throttled",
+        )]);
+        let registry = ProviderRegistry::from_connections([("primary", ready(primary))]);
+        let plan = ResolvedRoutePlan::from_normalized(
+            &routing(
+                vec![("intent", vec![normalized_route("primary", "m1", None)])],
+                Vec::new(),
+            ),
+            &no_overrides(),
+        );
+        let client = client(registry, plan);
+        let error = client
+            .complete(
+                &model_route("primary", "m1", None),
+                &prompt("x"),
+                &CancelToken::new(),
+            )
+            .expect_err("fails");
+        assert!(!error.to_string().contains("route-pinned"), "{}", error);
+    }
+
+    // ------------------------------------------------------------------
     // Registry outcomes
     // ------------------------------------------------------------------
 
@@ -1134,8 +1616,8 @@ mod tests {
     fn an_unavailable_primary_fails_hard_with_its_reason() {
         let registry = ProviderRegistry::from_connections([
             (
-                "glm",
-                down("The RELAY_TEST_GLM_KEY environment variable is missing"),
+                "gateway",
+                down("The RELAY_TEST_GATEWAY_KEY environment variable is missing"),
             ),
             (
                 "fake",
@@ -1147,7 +1629,7 @@ mod tests {
                 vec![(
                     "intent",
                     vec![
-                        normalized_route("glm", "glm-4.6", None),
+                        normalized_route("gateway", "claude-sonnet-5-5", None),
                         normalized_route("fake", "m2", None),
                     ],
                 )],
@@ -1159,7 +1641,7 @@ mod tests {
 
         let error = client
             .complete(
-                &model_route("glm", "glm-4.6", None),
+                &model_route("gateway", "claude-sonnet-5-5", None),
                 &prompt("x"),
                 &CancelToken::new(),
             )
@@ -1175,7 +1657,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("The RELAY_TEST_GLM_KEY environment variable is missing"),
+                .contains("The RELAY_TEST_GATEWAY_KEY environment variable is missing"),
             "{}",
             error
         );
@@ -1224,7 +1706,7 @@ mod tests {
                 &CancelToken::new(),
             )
             .expect("skips the unavailable fallback");
-        assert_eq!(response.text, "third try");
+        assert_eq!(response.text(), "third try");
         assert_eq!(
             response.routes_attempted,
             vec![
@@ -1308,7 +1790,7 @@ mod tests {
             Vec::new(),
         );
         let overrides = InvocationOverrides {
-            provider: Some("glm".to_owned()),
+            provider: Some("gateway".to_owned()),
             ..InvocationOverrides::default()
         };
         let plan = ResolvedRoutePlan::from_normalized(&routing_view, &overrides);
@@ -1434,7 +1916,7 @@ mod tests {
         let response = client
             .complete(&granted, &prompt("x"), &CancelToken::new())
             .expect("completes");
-        assert_eq!(response.text, "role tail");
+        assert_eq!(response.text(), "role tail");
         assert!(
             implementation_tail.requests().is_empty() && verification_tail.requests().is_empty(),
             "purpose tails must not be reached when the role chain matches"
@@ -1484,7 +1966,7 @@ mod tests {
                 &CancelToken::new(),
             )
             .expect("completes");
-        assert_eq!(response.text, "first purpose tail");
+        assert_eq!(response.text(), "first purpose tail");
         assert!(second_tail.requests().is_empty());
     }
 
@@ -1524,7 +2006,7 @@ mod tests {
     #[test]
     fn the_default_configuration_registers_the_offline_fake_as_ready() {
         let registry = ProviderRegistry::from_effective_config(&relay_config::default_config());
-        assert_eq!(registry.names(), ["fake", "openai", "anthropic"]);
+        assert_eq!(registry.names(), ["fake", "anthropic"]);
         assert!(registry.ready("fake").is_some());
         let Some(ConnectionState::Ready { adapter, .. }) = registry.connection("fake") else {
             panic!("fake connection must be ready");
@@ -1538,9 +2020,9 @@ mod tests {
         // outcome does not depend on the developer environment.
         let mut config = relay_config::default_config();
         config.providers.0.insert(
-            "glm".to_owned(),
+            "gateway".to_owned(),
             relay_config::ProviderConnection {
-                adapter: AdapterKind::OpenaiChat,
+                adapter: AdapterKind::Anthropic,
                 api_key_env: Some("RELAY_EXECUTOR_TEST_NEVER_SET_KEY_2026_10".to_owned()),
                 base_url: None,
                 preset: None,
@@ -1548,18 +2030,18 @@ mod tests {
             },
         );
         let registry = ProviderRegistry::from_effective_config(&config);
-        let Some(ConnectionState::Unavailable { adapter, reason }) = registry.connection("glm")
+        let Some(ConnectionState::Unavailable { adapter, reason }) = registry.connection("gateway")
         else {
-            panic!("glm must be unavailable without its credential variable");
+            panic!("gateway must be unavailable without its credential variable");
         };
-        assert_eq!(*adapter, AdapterKind::OpenaiChat);
+        assert_eq!(*adapter, AdapterKind::Anthropic);
         assert!(
             reason.contains(
                 "The RELAY_EXECUTOR_TEST_NEVER_SET_KEY_2026_10 environment variable is missing"
             ),
             "{reason}"
         );
-        assert!(registry.ready("glm").is_none());
+        assert!(registry.ready("gateway").is_none());
     }
 
     #[test]
@@ -1568,8 +2050,8 @@ mod tests {
         config.providers.0.insert(
             "weird".to_owned(),
             relay_config::ProviderConnection {
-                adapter: AdapterKind::OpenaiChat,
-                api_key_env: Some("OPENAI_API_KEY".to_owned()),
+                adapter: AdapterKind::Anthropic,
+                api_key_env: Some("RELAY_EXECUTOR_TEST_NEVER_SET_KEY_2026_10".to_owned()),
                 base_url: None,
                 preset: Some("bogus-preset".to_owned()),
                 capabilities: relay_config::CapabilityOverrides::default(),
@@ -1590,7 +2072,7 @@ mod tests {
         config.routing.clear();
         config.models = None;
         let registry = ProviderRegistry::from_effective_config(&config);
-        assert_eq!(registry.names(), ["fake", "openai", "anthropic"]);
+        assert_eq!(registry.names(), ["fake", "anthropic"]);
         assert!(registry.ready("fake").is_some());
         // And the plan built from that config's routing is empty.
         let plan = ResolvedRoutePlan::from_normalized(&normalize_routing(&config), &no_overrides());

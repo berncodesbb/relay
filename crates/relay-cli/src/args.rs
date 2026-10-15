@@ -57,7 +57,7 @@ Options:
   --json                Machine-readable output where supported
   --autonomy <level>    manual | safe | until-decision | bounded:<n>  (default: safe)
   --provider <name>     A configured provider connection (defaults: fake,
-                         openai, anthropic; default: fake, offline)
+                         anthropic; default: fake, offline)
   --max-ticks <n>       Scheduling waves per `run` (default: 1)
   --no-color            Accepted for compatibility; output is uncolored today
   -h, --help            Show this help

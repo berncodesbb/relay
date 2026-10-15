@@ -386,12 +386,14 @@ pub const MODEL_REMEDIATION_TURNS: u32 = 2;
 
 impl ModelExecutor {
     /// The system prompt for model-class sessions (plain data): the
-    /// objective plus the strict final-object protocol.
+    /// objective plus the strict final-object protocol. Model-class work is
+    /// tool-free: no tool definitions are sent, and a turn carrying native
+    /// tool calls is rejected with a remediation turn, never executed.
     pub fn system_prompt() -> String {
         format!(
             "You are a careful model reasoner producing one structured \
-             deliverable. You have NO tools; reply with the final object \
-             only.\n\n{}",
+             deliverable. You have NO tools and cannot call any; reply with \
+             the final object only.\n\n{}",
             crate::planner::protocol_contract()
         )
     }
@@ -455,7 +457,8 @@ impl Executor for ModelExecutor {
             };
             let request = ModelTurnRequest {
                 system: Some(Self::system_prompt()),
-                prompt,
+                messages: vec![relay_providers::contract::ModelMessage::user_text(prompt)],
+                tools: None,
                 max_output_tokens: spec.grant.budget.max_output_tokens,
                 temperature: None,
             };
@@ -469,7 +472,7 @@ impl Executor for ModelExecutor {
             total_usage.output_tokens = total_usage
                 .output_tokens
                 .saturating_add(response.output_tokens);
-            turn_texts.push(head_of(&response.text, 20_000));
+            turn_texts.push(head_of(&response.text(), 20_000));
             if let Err(exhausted) = context
                 .budget
                 .record_model_usage(response.input_tokens, response.output_tokens)
@@ -485,32 +488,38 @@ impl Executor for ModelExecutor {
                 );
             }
             // Strict final-object decode, shared with the guided planner.
+            // A turn carrying native tool calls is rejected outright —
+            // model-class work is tool-free, so nothing is ever executed
+            // and the model is asked for the final object again.
             let turn_value: Result<serde_json::Map<String, Value>, String> =
-                match serde_json::from_str::<Value>(response.text.trim()) {
+                match serde_json::from_str::<Value>(response.text().trim()) {
                     Ok(Value::Object(map)) => Ok(map),
                     Ok(_) => Err("the reply was JSON but not an object".to_owned()),
                     Err(error) => Err(error.to_string()),
                 };
             let mut session = crate::planner::ToolSession::default();
-            match turn_value {
-                Ok(map) if !map.contains_key("tool_calls") => {
-                    crate::planner::extract_final(
-                        spec,
-                        context,
-                        &Value::Object(map),
-                        &crate::planner::Guidance::model_work(),
-                        &mut session,
-                    );
-                }
-                Ok(_) => {
-                    session.failures.push(
-                        "model-class work has no tools; reply with the final object".to_owned(),
-                    );
-                }
-                Err(error) => {
-                    session
-                        .failures
-                        .push(crate::planner::malformed_turn_note(&error).to_owned());
+            if !response.tool_calls().is_empty() {
+                session.failures.push(
+                    "model-class work has no tools; a tool call was requested but none are \
+                     available; reply with the final object only"
+                        .to_owned(),
+                );
+            } else {
+                match turn_value {
+                    Ok(map) => {
+                        crate::planner::extract_final(
+                            spec,
+                            context,
+                            &Value::Object(map),
+                            &crate::planner::Guidance::model_work(),
+                            &mut session,
+                        );
+                    }
+                    Err(error) => {
+                        session
+                            .failures
+                            .push(crate::planner::malformed_final_note(&error).to_owned());
+                    }
                 }
             }
             if session.failures.is_empty() {
@@ -783,10 +792,9 @@ mod tests {
             _signal: &CancelToken,
         ) -> Result<ModelTurnResponse, ModelClientError> {
             Ok(ModelTurnResponse {
-                text: self.text.clone(),
                 input_tokens: 3,
                 output_tokens: 5,
-                routes_attempted: Vec::new(),
+                ..ModelTurnResponse::from_text(self.text.clone())
             })
         }
     }
@@ -808,12 +816,11 @@ mod tests {
             Ok(ModelTurnResponse {
                 input_tokens: 3,
                 output_tokens: 5,
-                routes_attempted: Vec::new(),
-                text: if request.prompt.contains("rejected") {
+                ..ModelTurnResponse::from_text(if request.last_user_text().contains("rejected") {
                     self.second.clone()
                 } else {
                     self.first.clone()
-                },
+                })
             })
         }
     }
@@ -903,7 +910,7 @@ mod tests {
         match receipt.outcome {
             AttemptOutcome::Failed { reason } => {
                 assert!(
-                    reason.contains("was not a valid JSON object")
+                    reason.contains("was not the final JSON object")
                         || reason.contains("final object"),
                     "{reason}"
                 );
@@ -931,6 +938,108 @@ mod tests {
             "{:?}",
             receipt.outcome
         );
+        assert!(
+            receipt
+                .evidence
+                .iter()
+                .any(|evidence| evidence.summary.contains("recovered"))
+        );
+    }
+
+    /// Always requests a native tool call (never a valid final object).
+    struct ToolCallingModel;
+
+    impl ModelClient for ToolCallingModel {
+        fn complete(
+            &self,
+            _route: &ModelRoute,
+            _request: &ModelTurnRequest,
+            _signal: &CancelToken,
+        ) -> Result<ModelTurnResponse, ModelClientError> {
+            Ok(ModelTurnResponse {
+                input_tokens: 3,
+                output_tokens: 5,
+                blocks: vec![relay_providers::contract::AssistantContent::ToolCall {
+                    call: relay_providers::contract::ToolCall {
+                        id: "c1".into(),
+                        name: "read-file".into(),
+                        arguments: serde_json::json!({ "path": "src/lib.rs" }),
+                    },
+                }],
+                routes_attempted: Vec::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn model_executor_rejects_native_tool_calls_without_executing_them() {
+        let spec = spec(grant(|_| {}));
+        let receipt = ModelExecutor.run(&spec, &context_with(Arc::new(ToolCallingModel)));
+        match receipt.outcome {
+            AttemptOutcome::Failed { reason } => {
+                assert!(reason.contains("has no tools"), "{reason}");
+                assert!(reason.contains("final object"), "{reason}");
+            }
+            AttemptOutcome::Completed => panic!("a tool-calling model must not complete"),
+        }
+        // Nothing executed (there is nothing to execute), and every
+        // remediation turn was accounted.
+        assert_eq!(receipt.usage.tool_calls, 0);
+        assert_eq!(
+            receipt.usage.input_tokens,
+            3 * u64::from(MODEL_REMEDIATION_TURNS + 1)
+        );
+        assert_eq!(receipt.evidence.len(), 1, "no verifier records were minted");
+    }
+
+    #[test]
+    fn model_executor_recovers_after_a_rejected_tool_call() {
+        struct ToolThenFinalModel;
+        impl ModelClient for ToolThenFinalModel {
+            fn complete(
+                &self,
+                _route: &ModelRoute,
+                request: &ModelTurnRequest,
+                _signal: &CancelToken,
+            ) -> Result<ModelTurnResponse, ModelClientError> {
+                if request.last_user_text().contains("rejected") {
+                    Ok(ModelTurnResponse {
+                        input_tokens: 3,
+                        output_tokens: 5,
+                        ..ModelTurnResponse::from_text(
+                            r#"{"evidence":[{"kind":"inspection","target":{"work_item":"work_model"},"outcome":"info","summary":"recovered"}]}"#,
+                        )
+                    })
+                } else {
+                    Ok(ModelTurnResponse {
+                        input_tokens: 3,
+                        output_tokens: 5,
+                        blocks: vec![relay_providers::contract::AssistantContent::ToolCall {
+                            call: relay_providers::contract::ToolCall {
+                                id: "c1".into(),
+                                name: "write-file".into(),
+                                arguments: serde_json::json!({
+                                    "path": "src/evil.rs",
+                                    "content": "nope"
+                                }),
+                            },
+                        }],
+                        routes_attempted: Vec::new(),
+                    })
+                }
+            }
+        }
+        let spec = spec(grant(|_| {}));
+        let context = context_with(Arc::new(ToolThenFinalModel));
+        let workspace = context.workspace_root.clone();
+        let receipt = ModelExecutor.run(&spec, &context);
+        assert!(
+            matches!(receipt.outcome, AttemptOutcome::Completed),
+            "{:?}",
+            receipt.outcome
+        );
+        // The rejected call never executed.
+        assert!(!workspace.join("src/evil.rs").exists());
         assert!(
             receipt
                 .evidence

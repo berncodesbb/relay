@@ -937,8 +937,11 @@ fn the_context_respects_every_configured_budget() {
         .messages
         .iter()
         .map(|message| match message {
-            relay_providers::contract::ModelMessage::User { content }
-            | relay_providers::contract::ModelMessage::ToolResult { content, .. } => {
+            relay_providers::contract::ModelMessage::User { content } => content
+                .iter()
+                .map(|block| block.text().chars().count())
+                .sum(),
+            relay_providers::contract::ModelMessage::ToolResult { content, .. } => {
                 content.chars().count()
             }
             relay_providers::contract::ModelMessage::Assistant { content } => content

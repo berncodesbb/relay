@@ -24,7 +24,8 @@ use std::sync::Arc;
 use relay_domain::ModelRoute;
 use relay_providers::collect_turn;
 use relay_providers::contract::{
-    CancelToken, ModelMessage, ModelProvider, ModelRequest, ProviderErrorKind,
+    AssistantContent, CancelToken, ModelMessage, ModelProvider, ModelRequest, ProviderErrorKind,
+    ToolCall, ToolSpec,
 };
 
 /// Bound on any failure message carried in executor diagnostics; provider
@@ -32,14 +33,24 @@ use relay_providers::contract::{
 /// depth for locally synthesized messages.
 const MAX_FAILURE_MESSAGE_CHARS: usize = 300;
 
-/// A model call as an executor sees it: prompts in, text and usage out.
+/// A model call as an executor sees it: a Relay-owned transcript in, ordered
+/// assistant blocks and usage out.
+///
+/// The transcript (`system` plus `messages`) is executor property: the model
+/// client forwards it faithfully and never reconstructs or collapses it.
+/// Tool definitions ([`tools`](Self::tools)) are supplied separately from
+/// prose, already filtered to the attempt's capability grant.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelTurnRequest {
     /// System/developer instructions.
     pub system: Option<String>,
-    /// The user turn (typically the attempt objective plus input
-    /// summaries).
-    pub prompt: String,
+    /// The Relay-owned conversation transcript, in order. A text-only call
+    /// carries a single user message (see [`ModelTurnRequest::from_prompt`]);
+    /// a tool-loop session appends assistant tool-use turns and tool results.
+    pub messages: Vec<ModelMessage>,
+    /// Tool definitions the model may call (grant-filtered). `None` means
+    /// the call is tool-free.
+    pub tools: Option<Vec<ToolSpec>>,
     /// Output token ceiling. When `None`, the routed implementation falls
     /// back to the planned route's limit.
     pub max_output_tokens: Option<u64>,
@@ -50,22 +61,46 @@ pub struct ModelTurnRequest {
 }
 
 impl ModelTurnRequest {
-    /// A prompt-only request.
+    /// A prompt-only request: one user text message, no system instruction,
+    /// no tools, no limits. Text-only call sites (chat flows, model-only
+    /// executors, scripted tests) start here.
     pub fn from_prompt(prompt: impl Into<String>) -> Self {
         ModelTurnRequest {
             system: None,
-            prompt: prompt.into(),
+            messages: vec![ModelMessage::user_text(prompt)],
+            tools: None,
             max_output_tokens: None,
             temperature: None,
         }
     }
+
+    /// The visible text of the last user message in the transcript (the
+    /// prompt, for prompt-shaped requests). Empty string when the transcript
+    /// has no user turn. This is a convenience for diagnostics and test
+    /// doubles, not a substitute for forwarding the transcript.
+    pub fn last_user_text(&self) -> String {
+        self.messages
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                ModelMessage::User { .. } => Some(message.text()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
 }
 
-/// A completed model turn as an executor sees it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A completed model turn as an executor sees it: the assistant's ordered
+/// content blocks plus summed usage and route diagnostics.
+///
+/// [`blocks`](Self::blocks) is authoritative; [`text`](Self::text) and
+/// [`tool_calls`](Self::tool_calls) are ordered convenience views. Not
+/// `Eq`: tool-call arguments are JSON values.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelTurnResponse {
-    /// The assistant text.
-    pub text: String,
+    /// Ordered assistant content blocks (text, tool calls, opaque
+    /// continuation data in true order).
+    pub blocks: Vec<AssistantContent>,
     /// Input tokens consumed, summed across every attempted route.
     pub input_tokens: u64,
     /// Output tokens consumed, summed across every attempted route.
@@ -74,6 +109,43 @@ pub struct ModelTurnResponse {
     /// successful route last). Routes skipped before a call (for example an
     /// unavailable fallback connection) are not listed.
     pub routes_attempted: Vec<ModelRoute>,
+}
+
+impl ModelTurnResponse {
+    /// A text-only response with one text block, zero usage, and no
+    /// attempted routes. Test doubles and scripted models migrate to this
+    /// and override the fields they care about.
+    pub fn from_text(text: impl Into<String>) -> Self {
+        ModelTurnResponse {
+            blocks: vec![AssistantContent::Text { text: text.into() }],
+            input_tokens: 0,
+            output_tokens: 0,
+            routes_attempted: Vec::new(),
+        }
+    }
+
+    /// Concatenated visible text across the text blocks (tool calls and
+    /// opaque continuation blocks excluded).
+    pub fn text(&self) -> String {
+        self.blocks
+            .iter()
+            .filter_map(|block| match block {
+                AssistantContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Tool calls in arrival order.
+    pub fn tool_calls(&self) -> Vec<ToolCall> {
+        self.blocks
+            .iter()
+            .filter_map(|block| match block {
+                AssistantContent::ToolCall { call } => Some(call.clone()),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// One attempted route and the bounded, redacted reason it failed. Provider
@@ -122,7 +194,7 @@ impl RouteAttemptFailure {
 /// The typed payload of a [`ModelClientError::Provider`]: every route
 /// attempted before the terminal failure, in order. Display is bounded,
 /// deterministic, and redacted, e.g.
-/// `glm/glm-4.6: rate-limit (throttled); fake/fake-standard: server (down)`.
+/// `claude-proxy/claude-sonnet-5-5: rate-limit (throttled); fake/fake-standard: server (down)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelCallFailure {
     attempts: Vec<RouteAttemptFailure>,
@@ -250,10 +322,8 @@ impl ModelClient for ProviderModelClient {
         let provider_request = ModelRequest {
             model: route.model.clone(),
             system: request.system.clone(),
-            messages: vec![ModelMessage::User {
-                content: request.prompt.clone(),
-            }],
-            tools: None,
+            messages: request.messages.clone(),
+            tools: request.tools.clone(),
             structured_output: None,
             max_output_tokens: request.max_output_tokens,
             temperature: request.temperature,
@@ -271,7 +341,7 @@ impl ModelClient for ProviderModelClient {
             ));
         }
         Ok(ModelTurnResponse {
-            text: turn.text,
+            blocks: turn.blocks,
             input_tokens: turn.usage.input_tokens.max(0) as u64,
             output_tokens: turn.usage.output_tokens.max(0) as u64,
             routes_attempted: vec![route.clone()],
@@ -284,7 +354,7 @@ impl ModelClient for ProviderModelClient {
 mod tests {
     use super::*;
     use relay_providers::contract::{AdapterKind, CancelToken};
-    use relay_providers::fake::{FakeProvider, FakeResponse};
+    use relay_providers::fake::{FakeProvider, FakeResponse, FakeToolCallPlan};
 
     fn provider_with_text(text: &str) -> Arc<dyn ModelProvider> {
         Arc::new(FakeProvider::with_fallback(
@@ -311,8 +381,216 @@ mod tests {
                 &CancelToken::new(),
             )
             .expect("completes");
-        assert_eq!(response.text, "hello from the model");
+        assert_eq!(response.text(), "hello from the model");
         assert_eq!(response.routes_attempted, vec![route.clone()]);
+    }
+
+    #[test]
+    fn from_prompt_builds_a_single_user_transcript_and_reads_back() {
+        let request = ModelTurnRequest::from_prompt("do the thing");
+        assert_eq!(request.system, None);
+        assert_eq!(request.tools, None);
+        assert_eq!(request.messages.len(), 1);
+        assert_eq!(request.messages[0].text(), "do the thing");
+        assert_eq!(request.last_user_text(), "do the thing");
+
+        // With a longer transcript, the newest user turn is the one read.
+        let request = ModelTurnRequest {
+            system: Some("be brief".into()),
+            messages: vec![
+                ModelMessage::user_text("first"),
+                ModelMessage::Assistant {
+                    content: vec![AssistantContent::Text { text: "ack".into() }],
+                },
+                ModelMessage::user_text("second"),
+            ],
+            tools: None,
+            max_output_tokens: None,
+            temperature: None,
+        };
+        assert_eq!(request.last_user_text(), "second");
+        // A transcript without a user turn reads as empty, not as assistant
+        // text.
+        let request = ModelTurnRequest {
+            system: None,
+            messages: vec![ModelMessage::Assistant {
+                content: vec![AssistantContent::Text { text: "hi".into() }],
+            }],
+            tools: None,
+            max_output_tokens: None,
+            temperature: None,
+        };
+        assert_eq!(request.last_user_text(), "");
+    }
+
+    #[test]
+    fn from_text_builds_a_text_block_response_that_reads_back() {
+        let response = ModelTurnResponse::from_text("{\"outputs\":[]}");
+        assert_eq!(response.text(), "{\"outputs\":[]}");
+        assert!(response.tool_calls().is_empty());
+        assert_eq!(response.input_tokens, 0);
+        assert_eq!(response.output_tokens, 0);
+        assert!(response.routes_attempted.is_empty());
+        assert_eq!(
+            response.blocks,
+            vec![AssistantContent::Text {
+                text: "{\"outputs\":[]}".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn forwards_the_transcript_tools_and_limits_faithfully() {
+        /// Records the exact request it served, then completes.
+        struct RecordingProvider {
+            requests: std::sync::Mutex<Vec<relay_providers::contract::ModelRequest>>,
+        }
+        impl ModelProvider for RecordingProvider {
+            fn name(&self) -> relay_providers::contract::AdapterKind {
+                relay_providers::contract::AdapterKind::Fake
+            }
+            fn models(&self) -> Vec<String> {
+                vec!["fake-standard".to_owned()]
+            }
+            fn stream(
+                &self,
+                request: &relay_providers::contract::ModelRequest,
+            ) -> relay_providers::contract::ProviderEventStream<'_> {
+                self.requests
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .push(request.clone());
+                Box::new(
+                    vec![
+                        relay_providers::contract::ProviderStreamEvent::TextDelta {
+                            text: "ok".to_owned(),
+                        },
+                        relay_providers::contract::ProviderStreamEvent::Completed {
+                            finish_reason: relay_providers::contract::FinishReason::Stop,
+                            usage: relay_providers::contract::TokenUsage {
+                                input_tokens: 3,
+                                output_tokens: 4,
+                            },
+                        },
+                    ]
+                    .into_iter(),
+                )
+            }
+        }
+
+        let provider = Arc::new(RecordingProvider {
+            requests: std::sync::Mutex::new(Vec::new()),
+        });
+        let client = ProviderModelClient::new(provider.clone() as Arc<dyn ModelProvider>);
+        let route = ModelRoute {
+            provider: "fake".to_owned(),
+            model: "fake-standard".to_owned(),
+            role: Some("fast".to_owned()),
+        };
+        let request = ModelTurnRequest {
+            system: Some("system instruction".into()),
+            messages: vec![
+                ModelMessage::user_text("first"),
+                ModelMessage::Assistant {
+                    content: vec![AssistantContent::Text { text: "mid".into() }],
+                },
+                ModelMessage::user_text("the prompt"),
+            ],
+            tools: Some(vec![ToolSpec {
+                name: "read-file".into(),
+                description: "Reads a file".into(),
+                parameters: serde_json::Map::from_iter([(
+                    "type".to_owned(),
+                    serde_json::json!("object"),
+                )]),
+            }]),
+            max_output_tokens: Some(1_024),
+            temperature: Some(0.2),
+        };
+        let response = client
+            .complete(&route, &request, &CancelToken::new())
+            .expect("completes");
+
+        // The provider saw the exact transcript, tools, and limits.
+        let seen = provider
+            .requests
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .last()
+            .cloned()
+            .expect("a call was recorded");
+        assert_eq!(seen.system.as_deref(), Some("system instruction"));
+        assert_eq!(seen.messages.len(), 3);
+        assert_eq!(seen.messages[2].text(), "the prompt");
+        assert_eq!(
+            seen.tools.as_ref().map(|tools| tools.len()),
+            Some(1),
+            "tools are forwarded, not dropped"
+        );
+        assert_eq!(seen.max_output_tokens, Some(1_024));
+        assert_eq!(seen.temperature, Some(0.2));
+        assert_eq!(seen.purpose.as_deref(), Some("fast"));
+
+        // The response reads back through the ordered-block views with the
+        // route and usage accounted.
+        assert_eq!(response.text(), "ok");
+        assert_eq!(response.input_tokens, 3);
+        assert_eq!(response.output_tokens, 4);
+        assert_eq!(response.routes_attempted, vec![route.clone()]);
+    }
+
+    #[test]
+    fn returns_ordered_blocks_without_discarding_tool_calls() {
+        let provider = Arc::new(FakeProvider::with_fallback(
+            Vec::new(),
+            FakeResponse {
+                text: Some("let me check".into()),
+                tool_calls: Some(vec![
+                    FakeToolCallPlan {
+                        name: "read-file".into(),
+                        args: serde_json::json!({ "path": "a" }),
+                    },
+                    FakeToolCallPlan {
+                        name: "list-files".into(),
+                        args: serde_json::json!({ "path": "." }),
+                    },
+                ]),
+                ..FakeResponse::default()
+            },
+        ));
+        let client = ProviderModelClient::new(provider);
+        let route = ModelRoute {
+            provider: "fake".to_owned(),
+            model: "fake-standard".to_owned(),
+            role: None,
+        };
+        let response = client
+            .complete(
+                &route,
+                &ModelTurnRequest::from_prompt("x"),
+                &CancelToken::new(),
+            )
+            .expect("completes");
+        // Authoritative order: text first, then both calls.
+        let kinds: Vec<&str> = response
+            .blocks
+            .iter()
+            .map(|block| match block {
+                AssistantContent::Text { .. } => "text",
+                AssistantContent::ToolCall { .. } => "tool-call",
+                AssistantContent::Continuation { .. } => "continuation",
+            })
+            .collect();
+        assert_eq!(kinds, ["text", "tool-call", "tool-call"]);
+        assert_eq!(response.text(), "let me check");
+        assert_eq!(
+            response
+                .tool_calls()
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
+            ["read-file", "list-files"]
+        );
     }
 
     #[test]
@@ -353,8 +631,8 @@ mod tests {
         )) as Arc<dyn ModelProvider>;
         let client = ProviderModelClient::new(provider);
         let route = ModelRoute {
-            provider: "glm".to_owned(),
-            model: "glm-4.6".to_owned(),
+            provider: "claude-proxy".to_owned(),
+            model: "claude-sonnet-5-5".to_owned(),
             role: Some("fast".to_owned()),
         };
         let error = client
@@ -373,7 +651,7 @@ mod tests {
         assert_eq!(attempt.route, route);
         assert_eq!(
             error.to_string(),
-            "model call failed: glm/glm-4.6: rate-limit (throttled)"
+            "model call failed: claude-proxy/claude-sonnet-5-5: rate-limit (throttled)"
         );
     }
 

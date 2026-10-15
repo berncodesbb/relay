@@ -1,6 +1,6 @@
 [package]
 name = "relay-providers"
-description = "Provider-neutral model contracts and private OpenAI, Anthropic, and fake adapters for Relay"
+description = "Provider-neutral model contracts and private Anthropic Messages and fake adapters for Relay"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

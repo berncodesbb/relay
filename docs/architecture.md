@@ -60,7 +60,7 @@ If JSONL and SQLite disagree, JSONL wins; SQLite is disposable and rebuildable. 
 ## Dependency rules
 
 - `relay-domain`, `relay-engine`, and `relay-workflows` are pure: no IO, clocks, randomness, HTTP, SQL, terminal, provider SDK, or filesystem dependencies. Time, IDs, provider output, and filesystem facts enter only through facts, commands, or attempt receipts.
-- Providers never leak SDK types. `relay-providers` defines the neutral model contract; the OpenAI/Anthropic adapters translate wire responses into Relay-owned request and event types inside their modules.
+- Providers never leak SDK types. `relay-providers` defines the neutral model contract; the Anthropic adapter (the sole live external protocol) and the offline fake translate wire responses into Relay-owned request and event types inside their modules.
 - Executors never advance the graph directly. They return receipts and proposals that deterministic policy validates (`relay_engine::validate_graph_change`, `accept_receipt`).
 - Library crates never write to the terminal; only `relay-cli` produces output.
 
@@ -138,12 +138,12 @@ Read/model attempts may run concurrently; workspace-changing attempts are serial
 
 ## Providers (`relay-providers`)
 
-The neutral contract (`ModelClient`, streaming events, usage, finish reasons) is the only boundary between runtime and vendors. Adapter identity is the wire *protocol* — the closed set `openai-chat` (any OpenAI-compatible Chat Completions endpoint), `anthropic`, and `fake` — kept deliberately distinct from the user-named **provider connections** in configuration; several connections may share one adapter, and no vendor ever earns its own enum variant. Adapters translate wire responses into Relay-owned types inside their modules; provider wire types stay private:
+The neutral contract (`ModelClient`, streaming events, ordered content blocks, usage, finish reasons) is the only boundary between runtime and vendors. Adapter identity is the wire *protocol* — the closed set `anthropic` and `fake` — kept deliberately distinct from the user-named **provider connections** in configuration; several connections may share one adapter, and no vendor ever earns its own enum variant. Anthropic Messages is the strategic and sole live external protocol (the `openai-chat` adapter was removed 2026-10-15; obsolete configuration fails with migration guidance — see `docs/configuration.md`). Adapters translate wire responses into Relay-owned types inside their modules; provider wire types stay private:
 
-- **openai-chat adapter** — Chat Completions compatibility with streaming, usage, tools, and structured output (native `json-schema` or the `json-object` translation with the schema embedded in the instruction). Not the Responses API, and not a promise of full OpenAI parity.
-- **anthropic adapter** — Messages API with merged tool results and defaulted token limits.
+- **anthropic adapter** — the native Messages API: ordered text/`tool_use` blocks with true streaming order, `tool_result` continuation carrying `is_error`, bounded opaque thinking/redacted-thinking continuation blocks (round-tripped only to the same compatible route, never rendered or persisted), merged consecutive tool results, structured output via the `json-object` translation (schema embedded in the system instruction), and fail-closed stream validation (duplicate or unknown block indices, malformed tool arguments, EOF without `message_stop`, and size bounds all become typed `invalid-response` failures).
 - **Fake adapter** — in-process, offline, scriptable; the deterministic engine behind tests and the built-in default routing.
-- **Capability profiles** — each connection carries an effective profile resolved as adapter defaults → preset (first shipped: `glm`) → explicit overrides. A requested feature is translated by a documented rule (developer → system instruction; `json-schema` → `json-object` embedding) or rejected with an `unsupported-capability` failure **before any HTTP request** — never silently dropped.
+- **Native tool loop** — Relay owns the transcript. Model-guided workspace and verifier sessions send grant-filtered native tool definitions; each `tool_use` request is validated against the attempt's immutable capability grant and executed only through the tool registry; results return as correlated `tool_result` blocks. Tool calls are never encoded in, or accepted from, assistant text, and provider-hosted tools are not used.
+- **Capability profiles** — each connection carries an effective profile resolved as adapter defaults → explicit overrides (no presets ship today). A requested feature is translated by a documented rule (`json-schema` → `json-object` embedding) or rejected with an `unsupported-capability` failure **before any HTTP request** — never silently dropped.
 - **Error normalization** — SDK/transport failures map to neutral kinds (`rate-limit`, `server`, `network`, `timeout`, `canceled`, `auth`, `invalid-response`, `unsupported-capability`, `unknown`) with retryability hints and redacted, trimmed messages. Headers and bodies never survive the adapter.
 
 Model routing composes at the application seam: the executor's connection registry builds each configured connection once (credential values are resolved from the configured environment-variable names at construction and never logged), and the routed model client resolves each attempt's granted route through it — bounded, ordered fallback along the normalized chain for availability failures only (never for cancellation, invalid output, auth, or unsupported capabilities), with every attempted route visible in bounded, redacted diagnostics.
@@ -209,7 +209,7 @@ The fixture corpus under `tests/fixtures/` is frozen historical evidence exporte
 
 ## Extension points
 
-- **New provider connection.** Any OpenAI-compatible endpoint is YAML only: name a connection under `providers:` with `adapter: openai-chat`, its base URL, credential-variable name, and optional preset. No code changes.
+- **New provider connection.** Any Anthropic Messages-compatible endpoint is YAML only: name a connection under `providers:` with `adapter: anthropic`, its base URL, credential-variable name, and optional capability overrides. No code changes.
 - **New adapter kind.** Implementing a new wire protocol means adding an `AdapterKind` and adapter in `relay-providers` (neutral contract, private wire types, capability defaults, error normalization through the shared failure mapping). Nothing outside the adapter changes.
 - **New tool.** Define a typed `ToolDefinition` (args schema, capability, timeout, output cap) and register it in `create_default_tool_registry`; capability grants and the permission gate pick it up.
 - **New workflow work definition.** Extend the catalog in `relay-workflows` (work definition, schemas, completion and invalidation rules, view template). Expansion still flows through `validate_graph_change`.

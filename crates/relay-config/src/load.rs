@@ -400,8 +400,19 @@ pub fn validate_effective_config(
     }
 
     // Capability/preset combinations must resolve on every connection:
-    // adapter defaults, then the named preset, then explicit overrides.
+    // adapter defaults, then the named preset, then explicit overrides. The
+    // removed `glm` preset is recognized only to explain its removal (it was
+    // an OpenAI-compatible Chat Completions profile).
     for (name, connection) in config.providers.iter() {
+        if connection.preset.as_deref() == Some("glm") {
+            return Err(ConfigValidationError::new(
+                provider_source(name),
+                vec![format!(
+                    "providers.{name}: the glm preset was removed with the openai-chat adapter; \
+                     configure an Anthropic Messages-compatible connection instead"
+                )],
+            ));
+        }
         if let Err(error) = resolve_capabilities(
             connection.adapter,
             connection.preset.as_deref(),
